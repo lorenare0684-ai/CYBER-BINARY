@@ -6,7 +6,7 @@
  *   - tools/page-hook.shell.js (MAIN-world WebSocket hook shell)
  *
  * Rebuild after any change to either source file.
- * Generated: 2026-08-22T15:23:32.966Z
+ * Generated: 2026-08-22T15:35:26.550Z
  */
 /* ====================================================================
  * Inlined CYBER_QUOTEX adapter (src/lib/quotex.js).
@@ -191,14 +191,26 @@
    *   {type:"bin",   event?, payload} binary body after a header (or headerless)
    *   {type:"unknown", raw}          anything else we couldn't classify
    * ============================================================ */
+  function bytesToStr(u8) {
+    // String.fromCharCode.apply with a huge array throws
+    // "Maximum call stack size exceeded" (>~64k elements), and the
+    // instruments/history binary payloads are often >1MB. Chunk it.
+    var out = "";
+    var CHUNK = 0x8000;
+    for (var i = 0; i < u8.length; i += CHUNK) {
+      out += String.fromCharCode.apply(null, u8.subarray(i, i + CHUNK));
+    }
+    return out;
+  }
+
   function asString(raw) {
     if (typeof raw === "string") return raw;
     if (raw == null) return "";
     if (typeof ArrayBuffer !== "undefined" && raw instanceof ArrayBuffer) {
-      try { return String.fromCharCode.apply(null, new Uint8Array(raw)); } catch (_) { return ""; }
+      try { return bytesToStr(new Uint8Array(raw)); } catch (_) { return ""; }
     }
     if (typeof Uint8Array !== "undefined" && raw instanceof Uint8Array) {
-      try { return String.fromCharCode.apply(null, raw); } catch (_) { return ""; }
+      try { return bytesToStr(raw); } catch (_) { return ""; }
     }
     if (typeof Blob !== "undefined" && raw && typeof raw.text === "function") {
       // async path — return a sentinel; caller will await `raw.text()`
@@ -1596,8 +1608,15 @@
       var nativeSend = ws.send.bind(ws);
       ws.send = function (data) {
         try {
-          var s = typeof data === "string" ? data
-            : (typeof ArrayBuffer !== "undefined" && data instanceof ArrayBuffer ? String.fromCharCode.apply(null, new Uint8Array(data)) : null);
+          var s = typeof data === "string" ? data : "";
+          if (!s && typeof ArrayBuffer !== "undefined" && data instanceof ArrayBuffer) {
+            var u8 = new Uint8Array(data);
+            var buf = "";
+            for (var bi = 0; bi < u8.length; bi += 0x8000) {
+              buf += String.fromCharCode.apply(null, u8.subarray(bi, bi + 0x8000));
+            }
+            s = buf;
+          }
           var hit = s ? Q.sniffOutgoing(s) : null;
           if (hit && hit.symbol) {
             live.lastWsSymbol = hit.symbol;

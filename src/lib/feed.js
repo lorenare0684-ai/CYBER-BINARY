@@ -92,6 +92,11 @@
       if (!Number.isFinite(price) || price <= 0) return null;
       last = price;
       const t = bucket(ts || Date.now());
+      // v2.3.2: a tick whose bucket is OLDER than the in-progress bar would
+      // overwrite `current` with a bar older than the last closed bar and
+      // corrupt series ordering (unsorted input → garbage indicators).
+      // Such ticks are stale replays — drop them.
+      if (current && t < current.time) return null;
       let closed = null;
       if (!current || current.time !== t) {
         if (current) {

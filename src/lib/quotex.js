@@ -177,14 +177,26 @@
    *   {type:"bin",   event?, payload} binary body after a header (or headerless)
    *   {type:"unknown", raw}          anything else we couldn't classify
    * ============================================================ */
+  function bytesToStr(u8) {
+    // String.fromCharCode.apply with a huge array throws
+    // "Maximum call stack size exceeded" (>~64k elements), and the
+    // instruments/history binary payloads are often >1MB. Chunk it.
+    var out = "";
+    var CHUNK = 0x8000;
+    for (var i = 0; i < u8.length; i += CHUNK) {
+      out += String.fromCharCode.apply(null, u8.subarray(i, i + CHUNK));
+    }
+    return out;
+  }
+
   function asString(raw) {
     if (typeof raw === "string") return raw;
     if (raw == null) return "";
     if (typeof ArrayBuffer !== "undefined" && raw instanceof ArrayBuffer) {
-      try { return String.fromCharCode.apply(null, new Uint8Array(raw)); } catch (_) { return ""; }
+      try { return bytesToStr(new Uint8Array(raw)); } catch (_) { return ""; }
     }
     if (typeof Uint8Array !== "undefined" && raw instanceof Uint8Array) {
-      try { return String.fromCharCode.apply(null, raw); } catch (_) { return ""; }
+      try { return bytesToStr(raw); } catch (_) { return ""; }
     }
     if (typeof Blob !== "undefined" && raw && typeof raw.text === "function") {
       // async path — return a sentinel; caller will await `raw.text()`

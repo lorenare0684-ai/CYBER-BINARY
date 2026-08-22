@@ -55,6 +55,10 @@
   let lastWsPrice = null;
   let lastWsSymbol = null;
   let manualAsset = null; // set by dashboard selection; null = auto-detect
+  // v2.3.2: cached confidence-calibration snapshot (settings.calibration +
+  // recorded bucket hit rates), refreshed on every STORE change so the
+  // per-tick signal path stays synchronous.
+  let calCache = { enabled: true, buckets: null };
   let lastQuotexStatus = { state: "idle" };
   let lastInstruments = [];
   let lastBalance = null;
@@ -268,9 +272,21 @@
     const t = {
       at: time, asset: p.asset, dir: p.dir, won, entry: p.entry, exit: close,
       score: p.score, confidence: p.confidence, regime: p.regime, strategy: p.strategy,
+      // v2.3.2: pnl was missing here, so the dashboard's live history column
+      // rendered blank (STORE.recordTrade history has it; this one didn't).
+      pnl: won ? 0.85 : -1,
     };
     stats.history.unshift(t);
     if (stats.history.length > 200) stats.history.length = 200;
+    // v2.3.2: these breakdowns were never updated, so the Assets tab's
+    // "Live WR" and the per-strategy/regime splits stayed permanently empty.
+    const bk = (map, key) => {
+      if (!map[key]) map[key] = { w: 0, l: 0 };
+      if (won) map[key].w += 1; else map[key].l += 1;
+    };
+    bk(stats.byStrategy, p.strategy || "confluence");
+    bk(stats.byAsset, p.asset || "UNKNOWN");
+    bk(stats.byRegime, p.regime || "unknown");
     stats.pending = null;
     if (autoController) autoController.updateDailyPnl(won ? 0.85 : -1);
     persistAll();
@@ -314,9 +330,23 @@
     } catch (_) {}
   }
 
+  function refreshCalCache() {
+    try {
+      STORE.getSettings().then((s) => {
+        calCache.enabled = !!(s && s.calibration);
+        return STORE.getCalibration().then((cal) => {
+          calCache.buckets = (cal && cal.buckets) || null;
+        });
+      }).catch(() => {});
+    } catch (_) {}
+  }
+
   async function loadSettingsAndArmAuto() {
     const s = await STORE.getSettings();
     currentStrategy = s.strategy || "confluence";
+    refreshCalCache();
+    // Keep the calibration snapshot fresh whenever any context writes state.
+    try { STORE.onChange(refreshCalCache); } catch (_) {}
     if (autoController) {
       autoController.setMode(s.autoMode || "off");
       autoController.setArmed(!!s.armed);
@@ -378,7 +408,11 @@
       candles: real.slice(-400),
       ts: Date.now(),
     };
-    if (id !== activeAsset) {
+    // v2.3.2: never force-switch the active asset from a background history
+    // replay. Only the socket symbol / DOM detection (or a manual pin) may
+    // change what the engine follows; otherwise a chart the user isn't
+    // watching (or an old tab's replay) would steal the active feed.
+    if (id !== activeAsset && !manualAsset) {
       activeAsset = id;
       activeFeed = feed;
     }
@@ -433,7 +467,7 @@
     }
   }
 
-  async function maybeSignal() {
+  function maybeSignal() {
     const asset = syncActiveAsset();
     const full = activeFeed.series();
     // v2.2: compute indicators on CLOSED bars only — the last element of the
@@ -453,6 +487,18 @@
       const lastBar = a[a.length - 1];
       if (lastBar && lastBar.time != null) sig.time = lastBar.time;
     }
+    // v2.3.2: actually apply the calibration the settings toggle promises —
+    // shrink reported confidence toward the observed hit rate for that
+    // confidence bucket (recorded by STORE.recordTrade). Applied BEFORE the
+    // signal reaches the auto controller / stats so every consumer sees the
+    // same adjusted confidence. Uses the cached snapshot (refreshed via
+    // STORE.onChange) so the per-tick path stays synchronous.
+    try {
+      if (sig.ready && sig.direction !== "WAIT" && calCache.enabled) {
+        const adj = STORE.calibrationAdjust(sig.confidence, calCache.buckets);
+        if (adj != null && Number.isFinite(adj)) sig.confidence = adj;
+      }
+    } catch (_) {}
     paintHud(sig);
     pushState(sig);
 

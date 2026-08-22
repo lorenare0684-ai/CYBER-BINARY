@@ -4,6 +4,18 @@ Chrome extension (Manifest V3) that attaches to a Quotex / QX Broker chart, buil
 
 > Educational market analysis only. Not a broker. Not financial advice. Binary options have a built-in payout edge against the trader — nothing here is a profit guarantee.
 
+## What's new in v2.3.2 — bug-audit fixes
+
+- **Settings no longer silently drop rapid changes** — `storage.js` used to re-read `chrome.storage.local` on every `load()`, so two quick updates inside the 200ms save debounce (e.g. mode then arm, stake then expiry) lost the earlier one. Writes pending in the debounce are now flushed before every read; cross-context changes (dashboard popup ↔ content script) are still picked up. Covered by `tools/bugs.js`.
+- **Daily P&L resets after 24h, not 1h** — `recordTrade()` used `36e5` ms (= one hour) as its "daily" reset horizon. Now a real 24h window, matching the UTC `byDay` keys.
+- **Huge WebSocket frames no longer crash the decoder** — `String.fromCharCode.apply` on a multi-megabyte binary frame threw *Maximum call stack size exceeded* (history/instruments payloads are routinely >1MB). Both the adapter and the page hook now convert byte payloads in 32KB chunks. Tested at 1KB → 4MB.
+- **Confidence calibration actually applies** — the settings toggle existed but the content script never read it; reported confidence now shrinks toward the observed hit rate of its confidence bucket before signals reach the auto controller and stats.
+- **Live stats breakdowns populate** — settled trades never updated `byStrategy` / `byAsset` / `byRegime` (or the history `pnl` column) in the content script, so the dashboard's live win-rate and splits stayed empty. Fixed + unit-covered.
+- **Stale ticks can't corrupt the candle feed** — a delayed/replayed tick older than the in-progress bar used to become the "current" bar, producing unsorted series and garbage indicators. Such ticks are now dropped; newer ticks still flow.
+- **Background history can't hijack the active asset** — a candle replay for a chart you're not watching no longer force-switches the engine's active asset away from what the page socket/DOM says (manual pins still win).
+- **Dashboard ARM button no longer dead-clicks** — it dereferenced `settings` before the async settings load resolved (TypeError); now safe, and the auto-mode selector no longer emits `armed: null`.
+- **Engine `lean` flag simplified** — the convoluted `cfg.lean !== false && (opts && opts.lean !== false && (opts.lean !== undefined ? opts.lean : true))` collapsed to `cfg.lean !== false && !(opts && opts.lean === false)`; behavior identical for every caller (live UI keeps all indicators, backtests stay fast), including callers that pass no options at all.
+
 ## What's new in v2.3 — every Quotex asset + reliable auto-detection
 
 - **Full Quotex asset catalog** (~170 symbols): every base FX pair (EURUSD, GBPUSD, … GBPNZD, NZDCAD, NZDCHF) **plus its `_otc` twin**, exotic FX OTC pairs (BRL/USD, USD/MXN, ARS/USD, USD/TRY, USD/COP …), all crypto OTC (BTC, ETH, SOL, ADA, XRP, LTC, DOGE, SHIB, TRX, LINK, DOT …), commodities (XAU, XAG, oil, gas, platinum, palladium, copper), all 13 indices, and the full stock list (AAPL, AMZN, TSLA, NVDA, MSFT, GOOGL, META, JPM, KO, WMT …). Broker-internal numeric IDs are baked in where confirmed and **self-heal at runtime**: any asset the platform lists in `instruments/list` is registered on the fly with its real ID, payout and timeframes, and appears in the Assets tab, the asset dropdown and per-asset accuracy reports.

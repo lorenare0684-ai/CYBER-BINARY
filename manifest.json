@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "CYBER BINARY — Quotex Signal Lab",
-  "version": "2.3.1",
-  "description": "v2.3.1: auto-detection from the full Quotex asset catalog (170+ symbols), reliable trade-button/stake placement on the current UI, and no more trade spam (per-bar dedup, enforced cooldown, min-interval). Educational only - not financial advice.",
+  "name": "CYBER BINARY \u2014 Quotex Signal Lab",
+  "version": "2.3.2",
+  "description": "v2.3.2: bug-audit release (settings race, daily reset, big-frame decode, calibration, stats). Auto-detection from the full Quotex asset catalog (170+ symbols), reliable trade placement, no trade spam. Educational only - not financial advice.",
   "permissions": [
     "storage",
     "windows",

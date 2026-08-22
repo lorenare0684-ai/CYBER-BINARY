@@ -153,8 +153,15 @@
       var nativeSend = ws.send.bind(ws);
       ws.send = function (data) {
         try {
-          var s = typeof data === "string" ? data
-            : (typeof ArrayBuffer !== "undefined" && data instanceof ArrayBuffer ? String.fromCharCode.apply(null, new Uint8Array(data)) : null);
+          var s = typeof data === "string" ? data : "";
+          if (!s && typeof ArrayBuffer !== "undefined" && data instanceof ArrayBuffer) {
+            var u8 = new Uint8Array(data);
+            var buf = "";
+            for (var bi = 0; bi < u8.length; bi += 0x8000) {
+              buf += String.fromCharCode.apply(null, u8.subarray(bi, bi + 0x8000));
+            }
+            s = buf;
+          }
           var hit = s ? Q.sniffOutgoing(s) : null;
           if (hit && hit.symbol) {
             live.lastWsSymbol = hit.symbol;

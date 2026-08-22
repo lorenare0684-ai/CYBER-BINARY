@@ -664,7 +664,7 @@
     const setSettings = (patch) => {
       STORE.setSettings(patch).then((s) => { settings = s; });
     };
-    $("auto-mode").addEventListener("change", (e) => setSettings({ autoMode: e.target.value, armed: e.target.value !== "off" ? settings && settings.armed : false }));
+    $("auto-mode").addEventListener("change", (e) => setSettings({ autoMode: e.target.value, armed: e.target.value !== "off" ? !!(settings && settings.armed) : false }));
     $("min-confidence").addEventListener("change", (e) => setSettings({ minConfidence: Number(e.target.value) || 0 }));
     $("stake").addEventListener("change", (e) => setSettings({ stake: Number(e.target.value) || 1 }));
     $("expiry").addEventListener("change", (e) => setSettings({ expiry: Number(e.target.value) || 3 }));
@@ -676,9 +676,13 @@
     $("notify-sound").addEventListener("change", (e) => setSettings({ notifySound: e.target.checked }));
     $("notify-desktop").addEventListener("change", (e) => setSettings({ notifyDesktop: e.target.checked }));
     $("arm-btn").addEventListener("click", () => {
-      const next = !settings.armed;
+      // v2.3.2: settings loads async — clicking ARM before it resolves used
+      // to throw on `settings.armed` (null deref) and the arm never happened.
+      const cur = settings && settings.armed;
+      const next = !cur;
+      const mode = (settings && settings.autoMode) || "off";
       setSettings({ armed: next });
-      if (hasChrome) chrome.runtime.sendMessage({ type: "CYBER_SET_AUTO", mode: settings.autoMode, armed: next }).catch(() => {});
+      if (hasChrome) chrome.runtime.sendMessage({ type: "CYBER_SET_AUTO", mode, armed: next }).catch(() => {});
       else updateAutoUI(Object.assign({}, autoState, { armed: next }));
     });
     $("test-sound").addEventListener("click", () => AUTO.playBeep("CALL"));
