@@ -1,15 +1,30 @@
 /**
- * Candle feed: live ticks, or a seeded demo market when Quotex is offline.
+ * Multi-asset candle feed.
+ *  - createFeed: live tick ingestion for a single asset.
+ *  - syntheticSeries: build a long 1m series for any asset profile with
+ *    realistic regime cycles (trending → ranging → volatile → ranging).
+ *  - cycSynthetic: cyclical, regime-aware generator used by historic backtest.
  */
 (function (root) {
   "use strict";
 
+  const ASSETS = (root.CYBER_ASSETS && root.CYBER_ASSETS) || null;
+
+  function seeded(seed) {
+    let s = (seed >>> 0) || 1;
+    return function () {
+      s = (1664525 * s + 1013904223) >>> 0;
+      return s / 4294967296;
+    };
+  }
+
   function createFeed(opts) {
     const tf = (opts && opts.tfMs) || 60000;
-    const max = (opts && opts.max) || 400;
+    const max = (opts && opts.max) || 600;
     let candles = [];
     let current = null;
     let last = null;
+    const volProfile = (opts && opts.volProfile) || null;
 
     function bucket(ts) {
       return Math.floor(ts / tf) * tf;
@@ -58,27 +73,80 @@
       last = p;
       current = {
         time: bucket(Date.now()),
-        open: p,
-        high: p,
-        low: p,
-        close: p,
+        open: p, high: p, low: p, close: p,
       };
       return series();
     }
 
+    function setSeries(arr) {
+      candles = arr.slice();
+      if (candles.length > max) candles = candles.slice(-max);
+      const lastBar = candles[candles.length - 1];
+      last = lastBar ? lastBar.close : null;
+      current = lastBar ? Object.assign({}, lastBar) : null;
+    }
+
     return {
-      ingest,
-      series,
-      seedHistory,
-      lastPrice: function () {
-        return last;
-      },
-      reset: function () {
-        candles = [];
-        current = null;
-        last = null;
-      },
+      ingest, series, seedHistory, setSeries,
+      lastPrice: () => last,
+      reset: () => { candles = []; current = null; last = null; },
+      size: () => candles.length + (current ? 1 : 0),
     };
+  }
+
+  /**
+   * Build a realistic per-asset 1m candle series.
+   * Includes regime cycling (trending → ranging → chop → back to trending).
+   * `minutes` = total bars to generate. `regimePeriod` = bars per regime.
+   */
+  function syntheticSeries(asset, minutes, opts) {
+    const a = (ASSETS && ASSETS.get(asset)) || asset || { basePrice: 1.0, vol: 0.0001, drift: 0, jumpRate: 0.005, decimals: 5 };
+    const seed = (opts && opts.seed) || 7;
+    const regimePeriod = (opts && opts.regimePeriod) || Math.max(120, Math.floor(minutes / 6));
+    const rnd = seeded(seed);
+    const out = [];
+    let p = a.basePrice;
+    let t = (opts && opts.startTime) || Date.UTC(2024, 0, 1, 0, 0, 0);
+    let regimeIdx = 0;
+    let barsInRegime = 0;
+    const regimeList = ["trending", "ranging", "choppy", "trending-down"];
+
+    for (let i = 0; i < minutes; i++) {
+      if (barsInRegime >= regimePeriod) {
+        barsInRegime = 0;
+        regimeIdx = (regimeIdx + 1) % regimeList.length;
+      }
+      const regime = regimeList[regimeIdx];
+      barsInRegime++;
+
+      let trend = 0;
+      let volMult = 1;
+      let meanRevPull = 0;
+      if (regime === "trending") { trend = a.vol * 0.6; volMult = 1.0; }
+      else if (regime === "trending-down") { trend = -a.vol * 0.6; volMult = 1.0; }
+      else if (regime === "ranging") { meanRevPull = (a.basePrice - p) / p * 0.04; volMult = 0.6; }
+      else if (regime === "choppy") { trend = (rnd() - 0.5) * a.vol * 0.2; volMult = 1.6; }
+
+      const shock = (rnd() - 0.5) * 2 * a.vol * volMult;
+      const jump = rnd() < (a.jumpRate || 0) ? (rnd() - 0.5) * a.vol * 8 : 0;
+      const drift = (a.drift || 0) + trend + meanRevPull;
+      const next = Math.max(0.01, p * (1 + drift + shock + jump));
+
+      const range = Math.abs(next - p) + a.vol * p * 0.5;
+      const h = Math.max(p, next) + rnd() * range * 0.4;
+      const l = Math.min(p, next) - rnd() * range * 0.4;
+      out.push({
+        time: t,
+        open: p,
+        high: h,
+        low: Math.max(0.01, l),
+        close: next,
+        regime,
+      });
+      p = next;
+      t += 60000;
+    }
+    return out;
   }
 
   function demoTick(price) {
@@ -87,5 +155,5 @@
     return Math.max(0.2, price + dir * step);
   }
 
-  root.CYBER_FEED = { createFeed, demoTick };
+  root.CYBER_FEED = { createFeed, syntheticSeries, demoTick, seeded };
 })(typeof self !== "undefined" ? self : globalThis);

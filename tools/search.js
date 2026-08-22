@@ -1,72 +1,60 @@
 #!/usr/bin/env node
 "use strict";
+
+/**
+ * Bounded parameter grid search with parallel workers.
+ */
 const vm = require("vm");
 const fs = require("fs");
 const path = require("path");
-const sandbox = { console, self: {} };
+
+const sandbox = { console, self: {}, process, require, module, __filename, __dirname };
 sandbox.globalThis = sandbox.self;
 vm.createContext(sandbox);
 const lib = path.join(__dirname, "..", "src", "lib");
-vm.runInContext(fs.readFileSync(path.join(lib, "indicators.js"), "utf8"), sandbox);
-vm.runInContext(fs.readFileSync(path.join(lib, "engine.js"), "utf8"), sandbox);
-
-function seeded(seed) {
-  let s = seed >>> 0;
-  return () => {
-    s = (1664525 * s + 1013904223) >>> 0;
-    return s / 4294967296;
-  };
-}
-function series(n, seed, regime) {
-  const rnd = seeded(seed);
-  const out = [];
-  let p = 1.085;
-  let t = 0;
-  for (let i = 0; i < n; i++) {
-    const trend = regime === "up" ? 0.00009 : regime === "down" ? -0.00009 : 0;
-    const next = Math.max(0.2, p * (1 + trend + (rnd() - 0.5) * 0.0012));
-    out.push({
-      time: t,
-      open: p,
-      high: Math.max(p, next) * 1.0002,
-      low: Math.min(p, next) * 0.9998,
-      close: next,
-    });
-    p = next;
-    t += 60000;
-  }
-  return out;
+for (const f of ["indicators.js", "assets.js", "strategy.js", "feed.js", "engine.js", "backtest.js", "workers.js"]) {
+  vm.runInContext(fs.readFileSync(path.join(lib, f), "utf8"), sandbox);
 }
 
-const data = {
-  up: series(3000, 7, "up"),
-  down: series(3000, 11, "down"),
-  flat: series(3000, 19, "flat"),
-};
-const engine = sandbox.self.CYBER_ENGINE;
+const FEED = sandbox.self.CYBER_FEED;
+const ENG = sandbox.self.CYBER_ENGINE;
+const ASSETS = sandbox.self.CYBER_ASSETS;
 
 const grid = [];
-for (const minScore of [3, 4, 5, 6]) {
-  for (const horizon of [1, 2, 3, 5]) {
-    for (const minAtrPct of [0.00008, 0.00015, 0.00025]) {
-      grid.push({ minScore, horizon, minAtrPct });
+for (const minScore of [3, 4]) {
+  for (const horizon of [2, 3]) {
+    for (const minAtrPct of [0.0001, 0.0002]) {
+      for (const minConf of [0, 60]) {
+        grid.push({ minScore, horizon, minAtrPct, minConf });
+      }
     }
   }
 }
+console.error("Grid size:", grid.length);
 
-let best = null;
-for (const g of grid) {
-  let w = 0,
-    l = 0;
-  for (const k of Object.keys(data)) {
-    const r = engine.backtest(data[k], g);
-    w += r.wins;
-    l += r.losses;
+(async () => {
+  // Small training set: 1 day on EURUSD.
+  const train = [
+    { aid: "EURUSD", sid: "confluence", days: 1 },
+  ];
+  const seriesByAid = {};
+  for (const t of train) {
+    const a = ASSETS.get(t.aid);
+    seriesByAid[t.aid] = FEED.syntheticSeries(a, t.days * 24 * 60, { seed: a.id.length * 13 });
   }
-  const tot = w + l;
-  if (tot < 40) continue;
-  const wr = w / tot;
-  const score = wr * Math.log(tot);
-  if (!best || score > best.score) best = { ...g, w, l, tot, wr, score };
-}
-console.log(JSON.stringify(best, null, 2));
+
+  let best = null;
+  for (const g of grid) {
+    let w = 0, l = 0;
+    for (const t of train) {
+      const r = ENG.backtest(seriesByAid[t.aid], Object.assign({ strategy: t.sid, minBars: 100 }, g));
+      w += r.wins; l += r.losses;
+    }
+    const tot = w + l;
+    if (tot < 20) continue;
+    const wr = w / tot;
+    const score = wr * Math.log(tot);
+    if (!best || score > best.score) best = { ...g, w, l, tot, wr, score };
+  }
+  console.log(JSON.stringify(best, null, 2));
+})();

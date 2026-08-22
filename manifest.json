@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "CYBER BINARY — Quotex Signal Lab",
-  "version": "1.0.0",
-  "description": "Chart-attached confluence signals and a live performance dashboard for Quotex. Educational analysis only — not financial advice.",
-  "permissions": ["storage", "windows", "tabs", "scripting"],
+  "version": "2.0.0",
+  "description": "Advanced chart-attached confluence engine with auto asset detection, multi-strategy backtest, regime-aware signals, calibration, and trade automation for Quotex. Educational only — not financial advice.",
+  "permissions": ["storage", "windows", "tabs", "scripting", "notifications"],
   "host_permissions": [
     "https://qxbroker.com/*",
     "https://quotex.com/*",
@@ -44,8 +44,14 @@
       ],
       "js": [
         "src/lib/indicators.js",
-        "src/lib/engine.js",
+        "src/lib/assets.js",
+        "src/lib/strategy.js",
         "src/lib/feed.js",
+        "src/lib/engine.js",
+        "src/lib/storage.js",
+        "src/lib/auto.js",
+        "src/lib/backtest.js",
+        "src/lib/workers.js",
         "src/content.js"
       ],
       "css": ["src/content.css"],
