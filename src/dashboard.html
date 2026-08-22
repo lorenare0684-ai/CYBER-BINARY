@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CYBER BINARY</title>
+    <link rel="stylesheet" href="dashboard.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <header class="top">
+        <div>
+          <p class="kicker">Quotex signal lab</p>
+          <h1>CYBER BINARY</h1>
+        </div>
+        <div id="link-state" class="pill dim">Booting…</div>
+      </header>
+
+      <section class="hero" id="hero" data-dir="WAIT">
+        <div class="dir" id="dir">WAIT</div>
+        <div class="reason" id="reason">Warming engine…</div>
+        <div class="asset-row">
+          <span id="asset">—</span>
+          <span id="price">—</span>
+        </div>
+      </section>
+
+      <section class="chart-wrap">
+        <canvas id="chart" width="800" height="280"></canvas>
+      </section>
+
+      <section class="grid stats">
+        <article>
+          <span>Win rate</span>
+          <strong id="winrate">—</strong>
+        </article>
+        <article>
+          <span>Accuracy</span>
+          <strong id="accuracy">—</strong>
+        </article>
+        <article>
+          <span>Wins</span>
+          <strong id="wins">0</strong>
+        </article>
+        <article>
+          <span>Losses</span>
+          <strong id="losses">0</strong>
+        </article>
+      </section>
+
+      <section class="meters" id="meters"></section>
+
+      <section>
+        <h2>Recent calls</h2>
+        <ul id="history" class="history"></ul>
+      </section>
+
+      <p class="disclaimer">
+        Educational confluence only. Not a broker, not auto-trade, not a profit
+        guarantee. Binary payouts usually require well above 50% to break even.
+      </p>
+    </div>
+    <script src="lib/indicators.js"></script>
+    <script src="lib/engine.js"></script>
+    <script src="lib/feed.js"></script>
+    <script src="dashboard.js"></script>
+  </body>
+</html>

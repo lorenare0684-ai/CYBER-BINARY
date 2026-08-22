@@ -1,0 +1,57 @@
+#cyber-binary-hud {
+  position: fixed;
+  top: 12px;
+  right: 12px;
+  z-index: 2147483646;
+  min-width: 220px;
+  max-width: min(320px, 40vw);
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: rgba(8, 12, 20, 0.88);
+  color: #e8eefc;
+  font: 12px/1.4 ui-sans-serif, system-ui, sans-serif;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
+  border: 1px solid rgba(80, 200, 255, 0.25);
+  backdrop-filter: blur(8px);
+}
+
+#cyber-binary-hud .cb-hud-title {
+  letter-spacing: 0.16em;
+  font-size: 10px;
+  opacity: 0.7;
+}
+
+#cyber-binary-hud .cb-hud-dir {
+  font-size: 22px;
+  font-weight: 700;
+  margin: 4px 0;
+}
+
+#cyber-binary-hud[data-dir="CALL"] .cb-hud-dir {
+  color: #3dff9a;
+}
+#cyber-binary-hud[data-dir="PUT"] .cb-hud-dir {
+  color: #ff5d7a;
+}
+#cyber-binary-hud[data-dir="WAIT"] .cb-hud-dir,
+#cyber-binary-hud[data-dir="WARM"] .cb-hud-dir,
+#cyber-binary-hud[data-dir="SCAN"] .cb-hud-dir {
+  color: #8aa0c8;
+}
+
+#cyber-binary-hud .cb-hud-meta {
+  opacity: 0.85;
+  word-break: break-word;
+}
+
+#cyber-binary-hud .cb-hud-btn {
+  margin-top: 8px;
+  width: 100%;
+  border: 0;
+  border-radius: 8px;
+  padding: 7px 10px;
+  cursor: pointer;
+  background: #1c8cff;
+  color: #fff;
+  font-weight: 600;
+}
