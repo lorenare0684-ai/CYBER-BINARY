@@ -3,66 +3,402 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>CYBER BINARY</title>
+    <title>CYBER BINARY — Signal Lab</title>
     <link rel="stylesheet" href="dashboard.css" />
   </head>
   <body>
     <div class="shell">
       <header class="top">
         <div>
-          <p class="kicker">Quotex signal lab</p>
+          <p class="kicker">Quotex signal lab · v2</p>
           <h1>CYBER BINARY</h1>
         </div>
-        <div id="link-state" class="pill dim">Booting…</div>
+        <div class="top-right">
+          <div id="link-state" class="pill dim">Booting…</div>
+          <div id="quotex-state" class="pill dim">Quotex · idle</div>
+          <div id="auto-state" class="pill dim">Auto off</div>
+        </div>
       </header>
 
-      <section class="hero" id="hero" data-dir="WAIT">
-        <div class="dir" id="dir">WAIT</div>
-        <div class="reason" id="reason">Warming engine…</div>
-        <div class="asset-row">
-          <span id="asset">—</span>
-          <span id="price">—</span>
+      <nav class="tabs" id="tabs">
+        <button data-tab="live" class="tab active">Live</button>
+        <button data-tab="auto" class="tab">Auto</button>
+        <button data-tab="instruments" class="tab">Instruments</button>
+        <button data-tab="backtest" class="tab">Backtest</button>
+        <button data-tab="history" class="tab">History</button>
+        <button data-tab="assets" class="tab">Assets</button>
+        <button data-tab="settings" class="tab">Settings</button>
+      </nav>
+
+      <!-- ============ LIVE TAB ============ -->
+      <section class="tab-pane active" data-pane="live">
+        <div class="controls">
+          <label class="ctl">
+            <span>Asset</span>
+            <select id="asset-select"></select>
+          </label>
+          <label class="ctl">
+            <span>Strategy</span>
+            <select id="strategy-select"></select>
+          </label>
+          <button id="refresh-asset" class="ghost-btn">Auto-detect</button>
         </div>
+
+        <section class="hero" id="hero" data-dir="WAIT">
+          <div class="dir" id="dir">WAIT</div>
+          <div class="reason" id="reason">Warming engine…</div>
+          <div class="asset-row">
+            <span id="asset">—</span>
+            <span id="price">—</span>
+          </div>
+          <div class="regime-row" id="regime-row">regime: —</div>
+        </section>
+
+        <section class="chart-wrap">
+          <canvas id="chart" width="800" height="280"></canvas>
+        </section>
+
+        <section class="grid stats">
+          <article><span>Win rate</span><strong id="winrate">—</strong></article>
+          <article><span>Accuracy</span><strong id="accuracy">—</strong></article>
+          <article><span>Wins</span><strong id="wins">0</strong></article>
+          <article><span>Losses</span><strong id="losses">0</strong></article>
+        </section>
+
+        <section>
+          <h2>Indicator confluence</h2>
+          <div class="meters" id="meters"></div>
+        </section>
+
+        <section>
+          <h2>Indicator readings</h2>
+          <div class="readings" id="readings"></div>
+        </section>
+
+        <section>
+          <h2>Recent calls</h2>
+          <ul id="history" class="history"></ul>
+        </section>
       </section>
 
-      <section class="chart-wrap">
-        <canvas id="chart" width="800" height="280"></canvas>
+      <!-- ============ AUTO TAB ============ -->
+      <section class="tab-pane" data-pane="auto">
+        <section class="hero small" id="auto-hero">
+          <div class="dir" id="auto-mode-label">OFF</div>
+          <div class="reason" id="auto-reason">Auto-trade is off. Pick a mode and arm it.</div>
+        </section>
+
+        <section class="grid stats">
+          <article><span>Trades today</span><strong id="trades-today">0</strong></article>
+          <article><span>Trades this hour</span><strong id="trades-hour">0</strong></article>
+          <article><span>Daily P&amp;L</span><strong id="daily-pnl">0</strong></article>
+          <article><span>Last trade</span><strong id="last-trade">—</strong></article>
+        </section>
+
+        <section class="controls tight">
+          <label class="ctl">
+            <span>Mode</span>
+            <select id="auto-mode">
+              <option value="off">Off</option>
+              <option value="alerts">Alerts only</option>
+              <option value="click">Click CALL/PUT</option>
+            </select>
+          </label>
+          <label class="ctl">
+            <span>Min confidence</span>
+            <input type="number" id="min-confidence" min="0" max="100" step="1" value="65" />
+          </label>
+          <label class="ctl">
+            <span>Stake</span>
+            <input type="number" id="stake" min="0.1" step="0.1" value="1" />
+          </label>
+          <label class="ctl">
+            <span>Expiry (min)</span>
+            <input type="number" id="expiry" min="1" max="60" step="1" value="3" />
+          </label>
+          <label class="ctl">
+            <span>Max / hour</span>
+            <input type="number" id="max-hour" min="0" step="1" value="12" />
+          </label>
+          <label class="ctl">
+            <span>Max / day</span>
+            <input type="number" id="max-day" min="0" step="1" value="60" />
+          </label>
+          <label class="ctl">
+            <span>Loss cap ($)</span>
+            <input type="number" id="loss-cap" min="0" step="1" value="30" />
+          </label>
+          <label class="ctl">
+            <span>Profit cap ($)</span>
+            <input type="number" id="profit-cap" min="0" step="1" value="0" />
+          </label>
+          <label class="ctl">
+            <span>Cooldown bars</span>
+            <input type="number" id="cooldown" min="0" step="1" value="2" />
+          </label>
+        </section>
+
+        <section class="row">
+          <button id="arm-btn" class="arm-btn">ARM AUTO</button>
+          <button id="test-sound" class="ghost-btn">Test beep</button>
+          <label class="check"><input type="checkbox" id="notify-sound" checked /> Sound</label>
+          <label class="check"><input type="checkbox" id="notify-desktop" /> Desktop</label>
+        </section>
+
+        <section>
+          <h2>Automation log</h2>
+          <ul id="auto-log" class="history small"></ul>
+        </section>
+
+        <p class="warn">
+          <strong>Click mode</strong> actively clicks the CALL/PUT button on the visible
+          Quotex chart using your stake and the strategy you selected. It is gated by
+          confidence, daily loss cap, and trade-rate caps. Toggle off at any time.
+        </p>
       </section>
 
-      <section class="grid stats">
-        <article>
-          <span>Win rate</span>
-          <strong id="winrate">—</strong>
-        </article>
-        <article>
-          <span>Accuracy</span>
-          <strong id="accuracy">—</strong>
-        </article>
-        <article>
-          <span>Wins</span>
-          <strong id="wins">0</strong>
-        </article>
-        <article>
-          <span>Losses</span>
-          <strong id="losses">0</strong>
-        </article>
+      <!-- ============ INSTRUMENTS TAB (v2.1) ============ -->
+      <section class="tab-pane" data-pane="instruments">
+        <section class="hero small" id="qx-hero">
+          <div class="dir" id="qx-conn">DISCONNECTED</div>
+          <div class="reason" id="qx-conn-reason">Waiting for the page to load.</div>
+        </section>
+
+        <section class="grid stats">
+          <article><span>Instruments</span><strong id="qx-instr-count">0</strong></article>
+          <article><span>Open</span><strong id="qx-open-count">0</strong></article>
+          <article><span>OTC</span><strong id="qx-otc-count">0</strong></article>
+          <article><span>Balance</span><strong id="qx-balance">—</strong></article>
+        </section>
+
+        <section class="controls tight">
+          <label class="ctl">
+            <span>Filter</span>
+            <input type="text" id="qx-filter" placeholder="EUR, BTC, _otc…" />
+          </label>
+          <label class="ctl">
+            <span>Type</span>
+            <select id="qx-kind">
+              <option value="all">All</option>
+              <option value="currency">FX</option>
+              <option value="crypto">Crypto</option>
+              <option value="commodity">Commodity</option>
+              <option value="stock">Stocks</option>
+              <option value="index">Index</option>
+              <option value="otc">OTC only</option>
+            </select>
+          </label>
+          <label class="check"><input type="checkbox" id="qx-open-only" /> Open only</label>
+        </section>
+
+        <section>
+          <h2>Detected instruments</h2>
+          <table class="table" id="qx-instr-table">
+            <thead>
+              <tr>
+                <th>Symbol</th>
+                <th>Name</th>
+                <th>Type</th>
+                <th>Payout</th>
+                <th>Timeframes</th>
+                <th>State</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </section>
+
+        <section>
+          <h2>Recent live orders</h2>
+          <ul id="qx-orders" class="history small"></ul>
+        </section>
+
+        <p class="disclaimer">
+          The instruments list is pushed by the live Quotex WebSocket as soon
+          as you load the trade page. The adapter decodes the binary payload
+          and exposes the canonical asset IDs used by the broker so the
+          engine can recognize any symbol the platform offers.
+        </p>
       </section>
 
-      <section class="meters" id="meters"></section>
+      <!-- ============ BACKTEST TAB ============ -->
+      <section class="tab-pane" data-pane="backtest">
+        <section class="controls tight">
+          <label class="ctl">
+            <span>History (days)</span>
+            <input type="number" id="bt-days" min="1" max="60" step="1" value="7" />
+          </label>
+          <label class="ctl">
+            <span>Horizon (bars)</span>
+            <input type="number" id="bt-horizon" min="1" max="10" step="1" value="3" />
+          </label>
+          <label class="ctl">
+            <span>Min confidence</span>
+            <input type="number" id="bt-minconf" min="0" max="100" step="1" value="0" />
+          </label>
+          <label class="ctl">
+            <span>Assets</span>
+            <select id="bt-kinds">
+              <option value="all">All</option>
+              <option value="fx">FX</option>
+              <option value="crypto">Crypto</option>
+              <option value="commodity">Commodities</option>
+              <option value="index">Indices</option>
+              <option value="otc">OTC</option>
+            </select>
+          </label>
+          <button id="bt-run" class="arm-btn">Run backtest</button>
+        </section>
 
-      <section>
-        <h2>Recent calls</h2>
-        <ul id="history" class="history"></ul>
+        <section class="grid stats">
+          <article><span>Trades</span><strong id="bt-trades">—</strong></article>
+          <article><span>Win rate</span><strong id="bt-winrate">—</strong></article>
+          <article><span>P&amp;L (units)</span><strong id="bt-pnl">—</strong></article>
+          <article><span>Max drawdown</span><strong id="bt-dd">—</strong></article>
+        </section>
+
+        <section>
+          <h2>Equity curve</h2>
+          <div class="chart-wrap"><canvas id="bt-equity" width="800" height="160"></canvas></div>
+        </section>
+
+        <section>
+          <h2>Per-strategy</h2>
+          <table class="table" id="bt-strategies">
+            <thead><tr><th>Strategy</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Win rate</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </section>
+
+        <section>
+          <h2>Per-asset</h2>
+          <table class="table" id="bt-assets">
+            <thead><tr><th>Asset</th><th>Trades</th><th>Win rate</th><th>P&amp;L</th><th>Max DD</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </section>
+
+        <section>
+          <h2>Regime breakdown</h2>
+          <table class="table" id="bt-regimes">
+            <thead><tr><th>Regime</th><th>Trades</th><th>Win rate</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </section>
+
+        <section>
+          <h2>Confidence calibration</h2>
+          <table class="table" id="bt-calib">
+            <thead><tr><th>Predicted</th><th>Trades</th><th>Observed win rate</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </section>
+
+        <p class="disclaimer">
+          Backtests use deterministic synthetic 1m candles for each asset (volatility
+          profile matches the asset class) plus whatever live candles you have in
+          storage. They are <strong>not</strong> a guarantee of future accuracy.
+        </p>
+      </section>
+
+      <!-- ============ HISTORY TAB ============ -->
+      <section class="tab-pane" data-pane="history">
+        <section class="controls tight">
+          <label class="ctl">
+            <span>Filter dir</span>
+            <select id="hist-dir">
+              <option value="all">All</option>
+              <option value="CALL">CALL</option>
+              <option value="PUT">PUT</option>
+            </select>
+          </label>
+          <label class="ctl">
+            <span>Outcome</span>
+            <select id="hist-outcome">
+              <option value="all">All</option>
+              <option value="win">Win</option>
+              <option value="loss">Loss</option>
+            </select>
+          </label>
+          <label class="ctl">
+            <span>Asset</span>
+            <select id="hist-asset"><option value="all">All</option></select>
+          </label>
+          <button id="hist-export" class="ghost-btn">Export CSV</button>
+          <button id="hist-clear" class="ghost-btn">Clear</button>
+        </section>
+
+        <section class="grid stats">
+          <article><span>Trades</span><strong id="hist-count">0</strong></article>
+          <article><span>Win rate</span><strong id="hist-wr">—</strong></article>
+          <article><span>Wins</span><strong id="hist-wins">0</strong></article>
+          <article><span>Losses</span><strong id="hist-losses">0</strong></article>
+        </section>
+
+        <section>
+          <h2>Filtered calls</h2>
+          <ul id="hist-list" class="history"></ul>
+        </section>
+      </section>
+
+      <!-- ============ ASSETS TAB ============ -->
+      <section class="tab-pane" data-pane="assets">
+        <p class="hint">
+          Auto-detection reads the visible chart symbol, URL, and page title to pick
+          the active asset. You can also click any row to switch.
+        </p>
+        <table class="table" id="asset-table">
+          <thead>
+            <tr>
+              <th>Asset</th>
+              <th>Class</th>
+              <th>Session</th>
+              <th>Best strategy</th>
+              <th>Historic WR</th>
+              <th>Live WR</th>
+              <th>Trades</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
+
+      <!-- ============ SETTINGS TAB ============ -->
+      <section class="tab-pane" data-pane="settings">
+        <section>
+          <h2>Engine</h2>
+          <label class="check"><input type="checkbox" id="set-calibration" checked />
+            Calibration: shrink engine confidence toward observed hit rate per bucket
+          </label>
+        </section>
+
+        <section>
+          <h2>Reset</h2>
+          <button id="reset-stats" class="ghost-btn">Reset stats &amp; history</button>
+        </section>
+
+        <p class="disclaimer">
+          Educational confluence only. Binary options are designed with a payout
+          edge against the trader. Nothing here is a broker, not auto-trade by
+          default, and not a profit promise.
+        </p>
       </section>
 
       <p class="disclaimer">
-        Educational confluence only. Not a broker, not auto-trade, not a profit
-        guarantee. Binary payouts usually require well above 50% to break even.
+        Educational confluence only. Not a broker, not financial advice, not a
+        profit guarantee.
       </p>
     </div>
     <script src="lib/indicators.js"></script>
-    <script src="lib/engine.js"></script>
+    <script src="lib/assets.js"></script>
+    <script src="lib/strategy.js"></script>
     <script src="lib/feed.js"></script>
+    <script src="lib/engine.js"></script>
+    <script src="lib/storage.js"></script>
+    <script src="lib/auto.js"></script>
+    <script src="lib/backtest.js"></script>
+    <script src="lib/workers.js"></script>
+    <script src="lib/quotex.js"></script>
     <script src="dashboard.js"></script>
   </body>
 </html>

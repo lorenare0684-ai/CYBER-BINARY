@@ -1,7 +1,7 @@
 "use strict";
 
-const DASH_W = 440;
-const DASH_H = 720;
+const DASH_W = 480;
+const DASH_H = 820;
 let dashWindowId = null;
 
 function dashboardUrl() {
@@ -42,7 +42,7 @@ chrome.action.onClicked.addListener(async (tab) => {
   await openDashboard();
 });
 
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || typeof msg !== "object") return;
 
   if (msg.type === "CYBER_OPEN_DASH") {
@@ -64,5 +64,37 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       sendResponse({ ok: true, payload: d.lastState || null });
     });
     return true;
+  }
+
+  // Forward auto events to any open dashboard.
+  if (msg.type === "CYBER_AUTO_STATE" || msg.type === "CYBER_AUTO_LOG" || msg.type === "CYBER_AUTO_DECISION") {
+    chrome.runtime.sendMessage(msg).catch(() => {});
+    sendResponse({ ok: true });
+    return;
+  }
+
+  // Asset/strategy setters — relay to the active tab.
+  if (msg.type === "CYBER_SET_ASSET" || msg.type === "CYBER_SET_STRATEGY" ||
+      msg.type === "CYBER_SET_AUTO" || msg.type === "CYBER_FORCE_TRADE" ||
+      msg.type === "CYBER_DETECT_ASSET" || msg.type === "CYBER_QUOTEX_SET_AUTH") {
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      if (tabs && tabs[0]) {
+        chrome.tabs.sendMessage(tabs[0].id, msg).then(
+          (r) => sendResponse(r || { ok: true }),
+          () => sendResponse({ ok: false })
+        );
+      } else {
+        sendResponse({ ok: false });
+      }
+    });
+    return true;
+  }
+
+  // Forward v2.1 platform events to the dashboard.
+  if (msg.type === "CYBER_QUOTEX_STATUS" || msg.type === "CYBER_QUOTEX_INSTRUMENTS" ||
+      msg.type === "CYBER_QUOTEX_BALANCE" || msg.type === "CYBER_QUOTEX_TRADE_RESULT") {
+    chrome.runtime.sendMessage(msg).catch(() => {});
+    sendResponse({ ok: true });
+    return;
   }
 });
