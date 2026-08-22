@@ -1,14 +1,22 @@
 {
   "manifest_version": 3,
-  "name": "CYBER BINARY — Quotex Signal Lab",
-  "version": "2.1.0",
-  "description": "v2.1: full Quotex.io integration — first-class adapter that decodes the platform's WebSocket traffic, drives the auto-trade engine with real candles, and offers a real-platform trade path. Educational only — not financial advice.",
-  "permissions": ["storage", "windows", "tabs", "scripting", "notifications"],
+  "name": "CYBER BINARY \u2014 Quotex Signal Lab",
+  "version": "2.2.0",
+  "description": "v2.2: fixed Quotex integration \u2014 reliable asset auto-detection, real historical candles replace the synthetic seed, stable closed-bar MACD/signals, and a chart that matches the platform. Educational only \u2014 not financial advice.",
+  "permissions": [
+    "storage",
+    "windows",
+    "tabs",
+    "scripting",
+    "notifications"
+  ],
   "host_permissions": [
     "https://qxbroker.com/*",
     "https://quotex.com/*",
+    "https://quotex.io/*",
     "https://*.quotex.com/*",
-    "https://*.qxbroker.com/*"
+    "https://*.qxbroker.com/*",
+    "https://*.quotex.io/*"
   ],
   "background": {
     "service_worker": "src/background.js"
@@ -28,9 +36,12 @@
         "https://qxbroker.com/*",
         "https://quotex.com/*",
         "https://*.quotex.com/*",
-        "https://*.qxbroker.com/*"
+        "https://*.qxbroker.com/*",
+        "https://*.quotex.io/*"
       ],
-      "js": ["src/page-hook.js"],
+      "js": [
+        "src/page-hook.js"
+      ],
       "run_at": "document_start",
       "all_frames": true,
       "world": "MAIN"
@@ -40,7 +51,8 @@
         "https://qxbroker.com/*",
         "https://quotex.com/*",
         "https://*.quotex.com/*",
-        "https://*.qxbroker.com/*"
+        "https://*.qxbroker.com/*",
+        "https://*.quotex.io/*"
       ],
       "js": [
         "src/lib/indicators.js",
@@ -55,7 +67,9 @@
         "src/lib/quotex.js",
         "src/content.js"
       ],
-      "css": ["src/content.css"],
+      "css": [
+        "src/content.css"
+      ],
       "run_at": "document_idle",
       "all_frames": true
     }
@@ -73,7 +87,8 @@
         "https://qxbroker.com/*",
         "https://quotex.com/*",
         "https://*.quotex.com/*",
-        "https://*.qxbroker.com/*"
+        "https://*.qxbroker.com/*",
+        "https://*.quotex.io/*"
       ]
     }
   ],

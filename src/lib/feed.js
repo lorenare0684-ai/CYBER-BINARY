@@ -1,6 +1,10 @@
 /**
  * Multi-asset candle feed.
- *  - createFeed: live tick ingestion for a single asset.
+ *  - createFeed: live tick ingestion for a single asset. Internally keeps a
+ *    sorted, de-duplicated array of CLOSED bars plus one "current" live bar.
+ *    `ingestCandle` / `mergeCandles` are order-safe (oldest-first OR
+ *    newest-first broker history works correctly) and replace synthetic
+ *    seed data with real broker history instead of mixing the two.
  *  - syntheticSeries: build a long 1m series for any asset profile with
  *    realistic regime cycles (trending → ranging → volatile → ranging).
  *  - cycSynthetic: cyclical, regime-aware generator used by historic backtest.
@@ -21,13 +25,67 @@
   function createFeed(opts) {
     const tf = (opts && opts.tfMs) || 60000;
     const max = (opts && opts.max) || 600;
-    let candles = [];
-    let current = null;
+    let candles = [];       // sorted CLOSED bars only (oldest → newest)
+    let current = null;     // in-progress bar
     let last = null;
     const volProfile = (opts && opts.volProfile) || null;
 
     function bucket(ts) {
       return Math.floor(ts / tf) * tf;
+    }
+
+    function cap() {
+      if (candles.length > max) candles = candles.slice(-max);
+    }
+
+    function pushClosed(c) {
+      if (!c) return;
+      // De-dupe by time before appending (never push the same bar twice).
+      const n = candles.length;
+      if (n && candles[n - 1].time === c.time) candles[n - 1] = c;
+      else candles.push(c);
+      cap();
+    }
+
+    function normalizeCandle(c) {
+      if (!c || !Number.isFinite(Number(c.time))) return null;
+      const time = Number(c.time) > 1e12 ? Math.floor(Number(c.time)) : Math.floor(Number(c.time) * 1000);
+      const open = Number(c.open);
+      const close = Number(c.close);
+      if (!Number.isFinite(open) || !Number.isFinite(close)) return null;
+      let high = Number.isFinite(Number(c.high)) ? Number(c.high) : Math.max(open, close);
+      let low = Number.isFinite(Number(c.low)) ? Number(c.low) : Math.min(open, close);
+      if (high < low) { const tmp = high; high = low; low = tmp; }
+      const volume = Number.isFinite(Number(c.volume)) ? Number(c.volume) : 0;
+      return { time, open, high, low, close, volume };
+    }
+
+    /**
+     * Merge a batch of candles (any order, may be empty) with the current
+     * series. The newest bar in the merged set becomes the live bar; every
+     * other bar is a closed bar. Returning `closed` tells callers which bar
+     * just closed so pending signals can be settled.
+     */
+    function mergeCandles(list) {
+      if (!Array.isArray(list) || !list.length) return { closed: null, current, last };
+      const map = Object.create(null);
+      for (let i = 0; i < candles.length; i++) map[candles[i].time] = candles[i];
+      if (current) map[current.time] = current;
+      for (let i = 0; i < list.length; i++) {
+        const n = normalizeCandle(list[i]);
+        if (n) map[n.time] = n;
+      }
+      const keys = Object.keys(map).map(Number).sort(function (a, b) { return a - b; });
+      if (!keys.length) return { closed: null, current, last };
+      const all = [];
+      for (let i = 0; i < keys.length; i++) all.push(map[keys[i]]);
+      const prevCurrentTime = current ? current.time : null;
+      candles = all.slice(0, -1);
+      cap();
+      current = Object.assign({}, all[all.length - 1]);
+      last = current.close;
+      const closed = prevCurrentTime != null && prevCurrentTime !== current.time ? map[prevCurrentTime] : null;
+      return { closed, current, last };
     }
 
     function ingest(price, ts) {
@@ -37,8 +95,7 @@
       let closed = null;
       if (!current || current.time !== t) {
         if (current) {
-          candles.push(current);
-          if (candles.length > max) candles = candles.slice(-max);
+          pushClosed(current);
           closed = current;
         }
         current = { time: t, open: price, high: price, low: price, close: price };
@@ -78,52 +135,77 @@
       return series();
     }
 
+    /**
+     * Replace the whole series (e.g. real broker history arriving after a
+     * synthetic seed). Sorts + de-dupes. The last bar becomes the live bar.
+     * This truly replaces — it never merges with the previous seed.
+     */
     function setSeries(arr) {
-      candles = arr.slice();
-      if (candles.length > max) candles = candles.slice(-max);
-      const lastBar = candles[candles.length - 1];
-      last = lastBar ? lastBar.close : null;
-      current = lastBar ? Object.assign({}, lastBar) : null;
+      if (!Array.isArray(arr) || !arr.length) {
+        candles = []; current = null; last = null;
+        return series();
+      }
+      const list = [];
+      for (let i = 0; i < arr.length; i++) {
+        const n = normalizeCandle(arr[i]);
+        if (n) list.push(n);
+      }
+      const map = Object.create(null);
+      for (let i = 0; i < list.length; i++) map[list[i].time] = list[i];
+      const keys = Object.keys(map).map(Number).sort(function (a, b) { return a - b; });
+      candles = []; current = null; last = null;
+      for (let i = 0; i < keys.length; i++) candles.push(map[keys[i]]);
+      cap();
+      if (candles.length) {
+        current = Object.assign({}, candles.pop());
+        last = current.close;
+        // cap() above already trimmed; ensure final current is the newest.
+      }
+      return series();
     }
+
+    // Backwards-compatible alias used by v2.1 callers.
+    function replaceCandles(arr) { return setSeries(arr); }
 
     /**
      * v2.1: ingest a fully-formed OHLCV candle (e.g. delivered by the
-     * page's WebSocket). Returns {closed, current, last} for the
-     * same shape as `ingest` so callers can detect bar closes
-     * uniformly.
+     * page's WebSocket). Order-safe: old history inserts at the correct
+     * position, a live update patches the current bar, a newer bar closes
+     * the previous one. Returns {closed, current, last} so callers can
+     * detect bar closes uniformly.
      */
     function ingestCandle(c) {
-      if (!c || typeof c.time !== "number") return null;
-      if (!Number.isFinite(c.open) || !Number.isFinite(c.close)) return null;
-      let closed = null;
-      if (current && current.time === c.time) {
-        // Update the in-progress bar in place.
-        if (Number.isFinite(c.high)) current.high = Math.max(current.high, c.high);
-        if (Number.isFinite(c.low))  current.low  = Math.min(current.low,  c.low);
-        current.close = c.close;
-        if (Number.isFinite(c.open)) current.open = c.open;
-      } else {
-        // New bar. Close the previous one if it exists.
-        if (current) {
-          candles.push(current);
-          if (candles.length > max) candles = candles.slice(-max);
-          closed = current;
-        }
-        current = {
-          time: c.time,
-          open: c.open,
-          high: Number.isFinite(c.high) ? c.high : Math.max(c.open, c.close),
-          low:  Number.isFinite(c.low)  ? c.low  : Math.min(c.open, c.close),
-          close: c.close,
-          volume: c.volume || 0,
-        };
-      }
-      last = c.close;
+      return mergeCandles([c]);
+    }
+
+    /** Close the current bar if it is stale (bucket older than `ts`). */
+    function forceClose(ts) {
+      if (!current) return null;
+      const t = bucket(ts || Date.now());
+      if (current.time >= t) return null;
+      const closed = current;
+      pushClosed(closed);
+      current = null;
       return { closed, current, last };
     }
 
+    /**
+     * Drop every closed bar older than `ts` (and the current bar too if it is
+     * older). Used when real broker history arrives: the synthetic seed bars
+     * live entirely before the first real candle, so this purges them before
+     * `mergeCandles` inserts the actual history.
+     */
+    function pruneBefore(ts) {
+      if (ts == null) return 0;
+      const before = candles.length;
+      candles = candles.filter((c) => c.time >= ts);
+      if (current && current.time < ts) current = null;
+      return before - candles.length;
+    }
+
     return {
-      ingest, ingestCandle, series, seedHistory, setSeries,
+      ingest, ingestCandle, mergeCandles, series, seedHistory, setSeries,
+      replaceCandles, forceClose, pruneBefore,
       lastPrice: () => last,
       reset: () => { candles = []; current = null; last = null; },
       size: () => candles.length + (current ? 1 : 0),
