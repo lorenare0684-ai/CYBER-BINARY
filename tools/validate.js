@@ -65,6 +65,32 @@ else {
 if (!sandbox.self.CYBER_ASSETS || !sandbox.self.CYBER_ASSETS.list().length) {
   console.error("assets missing"); failed++;
 }
+else {
+  const A = sandbox.self.CYBER_ASSETS;
+  const all = A.list();
+  if (all.length < 140) { console.error("asset catalog too small: " + all.length); failed++; }
+  const dupIds = all.map((a) => a.id).filter((v, i, arr) => arr.indexOf(v) !== i);
+  if (dupIds.length) { console.error("duplicate asset ids", dupIds); failed++; }
+  const kinds = new Set(all.map((a) => a.kind));
+  for (const k of ["fx", "crypto", "commodity", "index", "stock", "otc"]) {
+    if (!kinds.has(k)) { console.error("missing asset kind " + k); failed++; }
+  }
+  // detection smoke (display names + OTC routing + tickers)
+  const detCases = [
+    ["EURUSD", "EURUSD"], ["EUR/USD", "EURUSD"], ["EURUSD_otc", "EURUSD_otc"],
+    ["EUR/USD OTC", "EURUSD_otc"], ["BTCUSD", "BTCUSD"], ["BTCUSD_otc", "BTCUSD_otc"],
+    ["GBPNZD", "GBPNZD"], ["GBP/NZD OTC", "GBPNZD_otc"], ["SOLUSD_otc", "SOLUSD_otc"],
+    ["AAPL_otc", "AAPL_otc"], ["Apple (OTC)", "AAPL_otc"], ["TSLA OTC", "TSLA_otc"],
+    ["S&P 500", "SPXUSD"], ["XAUUSD", "XAUUSD"], ["XAUUSD OTC", "XAUUSD_otc"],
+    ["GOLD", "XAUUSD"], ["USD/JPY", "USDJPY"], ["TESLA", "TSLA_otc"],
+  ];
+  for (const [text, want] of detCases) {
+    const d = A.detect(text);
+    if (!d || d.id !== want) { console.error("detect(" + text + ") expected " + want + " got " + (d && d.id)); failed++; }
+  }
+  // OTC twins must never be returned for plain base text
+  if (A.detect("EUR/USD").id !== "EURUSD") { console.error("EUR/USD must map to base EURUSD"); failed++; }
+}
 if (!sandbox.self.CYBER_STRATEGIES || !sandbox.self.CYBER_STRATEGIES.list().length) {
   console.error("strategies missing"); failed++;
 }
@@ -119,6 +145,34 @@ else {
   const wsPlace = Q.placeTradeWs(fakeW, { asset: "EURUSD_otc", dir: "CALL", amount: 1, expiry: 60 });
   if (!wsPlace || !wsPlace.ok) { console.error("placeTradeWs should succeed with fake ws"); failed++; }
   if (!fakeW.sent.some((m) => m.indexOf('"orders/open"') !== -1)) { console.error("orders/open not sent"); failed++; }
+
+  // v2.3: outgoing-frame sniffing — the client's own requests reveal the
+  // active asset (this is the primary auto-detection source).
+  let sniffedAsset = null;
+  sandbox.window.WebSocket = FakeWS;
+  const r2 = Q.attachPageSocket({
+    onStatus: function () {},
+    onTick: function () {},
+    onInstruments: function () {},
+    onAsset: function (sym) { sniffedAsset = sym; },
+  });
+  const fakeW2 = new sandbox.window.WebSocket("wss://x");
+  fakeW2.send('42["instruments/follow","EURUSD_otc"]');
+  fakeW2.send('42["history/list/v2",{"asset":"GBPUSD","period":60,"offset":0,"limit":100}]');
+  fakeW2.send('42["orders/open",{"asset":"XAUUSD_otc"}]');
+  if (sniffedAsset !== "XAUUSD_otc") { console.error("outgoing sniff failed, got " + sniffedAsset); failed++; }
+  if (Q.sniffOutgoing('2') !== null || Q.sniffOutgoing('42["tick"]') !== null) { console.error("sniffOutgoing false positive"); failed++; }
+  r2.detach();
+
+  // v2.3: numeric-id tick rows resolve via the live instruments payload.
+  Q.rememberIds([[1, "EURUSD", "EUR/USD", "currency", 85, 0, 0, 0, 0, 0, 0, 0, [[60]], 0, true, []]]);
+  const nq = Q.parseQuote([[1, 1700000000000, 1.0855]]);
+  if (!nq || nq.symbol !== "EURUSD" || nq.price !== 1.0855) { console.error("numeric-id tick parse failed"); failed++; }
+  const wq = Q.parseQuote({ tick: [["EURUSD_otc", 1700000000000, 1.0856]] });
+  if (!wq || wq.symbol !== "EURUSD_otc") { console.error("{tick:[...]} wrapper parse failed"); failed++; }
+  const tq = Q.decodeFrame('43["tick",{"tick":[["EURUSD_otc",1700000000000,1.0857]]}]');
+  if (!tq || tq.event !== "tick" || Q.normalizeEvent(tq) !== "quote") { console.error("tick event mapping failed"); failed++; }
+
   r.detach();
   if (sandbox.window.WebSocket !== FakeWS) { console.error("detach did not restore", typeof sandbox.window.WebSocket); failed++; }
 }

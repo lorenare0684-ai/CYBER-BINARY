@@ -14,7 +14,12 @@
  *   - Daily loss cap kills auto-trade for the rest of the day.
  *   - Min confidence gate.
  *   - Per-hour / per-day trade caps.
- *   - Cooldown bars between trades.
+ *   - Cooldown bars between trades (v2.3: enforced unconditionally — the old
+ *     check read signal.metrics.closeTime which the engine never sets).
+ *   - Per-signal dedup (v2.3): one action per (asset, closed bar, direction),
+ *     so a signal never re-fires on the 500ms tick loop.
+ *   - Hard minimum interval (default 5s, settings.minIntervalMs) even when
+ *     cooldown is 0.
  *   - Per-asset "freeze" when an asset just lost.
  *
  * The module never reads the user's broker credentials or attempts to
@@ -39,6 +44,8 @@
       armed: false,
       mode: "off",
       lastTrade: null,    // { at, asset, dir, expired }
+      lastAttemptAt: 0,   // last time a trade action was actually taken
+      lastSignalKey: "",  // dedup: last (asset, bar, direction) processed
       tradesToday: 0,
       tradesHour: 0,
       hourStart: Date.now(),
@@ -65,6 +72,8 @@
         tradesHour: ctx.tradesHour,
         dailyPnl: ctx.dailyPnl,
         lastTrade: ctx.lastTrade,
+        lastAttemptAt: ctx.lastAttemptAt,
+        lastSignalKey: ctx.lastSignalKey,
         frozenAssets: Object.assign({}, ctx.frozenAssets),
       };
     }
@@ -107,12 +116,22 @@
       if ((signal.confidence || 0) < (s.minConfidence || 0)) {
         return { ok: false, reason: `Low confidence (${signal.confidence})` };
       }
-      // Cooldown
-      if (ctx.lastTrade && signal.metrics && signal.metrics.closeTime) {
-        const bars = (Date.now() - ctx.lastTrade.at) / 60000;
-        if (bars < (s.cooldownBars || 0)) {
-          return { ok: false, reason: `Cooldown (${bars.toFixed(1)}m)` };
+      // Cooldown — enforced unconditionally (v2.3: the old check depended on
+      // signal.metrics.closeTime which the engine never sets, so cooldown was
+      // skipped entirely and auto mode spammed one trade per 500ms tick).
+      if (ctx.lastTrade) {
+        const mins = (Date.now() - ctx.lastTrade.at) / 60000;
+        if (mins < (s.cooldownBars || 0)) {
+          return { ok: false, reason: `Cooldown (${mins.toFixed(1)}m of ${s.cooldownBars}m)` };
         }
+      }
+      // Hard safety floor: never act more often than every 5 seconds, no
+      // matter what the settings say (configurable via settings.minIntervalMs
+      // for testing / expert tuning; default 5000).
+      const minGap = (s.minIntervalMs != null && Number.isFinite(Number(s.minIntervalMs)))
+        ? Math.max(1000, Number(s.minIntervalMs)) : 5000;
+      if (ctx.lastAttemptAt && Date.now() - ctx.lastAttemptAt < minGap) {
+        return { ok: false, reason: `Minimum interval (${(minGap / 1000).toFixed(0)}s)` };
       }
       // Asset freeze
       const asset = signal.asset;
@@ -128,6 +147,18 @@
       if (opts && opts.onSignal) opts.onSignal(signal);
       if (signal.direction === "WAIT") return;
       if (ctx.mode === "off" || !ctx.armed) return;
+
+      // v2.3: per-signal dedup — one attempt per (asset, bar, direction).
+      // handleSignal is called on every tick by content.js; without this the
+      // controller placed/alerted on the SAME bar+direction repeatedly.
+      // Only applies when a bar timestamp exists; otherwise the 5s minimum
+      // interval in canTrade() still throttles.
+      const barKey = signal.time || (signal.metrics && (signal.metrics.time || signal.metrics.closeTime)) || 0;
+      if (barKey) {
+        const sigKey = (signal.asset || "") + ":" + barKey + ":" + signal.direction;
+        if (sigKey === ctx.lastSignalKey) return;
+        ctx.lastSignalKey = sigKey;
+      }
 
       const decision = await canTrade(signal);
       const log = {
@@ -145,6 +176,8 @@
       };
 
       if (!decision.ok) {
+        // Release the dedup key so the next (new) bar gets a fresh chance,
+        // but a NEW bar+direction WILL get evaluated (keys differ anyway).
         pushLog("skip", `Skip ${signal.direction} ${signal.asset || ""}: ${decision.reason}`);
         if (opts && opts.onTrade) opts.onTrade(log);
         return;
@@ -158,6 +191,7 @@
           expiry: decision.settings.expiry,
         });
         log.action = result;
+        ctx.lastAttemptAt = Date.now();
         if (result && result.ok) {
           ctx.tradesToday++;
           ctx.tradesHour++;
@@ -168,6 +202,7 @@
         }
       } else if (ctx.mode === "alerts") {
         log.action = { kind: "alert" };
+        ctx.lastAttemptAt = Date.now();
         if (decision.settings && decision.settings.notifySound) playBeep(signal.direction);
         if (decision.settings && decision.settings.notifyDesktop) notifyDesktop(signal);
         ctx.tradesToday++;

@@ -1,11 +1,16 @@
 "use strict";
 
 /**
- * CYBER BINARY v2.2 — content script.
+ * CYBER BINARY v2.3 — content script.
  *
  * Runs in the page's ISOLATED world. Reads the live state the page-hook
  * pushes via window.postMessage, keeps one feed per detected asset, runs
  * the confluence engine, and bridges results to the popup dashboard.
+ *
+ * v2.3 detection: the active asset now comes from (in order) the socket
+ * symbol (outgoing-frame sniffing + incoming ticks/history), the adapter's
+ * DOM helpers, class selectors, a text-scan of visible labels against the
+ * full catalog (hashed CSS-module class names), page title and URL.
  *
  * v2.2 fixes:
  *   - Real broker history REPLACES the synthetic seed (no more mixed
@@ -97,6 +102,46 @@
     return ASSETS.detect(text);
   }
 
+  let lastDomTextScan = 0;
+
+  /**
+   * v2.3: text-based fallback. The modern Quotex UI ships hashed CSS-module
+   * class names, so `[class*='asset']` style selectors miss it. Instead scan
+   * small leaf nodes for strings that match the (now complete) asset catalog
+   * — "EUR/USD", "EUR/USD OTC", "Bitcoin (OTC)", "Apple", "S&P 500" — and
+   * prefer the shortest match (most specific label).
+   */
+  function scanDomForAssetText(force) {
+    const now = Date.now();
+    if (!force && now - lastDomTextScan < 2000) return null; // throttle
+    lastDomTextScan = now;
+    let best = null;
+    let bestLen = 1e9;
+    const nodes = document.querySelectorAll("span, div, button, a, h1, h2, h3, td, p");
+    for (let i = 0; i < nodes.length; i++) {
+      const el = nodes[i];
+      if (el.id === "cyber-binary-hud" || (el.closest && el.closest("#cyber-binary-hud"))) continue;
+      if (el.children.length > 2) continue; // skip containers with many children
+      if (!el.offsetParent && el.getClientRects().length === 0) continue; // hidden
+      const t = visibleText(el);
+      if (!t || t.length < 2 || t.length > 40) continue;
+      if (/^[\d.,\s%+\-—:]+$/.test(t)) continue; // pure price/percent text
+      const det = ASSETS.detect(t);
+      if (!det) continue;
+      // Score: exact-ish short labels win. Penalize OTC-less matches for OTC
+      // text and vice versa so "EUR/USD" (base) isn't outvoted by noise.
+      const wantsOtc = /OTC|\(OT\)/i.test(t);
+      const isOtc = /_otc$/i.test(det.id);
+      if (wantsOtc !== isOtc) continue;
+      const score = t.length;
+      if (score < bestLen) {
+        bestLen = score;
+        best = det;
+      }
+    }
+    return best;
+  }
+
   function detectAssetFromDom() {
     // First choice: the adapter's canonical DOM helpers.
     if (QUOTEX && QUOTEX.findAssetHeader) {
@@ -131,6 +176,9 @@
         }
       }
     }
+    // v2.3: hashed-class fallback — match by visible text against the catalog.
+    const textDet = scanDomForAssetText(false);
+    if (textDet) return textDet;
     const titleAsset = ASSETS.detect(document.title);
     if (titleAsset) return titleAsset;
     const urlAsset = ASSETS.detect(location.href);
@@ -354,6 +402,9 @@
       lastOrders = snap.orders.slice(0, 50);
       try { chrome.runtime.sendMessage({ type: "CYBER_QUOTEX_TRADE_RESULT", payload: lastOrders[0] }).catch(() => {}); } catch (_) {}
     }
+    // v2.3: the hook's last-known socket symbol (from outgoing frames or
+    // history responses) is authoritative for late attaches.
+    if (snap.lastWsSymbol) lastWsSymbol = snap.lastWsSymbol;
     const ticks = snap.ticks || {};
     let bestSymbol = lastWsSymbol;
     let bestTime = 0;
@@ -395,6 +446,13 @@
     sig.asset = asset ? asset.id : activeAsset;
     sig.assetName = asset ? asset.name : activeAsset;
     sig.strategy = currentStrategy;
+    // v2.3: tag the closed bar the signal was computed on, so the auto
+    // controller can dedup per (asset, bar, direction) and the dashboard can
+    // show the bar time. Without it the controller re-fires every tick.
+    if (a.length) {
+      const lastBar = a[a.length - 1];
+      if (lastBar && lastBar.time != null) sig.time = lastBar.time;
+    }
     paintHud(sig);
     pushState(sig);
 

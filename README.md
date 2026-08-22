@@ -1,8 +1,20 @@
-# CYBER BINARY — Quotex Signal Lab v2.1
+# CYBER BINARY — Quotex Signal Lab v2.3
 
-Chrome extension (Manifest V3) that attaches to a Quotex / QX Broker chart, builds 1-minute candles from the live quote, and scores **CALL / PUT / WAIT** from a multi-indicator, multi-timeframe confluence engine. v2.1 adds a **first-class Quotex adapter** that decodes the platform's WebSocket traffic, drives the engine with real candles/ticks/balance, and offers a real-platform trade path.
+Chrome extension (Manifest V3) that attaches to a Quotex / QX Broker chart, builds 1-minute candles from the live quote, and scores **CALL / PUT / WAIT** from a multi-indicator, multi-timeframe confluence engine. The Quotex adapter decodes the platform's WebSocket traffic and drives the engine with real candles/ticks/balance.
 
 > Educational market analysis only. Not a broker. Not financial advice. Binary options have a built-in payout edge against the trader — nothing here is a profit guarantee.
+
+## What's new in v2.3 — every Quotex asset + reliable auto-detection
+
+- **Full Quotex asset catalog** (~170 symbols): every base FX pair (EURUSD, GBPUSD, … GBPNZD, NZDCAD, NZDCHF) **plus its `_otc` twin**, exotic FX OTC pairs (BRL/USD, USD/MXN, ARS/USD, USD/TRY, USD/COP …), all crypto OTC (BTC, ETH, SOL, ADA, XRP, LTC, DOGE, SHIB, TRX, LINK, DOT …), commodities (XAU, XAG, oil, gas, platinum, palladium, copper), all 13 indices, and the full stock list (AAPL, AMZN, TSLA, NVDA, MSFT, GOOGL, META, JPM, KO, WMT …). Broker-internal numeric IDs are baked in where confirmed and **self-heal at runtime**: any asset the platform lists in `instruments/list` is registered on the fly with its real ID, payout and timeframes, and appears in the Assets tab, the asset dropdown and per-asset accuracy reports.
+- **Auto-detection that actually works on the live platform:**
+  - **Outgoing-frame sniffing** — the extension watches the frames the page itself sends (`instruments/follow`, `instruments/update`, `history/list/v2`, `chart_notification/get`, `orders/open`), so the moment you open or switch a chart, the exact asset (e.g. `EURUSD_otc`) is known — no DOM guessing.
+  - **Numeric-id tick resolution** — `quotes/stream` rows that arrive as `[assetId, ts, price]` are resolved through the live instruments list.
+  - **DOM text-scan fallback** — the modern Quotex UI ships hashed CSS-module class names, so class selectors miss; the extension now scans small visible text nodes against the catalog ("EUR/USD", "EUR/USD OTC", "Bitcoin (OTC)", "S&P 500" …) and picks the most specific match.
+  - **History-payload detection** — incoming `history/list/v2` / `chart_notification/get` responses name their asset, another reliable signal.
+  - Detection layers in order: socket symbol → adapter DOM helpers → class selectors → text scan → page title → URL.
+- **Trade placement that works on the current UI** — the CALL/PUT button finder now understands the hashed-class DOM: it classifies any visible clickable by its label/aria/class (call/buy/up vs put/sell/down), falls back to green=call / red=put color detection, and only as a last resort to position. The stake input finder scores candidates (hints + trade-panel containment + proximity to the buttons) so it sets the right field, and `placeTrade` still prefers a real `orders/open` WebSocket frame.
+- **No more trade spam** — the auto controller now dedups per (asset, closed-bar, direction), so it fires **once per signal**, not once per 500ms tick; `cooldownBars` is enforced unconditionally (the old check read a `metrics.closeTime` field the engine never set, so cooldown silently never fired); and a hard minimum interval (5s, configurable via `settings.minIntervalMs`) prevents double-fires. Auto "alerts" mode no longer floods notifications for the same bar either.
 
 ## What's new in v2
 
@@ -16,7 +28,7 @@ Chrome extension (Manifest V3) that attaches to a Quotex / QX Broker chart, buil
   - **Alerts** — sound + desktop notification + dashboard pulse on qualifying signals. (Default.)
   - **Click** — actively click the visible CALL/PUT button with your stake and expiry, gated by safety limits.
 - **Safety limits** — confidence floor, daily loss cap, hourly / daily trade caps, cooldown bars, per-asset freeze, kill-switch (ARM/DISARM).
-- **Historic backtest** — runs the engine across the full asset catalog (16 assets: FX, crypto, commodities, indices, OTC) on deterministic synthetic 1m candles that cycle through trending / ranging / choppy regimes. Returns per-asset, per-strategy, per-regime, per-confidence-bucket accuracy.
+- **Historic backtest** — runs the engine across the full asset catalog (170+ assets: every Quotex FX pair + OTC twins, crypto OTC, commodities, indices, stocks OTC) on deterministic synthetic 1m candles that cycle through trending / ranging / choppy regimes. Returns per-asset, per-strategy, per-regime, per-confidence-bucket accuracy.
 - **Per-asset historic accuracy** + best-strategy recommendation.
 - **Trade history** with filters (dir / outcome / asset), CSV export, and per-asset / per-strategy / per-regime breakdowns.
 - **Walk-forward validation** helper to detect overfit.
@@ -33,7 +45,7 @@ v2.1 turns the extension into a first-class Quotex citizen. The generic page-hoo
   - Headerless binary: `\x04<...>` payloads inferred by shape (instruments list, quotes stream, history candles, balance)
   - 30+ known event names mapped to typed callbacks (`candle`, `tick`, `instruments`, `balance`, `order_opened`, `order_closed`, `authenticated`, `auth_error`, `error`)
 - **Page-side WebSocket hijack** (`attachPageSocket`). The adapter wraps `window.WebSocket` so every page-owned socket goes through the decoder. The wrapper is idempotent (`__cyberWrapped` flag) and exposes a `detach()` to put the native constructor back. We never open a second connection — we listen to the page's own traffic.
-- **Full Quotex asset catalog baked in** (84 symbols with their broker-internal numeric IDs, including the `_otc` synthetic variants). The adapter exposes a `getInstruments()` helper and a runtime `ASSET_IDS` map so detection works on any symbol the platform offers.
+- **Full Quotex asset catalog baked in** (~170 symbols with their broker-internal numeric IDs where confirmed, including every `_otc` synthetic variant). The adapter exposes a `getInstruments()` helper, a runtime `ASSET_IDS` map, and `rememberIds()` — live `instruments/list` payloads merge in the real IDs, payouts and timeframes for any symbol the platform adds.
 - **Real-platform payload parsers** for instruments list, candles, ticks, balance, and orders (opened/closed) — including the `[ts, open, low, high, close, vol?]` candle shape with high/low normalization and ms-epoch inference.
 - **Real platform DOM helpers** — `findPanel`, `findAssetHeader`, `findPriceLabel`, `findStakeInput`, `findExpirySelect`, `findCallButton`, `findPutButton`, `findBalance`, `setStake`. These supersede the inline selectors that lived in `content.js` / `auto.js`.
 - **`placeTrade`** with two modes:
@@ -92,7 +104,7 @@ A signal needs a vote score ≥ the strategy's `minScore` and a 2-point lead for
 ```bash
 node tools/validate.js              # structure + engine + backtest smoke
 node tools/backtest.js              # legacy single-asset backtest
-node tools/historic.js              # full matrix across 16 assets × strategies
+node tools/historic.js              # full matrix across 170+ assets × strategies
 node tools/historic.js --days 7     # 7 days
 node tools/historic.js --kinds fx   # FX only
 node tools/historic.js --strategies trend,meanrev,breakout
@@ -109,7 +121,7 @@ src/page-hook.js         # MAIN-world WebSocket wrap → CYBER_QUOTEX adapter
 src/content.js           # quote ingest, candles, multi-asset feeds, auto-trade
 src/dashboard.html|.js|.css  # tabbed lab UI
 src/lib/indicators.js    # 19 indicators + multi-timeframe resampler
-src/lib/assets.js        # 16-asset catalog + runtime registerQuotexAsset()
+src/lib/assets.js        # full Quotex catalog (170+) + runtime registerQuotexAsset()
 src/lib/strategy.js      # 6 strategy presets
 src/lib/engine.js        # confluence engine + backtest + walk-forward
 src/lib/feed.js          # live + synthetic 1m series generator (ingestCandle)

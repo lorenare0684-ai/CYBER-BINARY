@@ -45,6 +45,7 @@
     orders: [],       // rolling list of recent orders (last 50)
     status: { state: "idle", url: null },
     assetIdMap: {},   // broker numeric id -> symbol
+    lastWsSymbol: null, // most recent asset seen on the socket (in or out)
   };
 
   var handle = {
@@ -64,6 +65,10 @@
       if (!msg || !msg.asset) return;
       var key = msg.asset + "@" + (msg.period || 60);
       live.candles[key] = msg.candles || [];
+      // Incoming history payloads name their asset — another reliable
+      // active-asset signal (covers builds that never stream quotes/stream).
+      live.lastWsSymbol = msg.asset;
+      emit("asset", { symbol: msg.asset, raw: "ws_candle" });
       emit("candle", { asset: msg.asset, period: msg.period, candles: msg.candles });
     },
     onTick: function (q) {
@@ -80,7 +85,16 @@
         var it = list[i];
         if (it && it.symbol) live.assetIdMap[it.id] = it.symbol;
       }
+      // Learn broker ids so numeric tick rows ([id, ts, price]) resolve.
+      try { if (Q.rememberIds) Q.rememberIds(list); } catch (_) {}
       emit("instruments", list || []);
+    },
+    onAsset: function (symbol) {
+      // Active-asset hint from OUTGOING frames (the web client tells the
+      // server which asset it charts — the most reliable detector of all).
+      if (!symbol) return;
+      live.lastWsSymbol = symbol;
+      emit("asset", { symbol: symbol, raw: "ws_out" });
     },
     onBalance: function (b) {
       live.balance = b;
@@ -117,13 +131,15 @@
       ticks: live.ticks,
       candles: live.candles,
       assetIdMap: live.assetIdMap,
+      lastWsSymbol: live.lastWsSymbol,
       socket: !!handle.lastWs,
       frames: (window.__cyber_frames || []).slice(0, 12),
     };
   }
 
   // Install the WebSocket wrapper *synchronously*. Handles text, Blob and
-  // binary frames; all decoding happens inside the router.
+  // binary frames; all decoding happens inside the router. Also wraps
+  // `send()` so OUTGOING frames reveal the active asset (see onAsset above).
   var Native = window.WebSocket;
   if (typeof Native === "function") {
     handle.native = Native;
@@ -131,6 +147,22 @@
       var ws = protocols !== undefined ? new Native(url, protocols) : new Native(url);
       handle.lastWs = ws;
       try { emit("open", { url: url || "" }); } catch (_) {}
+      // --- outgoing-frame sniffing: the client's own requests tell us the
+      // active asset. This is what makes auto-detection work even when the
+      // DOM uses hashed class names or ticks arrive with numeric ids. ---
+      var nativeSend = ws.send.bind(ws);
+      ws.send = function (data) {
+        try {
+          var s = typeof data === "string" ? data
+            : (typeof ArrayBuffer !== "undefined" && data instanceof ArrayBuffer ? String.fromCharCode.apply(null, new Uint8Array(data)) : null);
+          var hit = s ? Q.sniffOutgoing(s) : null;
+          if (hit && hit.symbol) {
+            live.lastWsSymbol = hit.symbol;
+            emit("asset", { symbol: hit.symbol, raw: "ws_out", event: hit.event });
+          }
+        } catch (_) {}
+        return nativeSend(data);
+      };
       ws.addEventListener("open", function () {
         try { emit("quotex_status", { state: "open", url: url || "" }); } catch (_) {}
       });
