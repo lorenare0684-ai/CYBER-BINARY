@@ -16,6 +16,8 @@ const required = [
   "src/dashboard.css",
   "src/lib/indicators.js",
   "src/lib/engine.js",
+  "src/lib/feed.js",
+  "src/page-hook.js",
   "icons/icon16.png",
   "icons/icon32.png",
   "icons/icon48.png",
@@ -42,6 +44,18 @@ sandbox.globalThis = sandbox.self;
 vm.createContext(sandbox);
 vm.runInContext(fs.readFileSync(path.join(root, "src/lib/indicators.js"), "utf8"), sandbox);
 vm.runInContext(fs.readFileSync(path.join(root, "src/lib/engine.js"), "utf8"), sandbox);
+vm.runInContext(fs.readFileSync(path.join(root, "src/lib/feed.js"), "utf8"), sandbox);
+if (!sandbox.self.CYBER_FEED) {
+  console.error("feed missing");
+  failed++;
+} else {
+  const f = sandbox.self.CYBER_FEED.createFeed({ tfMs: 60000 });
+  f.seedHistory(50, 1.1);
+  if (f.series().length < 40) {
+    console.error("feed seed failed");
+    failed++;
+  }
+}
 
 const rsi = sandbox.self.CYBER_TA.rsi([1, 2, 3, 4, 3, 2, 3, 4, 5, 6, 5, 4, 5, 6, 7, 8], 5);
 if (!rsi.some((v) => v != null)) {

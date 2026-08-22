@@ -13,16 +13,20 @@
           <p class="kicker">Quotex signal lab</p>
           <h1>CYBER BINARY</h1>
         </div>
-        <div id="link-state" class="pill dim">Waiting for chart…</div>
+        <div id="link-state" class="pill dim">Booting…</div>
       </header>
 
       <section class="hero" id="hero" data-dir="WAIT">
         <div class="dir" id="dir">WAIT</div>
-        <div class="reason" id="reason">Attach on a Quotex chart to stream ticks.</div>
+        <div class="reason" id="reason">Warming engine…</div>
         <div class="asset-row">
           <span id="asset">—</span>
           <span id="price">—</span>
         </div>
+      </section>
+
+      <section class="chart-wrap">
+        <canvas id="chart" width="800" height="280"></canvas>
       </section>
 
       <section class="grid stats">
@@ -52,12 +56,13 @@
       </section>
 
       <p class="disclaimer">
-        Educational technical confluence only. Binary options are high-risk. No
-        signal is guaranteed. Past backtests are not live results.
+        Educational confluence only. Not a broker, not auto-trade, not a profit
+        guarantee. Binary payouts usually require well above 50% to break even.
       </p>
     </div>
     <script src="lib/indicators.js"></script>
     <script src="lib/engine.js"></script>
+    <script src="lib/feed.js"></script>
     <script src="dashboard.js"></script>
   </body>
 </html>

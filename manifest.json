@@ -30,19 +30,44 @@
         "https://*.quotex.com/*",
         "https://*.qxbroker.com/*"
       ],
+      "js": ["src/page-hook.js"],
+      "run_at": "document_start",
+      "all_frames": true,
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://qxbroker.com/*",
+        "https://quotex.com/*",
+        "https://*.quotex.com/*",
+        "https://*.qxbroker.com/*"
+      ],
       "js": [
         "src/lib/indicators.js",
         "src/lib/engine.js",
+        "src/lib/feed.js",
         "src/content.js"
       ],
       "css": ["src/content.css"],
-      "run_at": "document_idle"
+      "run_at": "document_idle",
+      "all_frames": true
     }
   ],
   "web_accessible_resources": [
     {
-      "resources": ["src/dashboard.html", "src/dashboard.css", "src/dashboard.js", "src/lib/*"],
-      "matches": ["<all_urls>"]
+      "resources": [
+        "src/dashboard.html",
+        "src/dashboard.css",
+        "src/dashboard.js",
+        "src/page-hook.js",
+        "src/lib/*"
+      ],
+      "matches": [
+        "https://qxbroker.com/*",
+        "https://quotex.com/*",
+        "https://*.quotex.com/*",
+        "https://*.qxbroker.com/*"
+      ]
     }
   ],
   "icons": {

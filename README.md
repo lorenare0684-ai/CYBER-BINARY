@@ -33,7 +33,8 @@ A signal needs score ≥ 4 and a 2-point lead for one side. Paper results settle
 ```
 manifest.json
 src/background.js      # dashboard window + state relay
-src/content.js         # Quotex price scrape, candles, HUD
+src/page-hook.js       # MAIN-world WebSocket wrap
+src/content.js         # quote ingest, candles, HUD
 src/dashboard.html|.js|.css
 src/lib/indicators.js
 src/lib/engine.js
