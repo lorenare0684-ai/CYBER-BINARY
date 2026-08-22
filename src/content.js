@@ -1,5 +1,19 @@
 "use strict";
 
+/**
+ * CYBER BINARY v2.1 — content script.
+ *
+ * Runs in the page's ISOLATED world. Reads the live state the page-hook
+ * pushes via window.postMessage, keeps one feed per detected asset, runs
+ * the confluence engine, and bridges results to the popup dashboard.
+ *
+ * Wires:
+ *   - the real-time feed (candles + ticks) from the Quotex page,
+ *   - the live balance and detected instruments list,
+ *   - the auto-trade controller (alerts / click / off),
+ *   - a `placeTrade` round-trip that uses the adapter to click CALL/PUT
+ *     (or send an `orders/open` frame on the page's own socket).
+ */
 (function () {
   if (window.__CYBER_BINARY__) return;
   window.__CYBER_BINARY__ = true;
@@ -10,10 +24,11 @@
   const STORE = self.CYBER_STORE;
   const AUTO = self.CYBER_AUTO;
   const STRAT = self.CYBER_STRATEGIES;
+  const QUOTEX = self.CYBER_QUOTEX || null;
 
-  // Per-asset feeds + state (in case the user switches assets without reloading).
-  const feeds = Object.create(null);    // assetId -> feed
-  const series = Object.create(null);   // assetId -> array
+  // Per-asset feeds + state.
+  const feeds = Object.create(null);
+  const series = Object.create(null);
   let activeAsset = "EURUSD";
   let activeFeed = createFeedFor(activeAsset);
   let autoController = null;
@@ -24,22 +39,20 @@
   let pollTimer = null;
   let lastWsPrice = null;
   let lastWsSymbol = null;
+  let lastQuotexStatus = { state: "idle" };
+  let lastInstruments = [];
+  let lastBalance = null;
+  let lastOrders = [];
 
   const stats = {
-    wins: 0,
-    losses: 0,
-    pending: null,
-    history: [],
-    byStrategy: {},
-    byAsset: {},
-    byRegime: {},
+    wins: 0, losses: 0, pending: null, history: [],
+    byStrategy: {}, byAsset: {}, byRegime: {},
   };
 
   function createFeedFor(assetId) {
     if (feeds[assetId]) return feeds[assetId];
     const f = self.CYBER_FEED.createFeed({ tfMs: TF_MS, max: 400 });
     feeds[assetId] = f;
-    // Seed with synthetic history so the engine is ready quickly.
     f.setSeries(self.CYBER_FEED.syntheticSeries(ASSETS.get(assetId) || { id: assetId, basePrice: 1.0, vol: 0.0001, jumpRate: 0.005, decimals: 5 }, 120));
     return f;
   }
@@ -57,7 +70,7 @@
     return (el.textContent || "").replace(/\s+/g, " ").trim();
   }
 
-  /* -------- automatic asset detection -------- */
+  /* -------- automatic asset detection (v2.1: prefer adapter instrument list) -------- */
   function detectAssetFromDom() {
     const sels = [
       "[class*='current-symbol']",
@@ -78,13 +91,10 @@
         }
       }
     }
-    // Title fallback
     const titleAsset = ASSETS.detect(document.title);
     if (titleAsset) return titleAsset;
-    // URL fallback
     const urlAsset = ASSETS.detect(location.href);
     if (urlAsset) return urlAsset;
-    // WS symbol fallback
     if (lastWsSymbol) {
       const det = ASSETS.detect(lastWsSymbol);
       if (det) return det;
@@ -103,6 +113,10 @@
 
   function findPrice() {
     if (lastWsPrice) return lastWsPrice;
+    if (QUOTEX) {
+      const p = QUOTEX.findPriceLabel();
+      if (p && p.price) return p.price;
+    }
     const selectors = [
       "[class*='current-profit']",
       "[class*='current-price']",
@@ -206,27 +220,38 @@
     } else {
       autoController = AUTO.startAuto({
         config: s,
-        onSignal: function (sig) { /* forwarded via pushState */ },
+        onSignal: function () { },
         onTrade: function (decision) {
-          try {
-            chrome.runtime.sendMessage({ type: "CYBER_AUTO_DECISION", payload: decision }).catch(() => {});
-          } catch (_) {}
+          try { chrome.runtime.sendMessage({ type: "CYBER_AUTO_DECISION", payload: decision }).catch(() => {}); } catch (_) {}
         },
         onLog: function (entry) {
-          try {
-            chrome.runtime.sendMessage({ type: "CYBER_AUTO_LOG", payload: entry }).catch(() => {});
-          } catch (_) {}
+          try { chrome.runtime.sendMessage({ type: "CYBER_AUTO_LOG", payload: entry }).catch(() => {}); } catch (_) {}
         },
         onState: function (state) {
-          try {
-            chrome.runtime.sendMessage({ type: "CYBER_AUTO_STATE", payload: state }).catch(() => {});
-          } catch (_) {}
+          try { chrome.runtime.sendMessage({ type: "CYBER_AUTO_STATE", payload: state }).catch(() => {}); } catch (_) {}
         },
       });
       autoController.setMode(s.autoMode || "off");
       autoController.setArmed(!!s.armed);
     }
     return s;
+  }
+
+  /* -------- v2.1: real-candle ingest from the page WS -------- */
+  function ingestLiveCandles(asset, period, candles) {
+    if (!asset || !Array.isArray(candles) || !candles.length) return;
+    const det = ASSETS.detect(asset) || ASSETS.get(asset);
+    if (!det) return;
+    const feed = createFeedFor(det.id);
+    for (const c of candles) {
+      if (!c || typeof c.time !== "number") continue;
+      const ev = feed.ingestCandle(c);
+      if (ev && ev.closed) settlePending(ev.closed.close, ev.closed.time);
+    }
+    if (det.id !== activeAsset) {
+      activeAsset = det.id;
+      activeFeed = feed;
+    }
   }
 
   async function maybeSignal() {
@@ -282,10 +307,16 @@
       autoState: autoController ? autoController.getState() : null,
       strategy: currentStrategy,
       ts: Date.now(),
+      // v2.1: real platform state
+      quotex: {
+        status: lastQuotexStatus,
+        balance: lastBalance,
+        instrumentsCount: lastInstruments.length,
+        activeSymbol: lastWsSymbol || activeAsset,
+        lastOrders: lastOrders.slice(0, 5),
+      },
     };
-    try {
-      chrome.runtime.sendMessage({ type: "CYBER_STATE", payload }).catch(() => {});
-    } catch (_) {}
+    try { chrome.runtime.sendMessage({ type: "CYBER_STATE", payload }).catch(() => {}); } catch (_) {}
   }
 
   function ensureHud() {
@@ -330,17 +361,20 @@
     asset.textContent = (sig && sig.assetName) || assetName();
     const wr = stats.wins + stats.losses;
     const wrTxt = wr ? ((stats.wins / wr) * 100).toFixed(1) + "%" : "—";
+    const qstat = lastQuotexStatus && lastQuotexStatus.state
+      ? "· qx:" + lastQuotexStatus.state : "";
+    const bal = lastBalance && lastBalance.balance != null
+      ? "· bal " + Number(lastBalance.balance).toFixed(2) : "";
     meta.textContent =
       (sig && sig.reason ? sig.reason + " · " : "") +
       "WR " + wrTxt + " · " +
-      stats.wins + "W / " + stats.losses + "L · " +
+      stats.wins + "W / " + stats.losses + "L " + qstat + " " + bal + " · " +
       (sig && sig.regime ? "regime " + sig.regime + " · " : "") +
       activeFeed.series().length + " bars";
   }
 
   function ingest(price, assetOverride) {
     if (assetOverride && assetOverride !== activeAsset) {
-      // Re-route to the right feed if we just learned the asset.
       const f = createFeedFor(assetOverride);
       const ev = f.ingest(price, Date.now());
       if (ev && ev.closed) settlePending(ev.closed.close, ev.closed.time);
@@ -355,7 +389,6 @@
   }
 
   function tick() {
-    // Refresh active asset before ingesting a tick.
     syncActiveAsset();
     const p = findPrice();
     if (p) ingest(p);
@@ -372,20 +405,70 @@
     } catch (_) {}
   }
 
+  /* -------- v2.1: page-hook message router -------- */
   window.addEventListener("message", function (ev) {
     if (!ev.data || ev.data.source !== "CYBER_BINARY_HOOK") return;
     const p = ev.data.payload || {};
-    if (ev.data.kind === "tick" && p.price) {
-      lastWsPrice = p.price;
-      // Route to the active asset's feed.
-      ingest(p.price);
-    } else if (ev.data.kind === "asset" && p.symbol) {
-      lastWsSymbol = p.symbol;
-      const det = ASSETS.detect(p.symbol);
-      if (det && det.id !== activeAsset) {
-        activeAsset = det.id;
-        activeFeed = createFeedFor(activeAsset);
+    switch (ev.data.kind) {
+      case "tick": {
+        if (p.price) {
+          lastWsPrice = p.price;
+          if (p.symbol) lastWsSymbol = p.symbol;
+          ingest(p.price, p.symbol && (ASSETS.detect(p.symbol) || {}).id);
+        }
+        break;
       }
+      case "asset": {
+        if (p.symbol) {
+          lastWsSymbol = p.symbol;
+          const det = ASSETS.detect(p.symbol);
+          if (det && det.id !== activeAsset) {
+            activeAsset = det.id;
+            activeFeed = createFeedFor(activeAsset);
+          }
+        }
+        break;
+      }
+      case "candle": {
+        if (p && p.asset && Array.isArray(p.candles)) {
+          ingestLiveCandles(p.asset, p.period, p.candles);
+        }
+        break;
+      }
+      case "balance": {
+        lastBalance = p;
+        try { chrome.runtime.sendMessage({ type: "CYBER_QUOTEX_BALANCE", payload: p }).catch(() => {}); } catch (_) {}
+        break;
+      }
+      case "instruments": {
+        lastInstruments = p || [];
+        for (const it of lastInstruments) {
+          if (it && it.symbol) {
+            try { ASSETS.registerQuotexAsset(it); } catch (_) {}
+          }
+        }
+        try { chrome.runtime.sendMessage({ type: "CYBER_QUOTEX_INSTRUMENTS", payload: lastInstruments }).catch(() => {}); } catch (_) {}
+        break;
+      }
+      case "order": {
+        lastOrders.unshift(p);
+        if (lastOrders.length > 50) lastOrders.length = 50;
+        try { chrome.runtime.sendMessage({ type: "CYBER_QUOTEX_TRADE_RESULT", payload: p }).catch(() => {}); } catch (_) {}
+        break;
+      }
+      case "quotex_status": {
+        lastQuotexStatus = p || lastQuotexStatus;
+        try { chrome.runtime.sendMessage({ type: "CYBER_QUOTEX_STATUS", payload: lastQuotexStatus }).catch(() => {}); } catch (_) {}
+        break;
+      }
+      case "adapter_status": {
+        // Surface a once-only log for the dashboard.
+        try { chrome.runtime.sendMessage({ type: "CYBER_QUOTEX_STATUS", payload: { state: p && p.loaded ? "adapter_loaded" : "fallback" } }).catch(() => {}); } catch (_) {}
+        break;
+      }
+      case "ready": break;
+      case "url": break;
+      case "open": break;
     }
   });
 
@@ -401,6 +484,34 @@
     ensureHud();
     pollTimer = setInterval(tick, 500);
     tick();
+  }
+
+  /* -------- v2.1: real platform trade placement -------- */
+  async function placeTrade(args) {
+    if (!QUOTEX) return { ok: false, error: "adapter missing" };
+    const s = await STORE.getSettings();
+    const stake = (args && args.stake) || s.stake || 1;
+    const expiry = (args && args.expiry) || s.expiry || 1; // minutes
+    const expirySec = Math.max(30, Math.round(expiry * 60));
+    const ws = (window.__cyber && window.__cyber.handle && window.__cyber.handle.lastWs) || null;
+    // Try DOM click first (always works if buttons are visible).
+    const domResult = QUOTEX.placeTradeDom({
+      dir: args.dir,
+      amount: stake,
+      expiry: expirySec,
+    });
+    if (domResult && domResult.ok) return Object.assign({ mode: "dom" }, domResult);
+    // Fall back to ws frame if user opted in via `args.mode === "ws"`.
+    if (args && args.mode === "ws" && ws) {
+      return QUOTEX.placeTradeWs(ws, {
+        asset: (args.asset || lastWsSymbol || activeAsset),
+        dir: args.dir,
+        amount: stake,
+        expiry: expirySec,
+        isDemo: !!(lastBalance && lastBalance.isDemo),
+      });
+    }
+    return domResult;
   }
 
   chrome.runtime.onMessage.addListener(function (msg, _s, sendResponse) {
@@ -430,10 +541,21 @@
       sig.asset = activeAsset;
       sig.assetName = assetName();
       sig.strategy = currentStrategy;
-      AUTO.clickTrade({ dir: sig.direction, stake: msg.stake, expiry: msg.expiry }).then((r) => {
-        sendResponse({ ok: true, result: r });
-      });
+      placeTrade({
+        dir: sig.direction,
+        stake: msg.stake,
+        expiry: msg.expiry,
+        mode: msg.wsMode ? "ws" : "dom",
+        asset: activeAsset,
+      }).then((r) => sendResponse({ ok: true, result: r }));
       return true;
+    }
+    if (msg && msg.type === "CYBER_QUOTEX_SET_AUTH") {
+      // v2.1: explicit user request to use the page's WS for direct orders.
+      // The extension never reads the SSID itself; the page-hook already
+      // captured it from the page's traffic. Here we just flip a flag the
+      // next `placeTrade` will honor when `mode: "ws"` is passed.
+      sendResponse({ ok: true, mode: "ws_ready" });
     }
   });
 

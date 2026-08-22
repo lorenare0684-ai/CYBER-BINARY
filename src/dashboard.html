@@ -15,6 +15,7 @@
         </div>
         <div class="top-right">
           <div id="link-state" class="pill dim">Booting…</div>
+          <div id="quotex-state" class="pill dim">Quotex · idle</div>
           <div id="auto-state" class="pill dim">Auto off</div>
         </div>
       </header>
@@ -22,6 +23,7 @@
       <nav class="tabs" id="tabs">
         <button data-tab="live" class="tab active">Live</button>
         <button data-tab="auto" class="tab">Auto</button>
+        <button data-tab="instruments" class="tab">Instruments</button>
         <button data-tab="backtest" class="tab">Backtest</button>
         <button data-tab="history" class="tab">History</button>
         <button data-tab="assets" class="tab">Assets</button>
@@ -152,6 +154,70 @@
           <strong>Click mode</strong> actively clicks the CALL/PUT button on the visible
           Quotex chart using your stake and the strategy you selected. It is gated by
           confidence, daily loss cap, and trade-rate caps. Toggle off at any time.
+        </p>
+      </section>
+
+      <!-- ============ INSTRUMENTS TAB (v2.1) ============ -->
+      <section class="tab-pane" data-pane="instruments">
+        <section class="hero small" id="qx-hero">
+          <div class="dir" id="qx-conn">DISCONNECTED</div>
+          <div class="reason" id="qx-conn-reason">Waiting for the page to load.</div>
+        </section>
+
+        <section class="grid stats">
+          <article><span>Instruments</span><strong id="qx-instr-count">0</strong></article>
+          <article><span>Open</span><strong id="qx-open-count">0</strong></article>
+          <article><span>OTC</span><strong id="qx-otc-count">0</strong></article>
+          <article><span>Balance</span><strong id="qx-balance">—</strong></article>
+        </section>
+
+        <section class="controls tight">
+          <label class="ctl">
+            <span>Filter</span>
+            <input type="text" id="qx-filter" placeholder="EUR, BTC, _otc…" />
+          </label>
+          <label class="ctl">
+            <span>Type</span>
+            <select id="qx-kind">
+              <option value="all">All</option>
+              <option value="currency">FX</option>
+              <option value="crypto">Crypto</option>
+              <option value="commodity">Commodity</option>
+              <option value="stock">Stocks</option>
+              <option value="index">Index</option>
+              <option value="otc">OTC only</option>
+            </select>
+          </label>
+          <label class="check"><input type="checkbox" id="qx-open-only" /> Open only</label>
+        </section>
+
+        <section>
+          <h2>Detected instruments</h2>
+          <table class="table" id="qx-instr-table">
+            <thead>
+              <tr>
+                <th>Symbol</th>
+                <th>Name</th>
+                <th>Type</th>
+                <th>Payout</th>
+                <th>Timeframes</th>
+                <th>State</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </section>
+
+        <section>
+          <h2>Recent live orders</h2>
+          <ul id="qx-orders" class="history small"></ul>
+        </section>
+
+        <p class="disclaimer">
+          The instruments list is pushed by the live Quotex WebSocket as soon
+          as you load the trade page. The adapter decodes the binary payload
+          and exposes the canonical asset IDs used by the broker so the
+          engine can recognize any symbol the platform offers.
         </p>
       </section>
 
@@ -332,6 +398,7 @@
     <script src="lib/auto.js"></script>
     <script src="lib/backtest.js"></script>
     <script src="lib/workers.js"></script>
+    <script src="lib/quotex.js"></script>
     <script src="dashboard.js"></script>
   </body>
 </html>

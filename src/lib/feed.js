@@ -86,8 +86,44 @@
       current = lastBar ? Object.assign({}, lastBar) : null;
     }
 
+    /**
+     * v2.1: ingest a fully-formed OHLCV candle (e.g. delivered by the
+     * page's WebSocket). Returns {closed, current, last} for the
+     * same shape as `ingest` so callers can detect bar closes
+     * uniformly.
+     */
+    function ingestCandle(c) {
+      if (!c || typeof c.time !== "number") return null;
+      if (!Number.isFinite(c.open) || !Number.isFinite(c.close)) return null;
+      let closed = null;
+      if (current && current.time === c.time) {
+        // Update the in-progress bar in place.
+        if (Number.isFinite(c.high)) current.high = Math.max(current.high, c.high);
+        if (Number.isFinite(c.low))  current.low  = Math.min(current.low,  c.low);
+        current.close = c.close;
+        if (Number.isFinite(c.open)) current.open = c.open;
+      } else {
+        // New bar. Close the previous one if it exists.
+        if (current) {
+          candles.push(current);
+          if (candles.length > max) candles = candles.slice(-max);
+          closed = current;
+        }
+        current = {
+          time: c.time,
+          open: c.open,
+          high: Number.isFinite(c.high) ? c.high : Math.max(c.open, c.close),
+          low:  Number.isFinite(c.low)  ? c.low  : Math.min(c.open, c.close),
+          close: c.close,
+          volume: c.volume || 0,
+        };
+      }
+      last = c.close;
+      return { closed, current, last };
+    }
+
     return {
-      ingest, series, seedHistory, setSeries,
+      ingest, ingestCandle, series, seedHistory, setSeries,
       lastPrice: () => last,
       reset: () => { candles = []; current = null; last = null; },
       size: () => candles.length + (current ? 1 : 0),

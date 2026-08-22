@@ -229,6 +229,11 @@
 
   /* --- DOM helpers for click trade --- */
   function findTradeButton(dir) {
+    // v2.1: prefer the quotex adapter (it has the canonical selectors).
+    if (root.CYBER_QUOTEX) {
+      const btn = dir === "CALL" ? root.CYBER_QUOTEX.findCallButton() : root.CYBER_QUOTEX.findPutButton();
+      if (btn) return btn;
+    }
     // Quotex is a SPA. The CALL/PUT button is near the stake/expiry panel.
     const sels = [
       `button[class*='call']`,
@@ -258,11 +263,18 @@
   }
 
   async function setStake(amount) {
+    // v2.1: prefer the quotex adapter.
+    if (root.CYBER_QUOTEX) {
+      const r = root.CYBER_QUOTEX.setStake(amount);
+      if (r) return true;
+    }
     // Try to find the stake input and set its value, dispatch input event.
     const sels = [
       "input[class*='amount']",
       "input[class*='stake']",
+      "input[class*='sum']",
       "input[aria-label*='amount' i]",
+      "input[aria-label*='stake' i]",
       "input[type='number']",
     ];
     for (const sel of sels) {
@@ -281,12 +293,22 @@
   }
 
   async function clickTrade(args) {
+    args = args || {};
+    // v2.1: prefer the quotex adapter for a single end-to-end call.
+    if (root.CYBER_QUOTEX && args.mode !== "ws") {
+      const r = root.CYBER_QUOTEX.placeTrade({
+        dir: args.dir,
+        amount: args.stake,
+        expiry: args.expiry ? Math.max(30, Math.round(args.expiry * 60)) : undefined,
+      });
+      if (r && r.ok) return r;
+    }
     try {
       if (args.stake) await setStake(args.stake);
       const btn = findTradeButton(args.dir);
       if (!btn) return { ok: false, error: "Trade button not visible" };
       btn.click();
-      return { ok: true, dir: args.dir, stake: args.stake, expiry: args.expiry };
+      return { ok: true, dir: args.dir, stake: args.stake, expiry: args.expiry, mode: "dom" };
     } catch (e) {
       return { ok: false, error: String(e && e.message || e) };
     }

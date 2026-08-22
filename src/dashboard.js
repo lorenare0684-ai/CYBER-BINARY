@@ -10,6 +10,7 @@
   const HIST = self.CYBER_HIST;
   const WORKERS = self.CYBER_WORKERS;
   const AUTO = self.CYBER_AUTO;
+  const QUOTEX = self.CYBER_QUOTEX || null;
 
   // Active local feed (for the dashboard's own chart when live data is missing).
   const localFeed = FEED.createFeed({ tfMs: 60000, max: 400 });
@@ -23,6 +24,11 @@
   let autoState = null;
   let settings = null;
   let btResults = null;
+  // v2.1: live Quotex state
+  let qxStatus = { state: "idle" };
+  let qxInstruments = [];
+  let qxBalance = null;
+  let qxOrders = [];
 
   function $(id) { return document.getElementById(id); }
   function $all(sel) { return document.querySelectorAll(sel); }
@@ -143,6 +149,7 @@
     $all(".tab-pane").forEach((p) => p.classList.toggle("active", p.dataset.pane === name));
     if (name === "assets") refreshAssetsTab();
     if (name === "settings") refreshSettingsTab();
+    if (name === "instruments") refreshInstrumentsTab();
     if (name === "backtest") {} // lazy
   }
   $all(".tab").forEach((t) => t.addEventListener("click", () => activateTab(t.dataset.tab)));
@@ -207,6 +214,16 @@
 
   /* ---------- live rendering ---------- */
   function renderLive(state) {
+    // v2.1: surface the platform state if the content script attached it.
+    if (state && state.quotex) {
+      if (state.quotex.status) qxStatus = state.quotex.status;
+      if (state.quotex.balance) qxBalance = state.quotex.balance;
+      if (Array.isArray(state.quotex.lastOrders) && state.quotex.lastOrders.length) {
+        qxOrders = state.quotex.lastOrders.concat(qxOrders).slice(0, 50);
+      }
+    }
+    paintQuotexPill();
+
     $("link-state").textContent = state.attached
       ? "Live · " + (state.source || "chart")
       : "Demo feed";
@@ -363,6 +380,116 @@
       pill.textContent = autoState.armed ? "Armed · " + mode : "Auto " + mode;
       pill.className = "pill " + (autoState.armed ? (mode === "click" ? "warn" : "ok") : "dim");
     }
+  }
+
+  /* ---------- v2.1: Quotex status pill + instruments tab ---------- */
+  function paintQuotexPill() {
+    const pill = $("quotex-state");
+    if (!pill) return;
+    const s = qxStatus || {};
+    const state = s.state || "idle";
+    let label = "Quotex · " + state;
+    let cls = "pill ";
+    if (state === "authenticated" || state === "open" || state === "connected" || state === "adapter_loaded") {
+      cls += "ok"; label = "Quotex · live";
+    } else if (state === "auth_error" || state === "error" || state === "closed" || state === "disconnected") {
+      cls += "warn"; label = "Quotex · " + state;
+    } else if (state === "fallback") {
+      cls += "warn"; label = "Quotex · fallback";
+    } else {
+      cls += "dim";
+    }
+    pill.className = cls;
+    pill.textContent = label;
+  }
+
+  function refreshInstrumentsTab() {
+    if (!QUOTEX) return;
+    const filter = ($("qx-filter").value || "").toUpperCase();
+    const kind = $("qx-kind").value;
+    const openOnly = $("qx-open-only").checked;
+
+    const list = qxInstruments.slice();
+    const filtered = list.filter((it) => {
+      if (filter) {
+        const hay = ((it.symbol || "") + " " + (it.name || "")).toUpperCase();
+        if (hay.indexOf(filter) === -1) return false;
+      }
+      if (kind === "otc") {
+        if (!it.isOtc) return false;
+      } else if (kind !== "all") {
+        if ((it.type || "").toLowerCase() !== kind) return false;
+      }
+      if (openOnly && !it.isOpen) return false;
+      return true;
+    });
+
+    const counts = list.reduce((acc, it) => {
+      if (it.isOpen) acc.open += 1;
+      if (it.isOtc) acc.otc += 1;
+      return acc;
+    }, { open: 0, otc: 0 });
+    $("qx-instr-count").textContent = String(list.length);
+    $("qx-open-count").textContent = String(counts.open);
+    $("qx-otc-count").textContent = String(counts.otc);
+    $("qx-balance").textContent = qxBalance && qxBalance.balance != null
+      ? Number(qxBalance.balance).toFixed(2) + (qxBalance.currency ? " " + qxBalance.currency : "")
+      : "—";
+
+    const hero = $("qx-conn");
+    const heroReason = $("qx-conn-reason");
+    if (hero) {
+      const state = (qxStatus && qxStatus.state) || "idle";
+      hero.textContent = state.toUpperCase();
+      hero.dataset.dir = state === "authenticated" || state === "open" ? "CALL" : (state === "fallback" || state === "disconnected" || state === "auth_error" ? "PUT" : "WAIT");
+    }
+    if (heroReason) {
+      const summary = list.length
+        ? list.length + " instruments detected from the live platform feed."
+        : "No instruments yet. Load a Quotex trade page to populate this tab.";
+      heroReason.textContent = summary;
+    }
+
+    const tb = $("qx-instr-table").querySelector("tbody");
+    tb.innerHTML = "";
+    filtered.sort((a, b) => (b.payout || 0) - (a.payout || 0));
+    for (const it of filtered) {
+      const tr = document.createElement("tr");
+      const tfs = (it.timeframes || []).map((t) => QUOTEX.KNOWN_TIMEFRAMES[t] || t + "s").slice(0, 6).join(", ");
+      tr.innerHTML =
+        "<td>" + (it.symbol || "—") + "</td>" +
+        "<td>" + (it.name || "—") + "</td>" +
+        "<td>" + (it.type || "—") + "</td>" +
+        "<td>" + (it.payout ? it.payout + "%" : "—") + "</td>" +
+        "<td>" + (tfs || "—") + "</td>" +
+        "<td class='" + (it.isOpen ? "win" : "loss") + "'>" + (it.isOpen ? "OPEN" : "closed") + "</td>";
+      tb.appendChild(tr);
+    }
+
+    const ol = $("qx-orders");
+    if (ol) {
+      ol.innerHTML = "";
+      for (const o of qxOrders.slice(0, 20)) {
+        const li = document.createElement("li");
+        const data = o.data || {};
+        const won = data.win === true;
+        const lost = data.loss === true;
+        li.innerHTML =
+          '<span class="' + (won ? "win" : lost ? "loss" : "") + '">' + (o.kind || "order").toUpperCase() + '</span>' +
+          '<span class="meta">' + (data.dir || data.direction || "") + " · " + (data.asset || "—") + " · " +
+          (data.amount != null ? data.amount + "$" : "") + " · " +
+          (data.profit != null ? (data.profit > 0 ? "+" : "") + data.profit + "$" : "") + '</span>';
+        ol.appendChild(li);
+      }
+    }
+  }
+
+  function bindInstrumentsTab() {
+    const onChange = () => refreshInstrumentsTab();
+    ["qx-filter", "qx-kind", "qx-open-only"].forEach((id) => {
+      const el = $(id);
+      if (el) el.addEventListener("input", onChange);
+    });
   }
 
   function appendAutoLog(entry) {
@@ -674,6 +801,30 @@
       if (msg && msg.type === "CYBER_AUTO_LOG" && msg.payload) {
         appendAutoLog(msg.payload);
       }
+      if (msg && msg.type === "CYBER_QUOTEX_STATUS" && msg.payload) {
+        qxStatus = msg.payload || qxStatus;
+        paintQuotexPill();
+        refreshInstrumentsTab();
+      }
+      if (msg && msg.type === "CYBER_QUOTEX_INSTRUMENTS" && Array.isArray(msg.payload)) {
+        qxInstruments = msg.payload;
+        // Register them with the assets catalog so detection works on the page too.
+        for (const it of qxInstruments) {
+          if (it && it.symbol) {
+            try { ASSETS.registerQuotexAsset(it); } catch (_) {}
+          }
+        }
+        refreshInstrumentsTab();
+      }
+      if (msg && msg.type === "CYBER_QUOTEX_BALANCE" && msg.payload) {
+        qxBalance = msg.payload;
+        refreshInstrumentsTab();
+      }
+      if (msg && msg.type === "CYBER_QUOTEX_TRADE_RESULT" && msg.payload) {
+        qxOrders.unshift(msg.payload);
+        if (qxOrders.length > 50) qxOrders.length = 50;
+        refreshInstrumentsTab();
+      }
     });
     chrome.runtime.sendMessage({ type: "CYBER_GET_STATE" }, (res) => {
       if (chrome.runtime.lastError) return;
@@ -697,11 +848,14 @@
   refreshSelectors();
   bindSelectors();
   bindAutoTab();
+  bindInstrumentsTab();
   bindBacktest();
   bindHistoryTab();
   bindSettingsTab();
   loadAutoSettings();
   scale();
+  paintQuotexPill();
+  refreshInstrumentsTab();
 
   // Local demo loop
   localFeed.setSeries(FEED.syntheticSeries(ASSETS.get("EURUSD"), 240));

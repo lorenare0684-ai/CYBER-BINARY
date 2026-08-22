@@ -113,6 +113,45 @@
     ALIAS[a.name.toUpperCase()] = a.id;
     for (const al of a.aliases) ALIAS[al.toUpperCase()] = a.id;
   }
+  // Pull in live-detected Quotex assets registered by the adapter at runtime.
+  // (See CYBER_QUOTEX in src/lib/quotex.js — the page hook calls
+  //  CYBER_ASSETS.registerQuotexAsset(...) when the broker instruments/list
+  //  payload arrives. We expose the same API here for symmetry.)
+  const RUNTIME_ALIASES = Object.create(null);
+  function registerQuotexAsset(q) {
+    if (!q || !q.symbol) return null;
+    const sym = String(q.symbol).toUpperCase();
+    if (!ALIAS[sym]) {
+      // Synthesize a minimal asset entry for any detected symbol so the
+      // engine has *something* to anchor on. Synthetic seed parameters come
+      // from the kind/otc hints when available.
+      const kind = q.isOtc ? "otc" : (q.type || "fx");
+      const basePrice = q.basePrice || (kind === "otc" ? 100 : kind === "crypto" ? 50000 : 1.08);
+      const vol = kind === "otc" ? annToMin(25) : kind === "crypto" ? annToMin(60) : annToMin(8);
+      const decimals = basePrice > 100 ? 2 : basePrice > 1 ? 5 : 5;
+      ASSETS.push({
+        id: sym,
+        name: q.name || sym,
+        kind: kind,
+        basePrice: basePrice,
+        pipSize: basePrice > 100 ? 0.1 : 0.0001,
+        decimals: decimals,
+        vol: vol,
+        drift: 0,
+        jumpRate: 0.003,
+        session: kind === "otc" ? "OTC 24/7" : (kind === "crypto" ? "24/7" : "London/NY"),
+        aliases: [sym, q.name || sym].concat(q.aliases || []),
+        brokerId: q.id || 0,
+        payout: q.payout || 0,
+        isOpen: q.isOpen !== false,
+        timeframes: q.timeframes || [60, 120, 180, 300, 600, 900, 1800, 3600],
+      });
+      ALIAS[sym] = sym;
+      for (const al of (q.aliases || [])) ALIAS[String(al).toUpperCase()] = sym;
+      RUNTIME_ALIASES[sym] = sym;
+    }
+    return get(sym);
+  }
 
   function get(id) {
     if (!id) return null;
@@ -139,5 +178,9 @@
     return ASSETS.filter((a) => a.kind === kind);
   }
 
-  root.CYBER_ASSETS = { list, get, detect, byKind, ALIAS };
+  function runtimeAliases() {
+    return Object.assign({}, RUNTIME_ALIASES);
+  }
+
+  root.CYBER_ASSETS = { list, get, detect, byKind, ALIAS, registerQuotexAsset, runtimeAliases };
 })(typeof self !== "undefined" ? self : globalThis);

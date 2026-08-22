@@ -76,7 +76,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // Asset/strategy setters — relay to the active tab.
   if (msg.type === "CYBER_SET_ASSET" || msg.type === "CYBER_SET_STRATEGY" ||
       msg.type === "CYBER_SET_AUTO" || msg.type === "CYBER_FORCE_TRADE" ||
-      msg.type === "CYBER_DETECT_ASSET") {
+      msg.type === "CYBER_DETECT_ASSET" || msg.type === "CYBER_QUOTEX_SET_AUTH") {
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
       if (tabs && tabs[0]) {
         chrome.tabs.sendMessage(tabs[0].id, msg).then(
@@ -88,5 +88,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
     });
     return true;
+  }
+
+  // Forward v2.1 platform events to the dashboard.
+  if (msg.type === "CYBER_QUOTEX_STATUS" || msg.type === "CYBER_QUOTEX_INSTRUMENTS" ||
+      msg.type === "CYBER_QUOTEX_BALANCE" || msg.type === "CYBER_QUOTEX_TRADE_RESULT") {
+    chrome.runtime.sendMessage(msg).catch(() => {});
+    sendResponse({ ok: true });
+    return;
   }
 });

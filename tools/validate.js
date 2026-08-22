@@ -22,6 +22,7 @@ const required = [
   "src/lib/storage.js",
   "src/lib/auto.js",
   "src/lib/backtest.js",
+  "src/lib/quotex.js",
   "src/page-hook.js",
   "icons/icon16.png",
   "icons/icon32.png",
@@ -44,10 +45,13 @@ if (man.manifest_version !== 3) {
   failed++;
 }
 
-const sandbox = { self: {}, globalThis: null, console };
+const sandbox = { self: {}, globalThis: null, console, window: {}, document: { querySelector: () => null, querySelectorAll: () => [] }, Event: function () {}, location: { hostname: "qxbroker.com", pathname: "/trade", href: "https://qxbroker.com/trade" } };
 sandbox.globalThis = sandbox.self;
+sandbox.window.WebSocket = undefined;
+sandbox.window.HTMLInputElement = { prototype: {} };
+sandbox.window.HTMLTextAreaElement = { prototype: {} };
 vm.createContext(sandbox);
-for (const f of ["indicators.js", "assets.js", "strategy.js", "feed.js", "engine.js", "storage.js", "auto.js", "backtest.js"]) {
+for (const f of ["indicators.js", "assets.js", "strategy.js", "feed.js", "engine.js", "storage.js", "auto.js", "backtest.js", "quotex.js"]) {
   vm.runInContext(fs.readFileSync(path.join(root, "src/lib", f), "utf8"), sandbox);
 }
 
@@ -69,6 +73,61 @@ if (!sandbox.self.CYBER_ENGINE) { console.error("engine missing"); failed++; }
 if (!sandbox.self.CYBER_STORE) { console.error("store missing"); failed++; }
 if (!sandbox.self.CYBER_AUTO) { console.error("auto missing"); failed++; }
 if (!sandbox.self.CYBER_HIST) { console.error("backtest missing"); failed++; }
+if (!sandbox.self.CYBER_QUOTEX) { console.error("quotex adapter missing"); failed++; }
+else {
+  const Q = sandbox.self.CYBER_QUOTEX;
+  if (Q.getInstruments().length < 80) { console.error("quotex catalog too small"); failed++; }
+  const f0 = Q.decodeFrame("0{\"sid\":\"x\"}");
+  if (!f0 || f0.kind !== "open") { console.error("quotex open frame"); failed++; }
+  const f1 = Q.decodeFrame('42["s_authorization",{"isDemo":1}]');
+  if (!f1 || f1.type !== "sio" || f1.event !== "s_authorization") { console.error("quotex sio frame"); failed++; }
+  const f2 = Q.decodeFrame('451-["instruments/list",{"_placeholder":true,"num":0}]');
+  if (!f2 || f2.type !== "hdr" || f2.event !== "instruments/list") { console.error("quotex header frame"); failed++; }
+  const f3 = Q.decodeFrame(String.fromCharCode(0x04) + '{"uid":1,"balance":50}');
+  if (!f3 || f3.type !== "bin" || !f3.payload || f3.payload.balance !== 50) { console.error("quotex binary frame"); failed++; }
+  const inst = Q.parseInstruments([[1,"EURUSD","EUR/USD","currency",85,0,0,0,0,0,0,0,[[60]],0,true,[]]]);
+  if (inst.length !== 1 || inst[0].symbol !== "EURUSD") { console.error("quotex parseInstruments"); failed++; }
+  const cNorm = Q.normalizeCandles({ asset:"EURUSD", period:60, raw:[[1700000000,1.08,1.075,1.085,1.082,100]] });
+  if (cNorm.length !== 1 || cNorm[0].time !== 1700000000000) { console.error("quotex candle epoch ms"); failed++; }
+  const op = Q.buildOrderPayload({ asset:"EURUSD_otc", dir:"CALL", amount:1, expiry:60 });
+  if (!op || op.action !== "call") { console.error("quotex order payload"); failed++; }
+  const place = Q.placeTradeDom({ dir: "CALL", amount: 1 });
+  if (place && place.ok) { console.error("placeTradeDom should fail in vm (no DOM)"); failed++; }
+
+  // attachPageSocket integration smoke (fake WebSocket).
+  let fakeWSEvents = 0;
+  function FakeWS(url) { this.url = url || ""; this._listeners = {}; this.sent = []; }
+  FakeWS.prototype.addEventListener = function (n, fn) { (this._listeners[n] = this._listeners[n] || []).push(fn); };
+  FakeWS.prototype.send = function (m) { this.sent.push(m); };
+  FakeWS.prototype._emitMessage = function (data) { for (const fn of (this._listeners.message || [])) fn({ data: data }); };
+  const oldWS = sandbox.window.WebSocket;
+  sandbox.window.WebSocket = FakeWS;
+  const r = Q.attachPageSocket({
+    onStatus: function () { fakeWSEvents++; },
+    onTick: function () { fakeWSEvents++; },
+    onInstruments: function () { fakeWSEvents++; },
+  });
+  if (!r || !r.ok) { console.error("attachPageSocket failed"); failed++; }
+  const fakeW = new sandbox.window.WebSocket("wss://x");
+  fakeW._emitMessage('42["s_authorization",{"isDemo":1}]');
+  fakeW._emitMessage("40");
+  fakeW._emitMessage('451-["instruments/list",{"_placeholder":true,"num":0}]');
+  fakeW._emitMessage(String.fromCharCode(0x04) + JSON.stringify([[1,"EURUSD","EUR/USD","currency",85,0,0,0,0,0,0,0,[[60]],0,true,[]]]));
+  fakeW._emitMessage('451-["quotes/stream",{"_placeholder":true,"num":0}]');
+  fakeW._emitMessage(String.fromCharCode(0x04) + JSON.stringify([["EURUSD",1700000000000,1.08,0,0,0]]));
+  if (fakeWSEvents < 4) { console.error("attachPageSocket dispatch failed, events=" + fakeWSEvents); failed++; }
+  const wsPlace = Q.placeTradeWs(fakeW, { asset: "EURUSD_otc", dir: "CALL", amount: 1, expiry: 60 });
+  if (!wsPlace || !wsPlace.ok) { console.error("placeTradeWs should succeed with fake ws"); failed++; }
+  if (!fakeW.sent.some((m) => m.indexOf('"orders/open"') !== -1)) { console.error("orders/open not sent"); failed++; }
+  r.detach();
+  if (sandbox.window.WebSocket !== FakeWS) { console.error("detach did not restore", typeof sandbox.window.WebSocket); failed++; }
+}
+
+// Smoke-test the runtime-asset registration in CYBER_ASSETS.
+if (sandbox.self.CYBER_ASSETS.registerQuotexAsset) {
+  const a = sandbox.self.CYBER_ASSETS.registerQuotexAsset({ id: 999, symbol: "TEST_otc", name: "Test", isOtc: true, payout: 80, timeframes: [60, 120] });
+  if (!a || a.id !== "TEST_OTC") { console.error("registerQuotexAsset"); failed++; }
+}
 
 // Smoke-test new indicators
 const TA = sandbox.self.CYBER_TA;

@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "CYBER BINARY — Quotex Signal Lab",
-  "version": "2.0.0",
-  "description": "Advanced chart-attached confluence engine with auto asset detection, multi-strategy backtest, regime-aware signals, calibration, and trade automation for Quotex. Educational only — not financial advice.",
+  "version": "2.1.0",
+  "description": "v2.1: full Quotex.io integration — first-class adapter that decodes the platform's WebSocket traffic, drives the auto-trade engine with real candles, and offers a real-platform trade path. Educational only — not financial advice.",
   "permissions": ["storage", "windows", "tabs", "scripting", "notifications"],
   "host_permissions": [
     "https://qxbroker.com/*",
@@ -52,6 +52,7 @@
         "src/lib/auto.js",
         "src/lib/backtest.js",
         "src/lib/workers.js",
+        "src/lib/quotex.js",
         "src/content.js"
       ],
       "css": ["src/content.css"],
