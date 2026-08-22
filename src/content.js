@@ -37,6 +37,7 @@
   const AUTO = self.CYBER_AUTO;
   const STRAT = self.CYBER_STRATEGIES;
   const QUOTEX = self.CYBER_QUOTEX || null;
+  const MARKERS = self.CYBER_MARKERS || null;
 
   // Per-asset feeds + state.
   const feeds = Object.create(null);
@@ -64,6 +65,12 @@
   let lastBalance = null;
   let lastOrders = [];
   const pendingWs = Object.create(null); // place_ws requestId -> resolver
+
+  // v2.3.3: non-repainting signal markers. Anchors are (asset, barTime,
+  // price, direction) fixed at creation; the store dedupes per bar so an
+  // arrow can never move or duplicate as new candles form.
+  const markerStore = MARKERS ? MARKERS.createStore({ max: 600 }) : null;
+  let lastMarkersAsset = null; // re-send to the page hook when the chart's asset changes
 
   const stats = {
     wins: 0, losses: 0, pending: null, history: [],
@@ -326,7 +333,29 @@
         stats.byAsset = s.byAsset || {};
         stats.byRegime = s.byRegime || {};
         stats.history = Array.isArray(s.history) ? s.history : [];
+        // v2.3.3: historical arrows — settled trades become fixed markers
+        // (anchor = bar time + entry price) so the chart shows past signals.
+        if (markerStore) markerStore.seedHistory(stats.history);
+        sendMarkers();
       });
+    } catch (_) {}
+  }
+
+  /** Push the active asset's markers (+ recent bars for the overlay
+   *  fallback) to the MAIN-world page hook, which renders them natively on
+   *  the lightweight-charts instance (or its own overlay canvas). */
+  function sendMarkers() {
+    if (!markerStore) return;
+    try {
+      window.postMessage({
+        source: "CYBER_BINARY_CONTENT",
+        kind: "markers",
+        payload: {
+          asset: activeAsset,
+          markers: markerStore.list(activeAsset),
+          bars: activeFeed.series().slice(-200),
+        },
+      }, "*");
     } catch (_) {}
   }
 
@@ -499,6 +528,20 @@
         if (adj != null && Number.isFinite(adj)) sig.confidence = adj;
       }
     } catch (_) {}
+    // v2.3.3: non-repainting arrow for THIS closed bar. The anchor is fixed
+    // (bar time + close price) before any future candle exists, so the arrow
+    // never moves when the next bars form.
+    if (markerStore && sig.ready && sig.direction !== "WAIT" && sig.time != null && a.length) {
+      const closedBar = a[a.length - 1];
+      markerStore.add({
+        asset: sig.asset,
+        time: sig.time,
+        price: closedBar.close,
+        dir: sig.direction,
+        confidence: sig.confidence,
+      });
+      sendMarkers();
+    }
     paintHud(sig);
     pushState(sig);
 
@@ -547,6 +590,7 @@
       accuracy: total ? (stats.wins / total) * 100 : 0,
       autoState: autoController ? autoController.getState() : null,
       strategy: currentStrategy,
+      markers: markerStore ? markerStore.list(activeAsset) : [],
       ts: Date.now(),
       quotex: {
         status: lastQuotexStatus,
@@ -650,6 +694,12 @@
     const p = findPrice();
     if (p) ingest(p, det && det.id);
     maybeSignal();
+    // v2.3.3: when the chart switches assets, push that asset's markers so
+    // the arrows shown always belong to the visible chart.
+    if (markerStore && lastMarkersAsset !== activeAsset) {
+      lastMarkersAsset = activeAsset;
+      sendMarkers();
+    }
     ensureHistorySubscription(det || ASSETS.get(activeAsset));
   }
 

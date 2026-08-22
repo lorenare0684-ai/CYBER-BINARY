@@ -204,6 +204,41 @@
     drawLine(emaFast, "rgba(77,163,255,0.85)");
     drawLine(emaSlow, "rgba(255,196,87,0.85)");
 
+    // v2.3.3: non-repainting signal arrows. Anchors are fixed (bar time +
+    // price); each arrow is drawn at its anchor's bar slot, so it never
+    // moves as later candles arrive.
+    if (o.markers && o.markers.length) {
+      for (let mi = 0; mi < o.markers.length; mi++) {
+        const mk = o.markers[mi];
+        if (!mk || mk.time == null || mk.price == null) continue;
+        // find the bar index for this marker's time (times are ascending)
+        let idx = -1;
+        let lo2 = 0, hi2 = view.length - 1;
+        while (lo2 <= hi2) {
+          const mid = (lo2 + hi2) >> 1;
+          if (view[mid].time === mk.time) { idx = mid; break; }
+          if (view[mid].time < mk.time) lo2 = mid + 1; else hi2 = mid - 1;
+        }
+        if (idx < 0) continue;
+        const mx = padL + idx * bw + bw / 2;
+        const my = yPrice(mk.price);
+        const s = 7;
+        ctx.fillStyle = mk.dir === "PUT" ? "#ff5d7a" : "#3dff9a";
+        ctx.beginPath();
+        if (mk.dir === "PUT") {
+          ctx.moveTo(mx, my - 5);
+          ctx.lineTo(mx - s, my - 5 - s);
+          ctx.lineTo(mx + s, my - 5 - s);
+        } else {
+          ctx.moveTo(mx, my + 5);
+          ctx.lineTo(mx - s, my + 5 + s);
+          ctx.lineTo(mx + s, my + 5 + s);
+        }
+        ctx.closePath();
+        ctx.fill();
+      }
+    }
+
     // Last price line + tag
     const lastC = view[view.length - 1].close;
     const lastY = yPrice(lastC);
@@ -464,7 +499,7 @@
       ? state.chartCandles : state.candles;
     if (chartCandles && chartCandles.length) {
       lastChartCandles = chartCandles.slice();
-      lastChartMeta = { timeframe: tfLabel(state.chartPeriod || 60) };
+      lastChartMeta = { timeframe: tfLabel(state.chartPeriod || 60), markers: state.markers };
       drawChart($("chart"), lastChartCandles, lastChartMeta);
     }
     if (state.autoState) updateAutoUI(state.autoState);

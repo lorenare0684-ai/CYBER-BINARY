@@ -4,6 +4,16 @@ Chrome extension (Manifest V3) that attaches to a Quotex / QX Broker chart, buil
 
 > Educational market analysis only. Not a broker. Not financial advice. Binary options have a built-in payout edge against the trader — nothing here is a profit guarantee.
 
+## What's new in v2.3.3 — non-repainting signal arrows on the Quotex chart
+
+- **Arrows on the platform chart** — every qualifying signal now draws an arrow on the Quotex chart itself: green **CALL** arrow below the bar, red **PUT** arrow above it, glued to the exact bar that triggered the signal.
+- **Non-repainting by construction** — arrows are anchored to a *closed* bar's (time, close). The anchor is fixed before the next candle exists, deduped per (asset, bar, direction), and never changes afterwards; re-rendering only re-projects fixed anchors, so arrows can never move, flicker or double up as new candles form.
+- **Historical arrows too** — on attach, every settled trade in your stored history is replayed as a fixed marker, so past signals are visible on the chart alongside the live ones.
+- **Renders through TradingView Lightweight Charts natively** — the page hook (MAIN world, document_start) captures the chart instance three ways: it wraps `LightweightCharts.createChart` before the page bundle assigns the global, reads `<lightweight-chart>` web-component instances, and runs a bounded React-fiber scan of the chart container for bundled builds. Markers are drawn with the library's own `series.setMarkers()` — the arrows scroll and zoom with the chart exactly like platform drawings.
+- **Overlay-canvas fallback** — if no chart API is reachable, arrows are drawn on a transparent overlay above the price chart from the same fixed anchors (approximate mapping from the live feed bars; redrawn on resize/scroll).
+- **Dashboard chart arrows** — the same fixed anchors are drawn on the dashboard's candle chart (green/red triangles at their bar slots).
+- All of it is regression-tested in `tools/markers.js` (store semantics, immutable anchors, dedupe, UTC-second conversion, hook capture paths, native + overlay rendering, idempotent re-renders) and `tools/detection-e2e.js` (markers message + state payload).
+
 ## What's new in v2.3.2 — bug-audit fixes
 
 - **Settings no longer silently drop rapid changes** — `storage.js` used to re-read `chrome.storage.local` on every `load()`, so two quick updates inside the 200ms save debounce (e.g. mode then arm, stake then expiry) lost the earlier one. Writes pending in the debounce are now flushed before every read; cross-context changes (dashboard popup ↔ content script) are still picked up. Covered by `tools/bugs.js`.

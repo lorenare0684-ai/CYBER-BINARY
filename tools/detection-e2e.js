@@ -23,7 +23,8 @@ const root = path.join(__dirname, "..");
 // Deterministic intervals: content.js registers its 500ms `tick` loop through
 // setInterval; we capture the callback instead of letting it fire on its own.
 const intervalFns = [];
-const sandbox = { self: {}, console, globalThis: null, location: { hostname: "qxbroker.com", pathname: "/trade", href: "https://qxbroker.com/en/trade?type=demo", host: "qxbroker.com", title: "Quotex" }, navigator: { userAgent: "node" }, Event: function () {}, Notification: undefined, setTimeout: (fn) => 0, clearInterval: () => {}, setInterval: (fn) => { intervalFns.push(fn); return intervalFns.length; }, postMessage: () => {} };
+const postedMessages = [];
+const sandbox = { self: {}, console, globalThis: null, location: { hostname: "qxbroker.com", pathname: "/trade", href: "https://qxbroker.com/en/trade?type=demo", host: "qxbroker.com", title: "Quotex" }, navigator: { userAgent: "node" }, Event: function () {}, Notification: undefined, setTimeout: (fn) => 0, clearInterval: () => {}, setInterval: (fn) => { intervalFns.push(fn); return intervalFns.length; }, postMessage: (m) => { postedMessages.push(m); } };
 sandbox.globalThis = sandbox.self;
 sandbox.window = sandbox.self;
 sandbox.__contentMsgListeners = [];
@@ -90,7 +91,7 @@ const chromeStub = {
 sandbox.chrome = chromeStub;
 
 vm.createContext(sandbox);
-for (const f of ["indicators.js", "assets.js", "strategy.js", "feed.js", "engine.js", "storage.js", "auto.js", "backtest.js", "quotex.js"]) {
+for (const f of ["indicators.js", "assets.js", "strategy.js", "feed.js", "engine.js", "storage.js", "auto.js", "backtest.js", "quotex.js", "markers.js"]) {
   vm.runInContext(fs.readFileSync(path.join(root, "src/lib", f), "utf8"), sandbox);
 }
 // content.js runs in the ISOLATED world of the page — same sandbox here.
@@ -125,6 +126,17 @@ check("content message listener captured", sandbox.__contentMsgListeners.length 
 //    (this is the path that was broken with hashed CSS-module class names).
 forceTick();
 check("DOM text-scan detects EUR/USD OTC at attach", lastState() && lastState().assetId === "EURUSD_otc", lastState() && lastState().assetId);
+
+// v2.3.3: the content script pushes its marker list to the MAIN-world hook
+// (kind "markers") so arrows can be drawn on the platform chart.
+const markersMsg = postedMessages.find((m) => m && m.kind === "markers");
+check("markers message posted to the page hook", !!markersMsg, "posted kinds=" + postedMessages.map((m) => m && m.kind).join(","));
+check("markers payload has per-asset list + bars for the overlay",
+  markersMsg && Array.isArray(markersMsg.payload && markersMsg.payload.markers) && Array.isArray(markersMsg.payload && markersMsg.payload.bars),
+  markersMsg && JSON.stringify(markersMsg.payload && { n: markersMsg.payload.markers.length, bars: markersMsg.payload.bars.length }));
+const state0 = lastState();
+check("state payload carries markers for the dashboard chart",
+  state0 && Array.isArray(state0.markers), state0 && String(state0.markers));
 
 // 1. outgoing-sniff asset message
 hookMsg("asset", { symbol: "EURUSD_otc", raw: "ws_out" });
