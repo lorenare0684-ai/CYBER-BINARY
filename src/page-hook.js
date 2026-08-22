@@ -6,7 +6,7 @@
  *   - tools/page-hook.shell.js (MAIN-world WebSocket hook shell)
  *
  * Rebuild after any change to either source file.
- * Generated: 2026-08-22T14:54:30.282Z
+ * Generated: 2026-08-22T15:48:04.056Z
  */
 /* ====================================================================
  * Inlined CYBER_QUOTEX adapter (src/lib/quotex.js).
@@ -27,8 +27,10 @@
  *     connection; no broker credentials are ever read, stored, or
  *     sent by the extension).
  *
- *   - Knows the full Quotex asset catalog (84 assets, including the
- *     `_otc` synthetic variants), with the broker-internal numeric IDs.
+ *   - Knows the full Quotex asset catalog (~170 symbols: every base FX pair
+ *     + its `_otc` twin, exotic FX OTC, crypto OTC, commodities, indices,
+ *     stocks OTC), with the broker-internal numeric IDs where confirmed;
+ *     live `instruments/list` payloads merge real ids at runtime.
  *
  *   - Locates the live trading panel in the DOM (asset, price, stake,
  *     expiry, CALL/PUT buttons, balance) and offers a `placeTrade()`
@@ -50,7 +52,12 @@
   "use strict";
 
   /* ============================================================
-   * 1. Asset catalog (from quotexapi constants — official IDs).
+   * 1. Asset catalog (v2.3: FULL Quotex platform list).
+   *
+   * Numeric IDs are the broker-internal ids confirmed by the official
+   * open-source clients (A11ksa/API-Quotex, ericpedra/quotexapi, quotexpy).
+   * Symbols with no confirmed id live in EXTRA_SYMBOLS and get their real id
+   * from the platform's `instruments/list` payload at runtime (rememberIds).
    * ============================================================ */
   var ASSET_IDS = {
     "ADAUSD_otc": 376, "APTUSD_otc": 377, "ARBUSD_otc": 378, "ATOUSD_otc": 368,
@@ -74,10 +81,36 @@
     "NZDJPY": 58, "NZDJPY_otc": 89, "NZDUSD": 60, "NZDUSD_otc": 90,
     "PFE_otc": 297, "SPXUSD": 323, "STXEUR": 325, "UKBrent_otc": 164,
     "USCrude_otc": 165, "USDCAD": 61, "USDCAD_otc": 91, "USDCHF": 62,
-    "USDCHF_otc": 92, "USDJPY": 63, "USDJPY_otc": 93, "XAGUSD": 65,
-    "XAGUSD_otc": 167, "XAUUSD": 2, "XAUUSD_otc": 169, "XRPUSD_otc": 364,
-    "AVAUSD_otc": 379, "AXSUSD_otc": 380,
+    "USDCHF_otc": 92, "USDJPY": 63, "USDJPY_otc": 93, "USDMXN_otc": 343,
+    "XAGUSD": 65, "XAGUSD_otc": 167, "XAUUSD": 2, "XAUUSD_otc": 169,
+    "XRPUSD_otc": 364, "AVAUSD_otc": 379, "AXSUSD_otc": 380,
   };
+
+  // Symbols the platform lists but whose broker id isn't confirmed by the
+  // open-source clients yet. They still appear in getInstruments()/detection;
+  // the live `instruments/list` payload fills in their real ids (rememberIds).
+  var EXTRA_SYMBOLS = [
+    // FX: newer real-market pairs + OTC twins
+    "GBPNZD", "GBPNZD_otc", "NZDCAD", "NZDCAD_otc", "NZDCHF", "NZDCHF_otc",
+    // Exotic FX (OTC)
+    "ARSUSD_otc", "DZDUSD_otc", "INRUSD_otc", "USDBDT_otc", "USDCOP_otc",
+    "USDPKR_otc", "USDTRY_otc", "USDZAR_otc", "EURTRY_otc", "EURPLN_otc",
+    "EURHUF_otc", "USDRUB_otc", "USDSEK_otc", "USDNOK_otc", "EURNOK_otc",
+    "EURSEK_otc",
+    // Crypto (OTC)
+    "SOLUSD_otc", "LTCUSD_otc", "TRXUSD_otc", "SHIBUSD_otc", "MATICUSD_otc",
+    "DOTUSD_otc", "LINKUSD_otc", "XLMUSD_otc", "DOGEUSD_otc", "DASHUSD_otc",
+    "ETCUSD_otc", "NEARUSD_otc", "SUIUSD_otc", "TIAUSD_otc",
+    // Commodities (OTC)
+    "XNGUSD_otc", "XPTUSD_otc", "XPDUSD_otc", "COPPER_otc",
+    // Stocks (OTC)
+    "AAPL_otc", "AMZN_otc", "CSCO_otc", "DIS_otc", "GOOGL_otc", "JPM_otc",
+    "KO_otc", "NFLX_otc", "NVDA_otc", "PG_otc", "TSLA_otc", "V_otc", "WMT_otc",
+    "XOM_otc", "HD_otc", "PEP_otc", "META_otc", "AMD_otc", "IBM_otc",
+    "NKE_otc", "SBUX_otc", "CVX_otc", "WFC_otc", "BAC_otc", "C_otc", "GS_otc",
+    "MS_otc", "T_otc", "VZ_otc", "COST_otc", "ABBV_otc", "LLY_otc", "UNH_otc",
+    "MA_otc",
+  ];
 
   var KNOWN_TIMEFRAMES = {
     30: "30s", 60: "1m", 120: "2m", 180: "3m", 300: "5m", 600: "10m",
@@ -91,6 +124,35 @@
     if (Object.prototype.hasOwnProperty.call(ASSET_IDS, k)) {
       ID_TO_SYMBOL[ASSET_IDS[k]] = k;
     }
+  }
+
+  /**
+   * Merge broker-internal ids learned from the live `instruments/list`
+   * payload into the static catalog. Any id seen at runtime wins over our
+   * best-effort static guess, and any brand-new symbol gets an id mapping so
+   * numeric tick rows (`[id, ts, price]`) resolve to a symbol.
+   */
+  function rememberIds(list) {
+    if (!Array.isArray(list)) return 0;
+    var added = 0;
+    for (var i = 0; i < list.length; i++) {
+      var it = list[i];
+      if (!it || !it.symbol) continue;
+      var sym = normalizeSymbolName(it.symbol);
+      var id = parseInt(it.id, 10) || 0;
+      if (sym && id) {
+        if (!Object.prototype.hasOwnProperty.call(ASSET_IDS, sym) || ASSET_IDS[sym] !== id) {
+          ASSET_IDS[sym] = id;
+          ID_TO_SYMBOL[id] = sym;
+          added++;
+        }
+      } else if (sym && !Object.prototype.hasOwnProperty.call(ASSET_IDS, sym)) {
+        // Known symbol, id not (yet) present in the row — keep it listed.
+        ASSET_IDS[sym] = 0;
+        added++;
+      }
+    }
+    return added;
   }
 
   function isQuotexHost(host) {
@@ -129,14 +191,26 @@
    *   {type:"bin",   event?, payload} binary body after a header (or headerless)
    *   {type:"unknown", raw}          anything else we couldn't classify
    * ============================================================ */
+  function bytesToStr(u8) {
+    // String.fromCharCode.apply with a huge array throws
+    // "Maximum call stack size exceeded" (>~64k elements), and the
+    // instruments/history binary payloads are often >1MB. Chunk it.
+    var out = "";
+    var CHUNK = 0x8000;
+    for (var i = 0; i < u8.length; i += CHUNK) {
+      out += String.fromCharCode.apply(null, u8.subarray(i, i + CHUNK));
+    }
+    return out;
+  }
+
   function asString(raw) {
     if (typeof raw === "string") return raw;
     if (raw == null) return "";
     if (typeof ArrayBuffer !== "undefined" && raw instanceof ArrayBuffer) {
-      try { return String.fromCharCode.apply(null, new Uint8Array(raw)); } catch (_) { return ""; }
+      try { return bytesToStr(new Uint8Array(raw)); } catch (_) { return ""; }
     }
     if (typeof Uint8Array !== "undefined" && raw instanceof Uint8Array) {
-      try { return String.fromCharCode.apply(null, raw); } catch (_) { return ""; }
+      try { return bytesToStr(raw); } catch (_) { return ""; }
     }
     if (typeof Blob !== "undefined" && raw && typeof raw.text === "function") {
       // async path — return a sentinel; caller will await `raw.text()`
@@ -240,7 +314,10 @@
     var ev = mapEventName(event);
     var out = { event: event, normalized: ev, payload: payload };
     switch (ev) {
-      case "instruments": out.instruments = parseInstruments(payload); break;
+      case "instruments":
+        out.instruments = parseInstruments(payload);
+        try { rememberIds(out.instruments); } catch (_) {}
+        break;
       case "quote":       out.quote = parseQuote(payload); break;
       case "balance":     out.balance = parseBalance(payload); break;
       case "candles":     {
@@ -286,6 +363,11 @@
       case "successcloseOrder":    return "order_closed";
       case "orders/closed/list":   return "orders_closed_list";
       case "quotes/stream":        return "quote";
+      // Older platform builds stream quotes under "tick" / "stream_update"
+      // (payload identical to quotes/stream: [[symbol, ts, price], ...]).
+      case "tick":                 return "quote";
+      case "stream_update":        return "quote";
+      case "quotes":               return "quote";
       case "history/list/v2":      return "candles";
       case "chart_notification/get": return "candles";
       case "loadHistoryPeriod":    return "candles";
@@ -470,6 +552,12 @@
 
   function parseQuote(payload) {
     if (!payload) return null;
+    // Object wrappers seen on some builds: {"tick": [[...],...]} or
+    // {"quotes": [...]} or a single quote object.
+    if (!Array.isArray(payload) && typeof payload === "object") {
+      if (payload.tick != null && Array.isArray(payload.tick)) payload = payload.tick;
+      else if (payload.quotes != null && Array.isArray(payload.quotes)) payload = payload.quotes;
+    }
     var symbol = null, ts = null, price = null;
     if (Array.isArray(payload)) {
       if (!payload.length) return null;
@@ -486,9 +574,22 @@
         symbol = String(first[1]);
         price = parseFloat(first[2]);
       }
-      if (price == null && typeof first[1] === "number") {
-        ts = first[1];
-        price = parseFloat(first[2]);
+      // [assetId, ts, price] — resolve the numeric broker id to a symbol
+      if (price == null && typeof first[0] === "number" && typeof first[1] === "number" && first.length >= 3) {
+        var byId = ID_TO_SYMBOL[first[0]];
+        if (byId) {
+          symbol = byId;
+          ts = first[1];
+          price = parseFloat(first[2]);
+        } else {
+          ts = first[1];
+          price = parseFloat(first[2]);
+        }
+      }
+      // [ts, price] — two-element rows on some streams
+      if (price == null && typeof first[1] === "number" && first.length >= 2) {
+        ts = first[0];
+        price = parseFloat(first[1]);
       }
     } else if (typeof payload === "object") {
       symbol = payload.symbol || payload.asset || payload.pair || null;
@@ -642,22 +743,8 @@
   }
 
   function findStakeInput() {
-    var sels = [
-      "input[class*='amount']",
-      "input[class*='stake']",
-      "input[class*='sum']",
-      "input[aria-label*='amount' i]",
-      "input[aria-label*='stake' i]",
-      "input[placeholder*='amount' i]",
-      "input[type='number']",
-    ];
-    for (var i = 0; i < sels.length; i++) {
-      var nodes = document.querySelectorAll(sels[i]);
-      for (var j = 0; j < nodes.length; j++) {
-        if (isVisible(nodes[j])) return nodes[j];
-      }
-    }
-    return null;
+    var cands = stakeCandidates();
+    return cands.length ? cands[0].el : null;
   }
 
   function findExpirySelect() {
@@ -682,37 +769,97 @@
   function findCallButton() { return findDirButton("CALL"); }
   function findPutButton()  { return findDirButton("PUT"); }
 
+  // Words / glyphs that identify a direction on any platform build.
+  var CALL_HINTS = /call|buy|up|rise|higher|bull|subir|comprar|↑|⇑|▲|➚|↗/i;
+  var PUT_HINTS = /put|sell|down|fall|lower|bear|bajar|vender|↓|⇓|▼|➘|↘/i;
+
+  function elementDirHints(el) {
+    var text = ((el.textContent || "") + " " + (el.getAttribute && (el.getAttribute("aria-label") || "")) + " " + (el.className || "")).toUpperCase();
+    var cls = String(el.className || "").toLowerCase();
+    var call = CALL_HINTS.test(text) || /call|buy|up|rise/.test(cls);
+    var put = PUT_HINTS.test(text) || /put|sell|down|fall/.test(cls);
+    return { call: call, put: put };
+  }
+
+  function elementIsGreen(el) {
+    try {
+      var bg = getComputedStyle(el).backgroundColor;
+      var m = bg.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+      if (!m) return null;
+      var r = +m[1], g = +m[2], b = +m[3];
+      if (g > r + 25 && g > b + 25) return true;   // clearly green
+      if (r > g + 25 && r > b + 25) return false;  // clearly red
+      return null;
+    } catch (_) { return null; }
+  }
+
   function findDirButton(dir) {
     var sels = [
-      "button[class*='call']",
-      "button[class*='put']",
-      "button[class*='up']",
-      "button[class*='down']",
-      "[class*='call-btn']",
-      "[class*='put-btn']",
-      "button[data-type='CALL']",
-      "button[data-type='PUT']",
-      "button[data-direction='CALL']",
-      "button[data-direction='PUT']",
+      "button[class*='call']", "button[class*='put']",
+      "button[class*='up']", "button[class*='down']",
+      "button[class*='buy']", "button[class*='sell']",
+      "[class*='call-btn']", "[class*='put-btn']",
+      "[class*='up-btn']", "[class*='down-btn']",
+      "[class*='btn-call']", "[class*='btn-put']",
+      "[class*='btn-up']", "[class*='btn-down']",
+      "[class*='btn-buy']", "[class*='btn-sell']",
+      "[class*='turbo-buy']", "[class*='turbo-sell']",
+      "[class*='binary-buy']", "[class*='binary-sell']",
+      "[class*='header-call']", "[class*='header-put']",
+      "button[data-type='CALL']", "button[data-type='PUT']",
+      "button[data-direction='CALL']", "button[data-direction='PUT']",
+      "button[data-testid*='call' i]", "button[data-testid*='put' i]",
+      "button[aria-label*='call' i]", "button[aria-label*='put' i]",
+      "[role='button'][class*='call']", "[role='button'][class*='put']",
     ];
+    var seen = [];
     for (var i = 0; i < sels.length; i++) {
       var nodes = document.querySelectorAll(sels[i]);
       for (var j = 0; j < nodes.length; j++) {
         if (!isVisible(nodes[j])) continue;
-        var t = (nodes[j].textContent || "").trim().toUpperCase();
-        if (dir === "CALL" && (sels[i].indexOf("call") !== -1 || sels[i].indexOf("up") !== -1 ||
-            t === "CALL" || t === "BUY" || t.indexOf("↑") !== -1)) return nodes[j];
-        if (dir === "PUT" && (sels[i].indexOf("put") !== -1 || sels[i].indexOf("down") !== -1 ||
-            t === "PUT" || t === "SELL" || t.indexOf("↓") !== -1)) return nodes[j];
+        if (seen.indexOf(nodes[j]) !== -1) continue;
+        seen.push(nodes[j]);
+        var h = elementDirHints(nodes[j]);
+        if (dir === "CALL" && h.call && !h.put) return nodes[j];
+        if (dir === "PUT" && h.put && !h.call) return nodes[j];
       }
     }
-    // Last-resort scan: any visible button whose label matches the direction.
-    var all = document.querySelectorAll("button");
+    // Last-resort scan: ANY visible clickable element. Classify by label,
+    // then by green/red background (Quotex CALL is green, PUT is red), then
+    // by vertical position among siblings in the trade panel.
+    var scope = findPanel() || document;
+    var all = scope.querySelectorAll("button, [role='button'], [class*='btn'], [class*='button'], [class*='header']");
+    var greens = [], reds = [], unclassified = [];
     for (var k = 0; k < all.length; k++) {
-      if (!isVisible(all[k])) continue;
-      var t2 = (all[k].textContent || "").trim().toUpperCase();
-      if (dir === "CALL" && (t2 === "CALL" || t2 === "BUY" || t2.indexOf("↑") !== -1)) return all[k];
-      if (dir === "PUT"  && (t2 === "PUT"  || t2 === "SELL" || t2.indexOf("↓") !== -1)) return all[k];
+      var el = all[k];
+      if (!isVisible(el)) continue;
+      if (el.closest && el.closest("#cyber-binary-hud")) continue;
+      if (el.tagName === "BUTTON" && !el.children.length && !(el.textContent || "").trim()) continue;
+      if (seen.indexOf(el) !== -1) continue;
+      var ht = elementDirHints(el);
+      if (dir === "CALL" && ht.call && !ht.put) return el;
+      if (dir === "PUT" && ht.put && !ht.call) return el;
+      var color = elementIsGreen(el);
+      if (color === true) greens.push(el);
+      else if (color === false) reds.push(el);
+      else unclassified.push(el);
+    }
+    // By color: for CALL prefer the GREEN button, for PUT the RED one —
+    // but only when there is exactly one strong candidate of each color.
+    if (dir === "CALL" && greens.length === 1 && reds.length === 1) return greens[0];
+    if (dir === "PUT" && greens.length === 1 && reds.length === 1) return reds[0];
+    // By position (conservative): only when exactly two unclassified
+    // clickables share the same parent and are large enough to be the
+    // trade buttons — upper = CALL, lower = PUT.
+    if (unclassified.length === 2) {
+      var a1 = unclassified[0], a2 = unclassified[1];
+      var sameParent = (a1.parentElement === a2.parentElement) && a1.parentElement != null;
+      var big = a1.getBoundingClientRect().height >= 28 && a2.getBoundingClientRect().height >= 28;
+      if (sameParent && big) {
+        return a1.getBoundingClientRect().top <= a2.getBoundingClientRect().top
+          ? (dir === "CALL" ? a1 : a2)
+          : (dir === "CALL" ? a2 : a1);
+      }
     }
     return null;
   }
@@ -761,9 +908,60 @@
    *          only get by snooping the page's traffic; we never ask
    *          the user for credentials.
    * ============================================================ */
+  function stakeCandidates() {
+    var sels = [
+      "input[class*='amount']", "input[class*='stake']", "input[class*='sum']",
+      "input[aria-label*='amount' i]", "input[aria-label*='stake' i]",
+      "input[placeholder*='amount' i]", "input[placeholder*='stake' i]",
+      "input[name='amount']", "input[name='sum']",
+      "input[data-testid*='amount' i]", "input[data-testid*='stake' i]",
+      "input[inputmode='decimal']", "input[inputmode='numeric']",
+      "[class*='stake'] input[type='number']", "[class*='amount'] input[type='number']",
+      "input[type='number']",
+    ];
+    var out = [];
+    var seen = [];
+    var panel = null;
+    try { panel = findPanel(); } catch (_) {}
+    var btn = null;
+    try { btn = findCallButton() || findPutButton(); } catch (_) {}
+    for (var i = 0; i < sels.length; i++) {
+      var nodes = document.querySelectorAll(sels[i]);
+      for (var j = 0; j < nodes.length; j++) {
+        var el = nodes[j];
+        if (!isVisible(el)) continue;
+        if (seen.indexOf(el) !== -1) continue;
+        seen.push(el);
+        var type = (el.type || "").toLowerCase();
+        if (type === "hidden" || type === "checkbox" || type === "radio" || type === "submit" || type === "button") continue;
+        var score = 0;
+        var tag = (el.className || "") + " " + (el.placeholder || "") + " " + (el.getAttribute && (el.getAttribute("aria-label") || ""));
+        if (/amount|stake|sum|invest/i.test(tag)) score += 4;
+        if (el.inputMode === "decimal" || el.inputMode === "numeric") score += 1;
+        if (panel && panel.contains && panel.contains(el)) score += 2;
+        else if (panel && panel.querySelectorAll) {
+          // is el inside panel?
+          var p = el.parentElement;
+          while (p) { if (p === panel) { score += 2; break; } p = p.parentElement; }
+        }
+        if (btn) {
+          try {
+            var r1 = el.getBoundingClientRect(), r2 = btn.getBoundingClientRect();
+            var dist = Math.abs(r1.top - r2.top) + Math.abs(r1.left - r2.left);
+            if (dist < 400) score += 1;
+          } catch (_) {}
+        }
+        out.push({ el: el, score: score });
+      }
+    }
+    out.sort(function (a, b) { return b.score - a.score; });
+    return out;
+  }
+
   function setStake(amount) {
-    var el = findStakeInput();
-    if (!el) return false;
+    var cands = stakeCandidates();
+    if (!cands.length) return false;
+    var el = cands[0].el;
     try {
       var proto = el.tagName === "TEXTAREA" ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
       var setter = Object.getOwnPropertyDescriptor(proto, "value");
@@ -771,6 +969,7 @@
       else el.value = String(amount);
       el.dispatchEvent(new Event("input", { bubbles: true }));
       el.dispatchEvent(new Event("change", { bubbles: true }));
+      try { el.dispatchEvent(new Event("blur", { bubbles: true })); } catch (_) {}
       return true;
     } catch (_) { return false; }
   }
@@ -865,6 +1064,7 @@
       balance:   handlers.onBalance   || function () {},
       order:     handlers.onOrder     || function () {},
       frame:     handlers.onFrame     || function () {},
+      asset:     handlers.onAsset     || function () {},
     };
 
     function feed(label, payload, frame) {
@@ -881,8 +1081,18 @@
 
     function emitInstruments(payload) {
       var list = parseInstruments(payload);
+      // Learn broker ids from the live payload (numeric tick rows and
+      // orders reference assets by id, so this is what makes detection work
+      // even on builds whose quotes/stream uses numeric ids).
+      try { rememberIds(list); } catch (_) {}
       try { listeners.instruments(list); } catch (_) {}
       feed("instruments", list, null);
+    }
+
+    function emitAsset(symbol) {
+      if (!symbol) return;
+      try { listeners.asset(String(symbol)); } catch (_) {}
+      feed("asset", String(symbol), null);
     }
 
     function emitTick(payload) {
@@ -1035,6 +1245,39 @@
     };
   }
 
+  /**
+   * Sniff OUTGOING Socket.IO frames. The web client tells the server which
+   * asset it is charting (`instruments/follow`, `instruments/update`,
+   * `history/list/v2`, `chart_notification/get`, `orders/open` …), so these
+   * frames are the single most reliable source for the ACTIVE asset — far
+   * better than guessing from hashed DOM class names. Returns the symbol or
+   * null. Pure, safe to call for every send().
+   */
+  function sniffOutgoing(data) {
+    var s = typeof data === "string" ? data : "";
+    if (!s) return null;
+    var idx = s.indexOf('["');
+    if (idx < 0) return null;
+    // Only Socket.IO payload frames (42… / 43… / 451-… / 46…).
+    var prefix = s.charAt(0);
+    if (!(prefix === "4" || prefix === "5")) return null;
+    if (s.indexOf("42") !== 0 && s.indexOf("43") !== 0 && s.indexOf("451-") !== 0 && s.indexOf("46") !== 0) return null;
+    var arr = safeJSON(s.slice(s.indexOf("[")));
+    if (!Array.isArray(arr) || arr.length < 1) return null;
+    var ev = String(arr[0] || "");
+    var body = arr.length > 1 ? arr[1] : null;
+    // Only events that carry an asset/symbol reference.
+    if (!/^(instruments\/follow|instruments\/update|history\/list\/v2|chart_notification\/get|loadHistoryPeriod|quotes\/stream|orders\/open|instruments\/update_list|tick)$/.test(ev)) return null;
+    var asset = null;
+    if (body && typeof body === "object") {
+      asset = body.asset || body.symbol || body.pair || null;
+    } else if (typeof body === "string" && body) {
+      asset = body;
+    }
+    if (!asset) return null;
+    return { event: ev, symbol: normalizeSymbolName(asset) };
+  }
+
   function attachPageSocket(handlers) {
     handlers = handlers || {};
     var Native = window.WebSocket;
@@ -1047,6 +1290,21 @@
       var ws = protocols !== undefined ? new Native(url, protocols) : new Native(url);
       try { router.listeners.status({ state: "opening", url: url }); } catch (_) {}
       if (handle) handle.lastWs = ws;
+      // Outgoing-frame sniffing: the client's own requests reveal the active
+      // asset with no DOM/selector guessing. Handles ArrayBuffer sends too.
+      var nativeSend = ws.send.bind(ws);
+      ws.send = function (data) {
+        try {
+          var s = typeof data === "string" ? data
+            : (data instanceof ArrayBuffer ? asString(data) : null);
+          var hit = s ? sniffOutgoing(s) : null;
+          if (hit && hit.symbol) {
+            try { router.listeners.asset(hit.symbol); } catch (_) {}
+            feedOut(hit);
+          }
+        } catch (_) {}
+        return nativeSend(data);
+      };
       ws.addEventListener("open", function () {
         try { router.listeners.status({ state: "open", url: url }); } catch (_) {}
       });
@@ -1057,6 +1315,13 @@
         try { router.feedRaw(ev.data); } catch (_) {}
       });
       return ws;
+    }
+    function feedOut(hit) {
+      try {
+        if (router.listeners && typeof router.listeners.frame === "function") {
+          router.listeners.frame("outgoing", hit, null);
+        }
+      } catch (_) {}
     }
     Wrapped.prototype = Native.prototype;
     Wrapped.CONNECTING = Native.CONNECTING;
@@ -1120,6 +1385,7 @@
     findAssetHeader: findAssetHeader,
     findPriceLabel: findPriceLabel,
     findStakeInput: findStakeInput,
+    stakeCandidates: stakeCandidates,
     findExpirySelect: findExpirySelect,
     findCallButton: findCallButton,
     findPutButton: findPutButton,
@@ -1151,11 +1417,18 @@
       }
     },
     getInstruments: function () {
-      // Static catalog (id -> symbol). Live list arrives via attachPageSocket.
+      // Static catalog (id -> symbol) + symbols without confirmed ids yet.
+      // Live list arrives via attachPageSocket and merges real ids.
       var out = [];
       for (var s in ASSET_IDS) {
         if (Object.prototype.hasOwnProperty.call(ASSET_IDS, s)) {
           out.push({ id: ASSET_IDS[s], symbol: s, isOtc: /_otc$/i.test(s) });
+        }
+      }
+      for (var e = 0; e < EXTRA_SYMBOLS.length; e++) {
+        var es = EXTRA_SYMBOLS[e];
+        if (!Object.prototype.hasOwnProperty.call(ASSET_IDS, es)) {
+          out.push({ id: 0, symbol: es, isOtc: /_otc$/i.test(es) });
         }
       }
       return out;
@@ -1164,9 +1437,12 @@
       var b = findBalance();
       return b ? b.value : null;
     },
+    rememberIds: rememberIds,
+    sniffOutgoing: sniffOutgoing,
     KNOWN_EVENTS: KNOWN_EVENTS,
     WSS_GUESSES: WSS_GUESSES,
     ASSET_IDS: ASSET_IDS,
+    EXTRA_SYMBOLS: EXTRA_SYMBOLS,
     ID_TO_SYMBOL: ID_TO_SYMBOL,
     KNOWN_TIMEFRAMES: KNOWN_TIMEFRAMES,
   };
@@ -1224,6 +1500,7 @@
     orders: [],       // rolling list of recent orders (last 50)
     status: { state: "idle", url: null },
     assetIdMap: {},   // broker numeric id -> symbol
+    lastWsSymbol: null, // most recent asset seen on the socket (in or out)
   };
 
   var handle = {
@@ -1243,6 +1520,10 @@
       if (!msg || !msg.asset) return;
       var key = msg.asset + "@" + (msg.period || 60);
       live.candles[key] = msg.candles || [];
+      // Incoming history payloads name their asset — another reliable
+      // active-asset signal (covers builds that never stream quotes/stream).
+      live.lastWsSymbol = msg.asset;
+      emit("asset", { symbol: msg.asset, raw: "ws_candle" });
       emit("candle", { asset: msg.asset, period: msg.period, candles: msg.candles });
     },
     onTick: function (q) {
@@ -1259,7 +1540,16 @@
         var it = list[i];
         if (it && it.symbol) live.assetIdMap[it.id] = it.symbol;
       }
+      // Learn broker ids so numeric tick rows ([id, ts, price]) resolve.
+      try { if (Q.rememberIds) Q.rememberIds(list); } catch (_) {}
       emit("instruments", list || []);
+    },
+    onAsset: function (symbol) {
+      // Active-asset hint from OUTGOING frames (the web client tells the
+      // server which asset it charts — the most reliable detector of all).
+      if (!symbol) return;
+      live.lastWsSymbol = symbol;
+      emit("asset", { symbol: symbol, raw: "ws_out" });
     },
     onBalance: function (b) {
       live.balance = b;
@@ -1286,6 +1576,393 @@
   });
   handle.router = router;
 
+  /* ====================================================================
+   * v2.3.3 — non-repainting signal markers on the platform chart.
+   *
+   * Quotex's chart is TradingView "lightweight-charts". Arrows are anchored
+   * to (bar time, price) by the content script (fixed once per closed bar),
+   * so they can never repaint: re-rendering only re-projects fixed anchors.
+   * Rendering here tries, in order:
+   *   1. native `series.setMarkers()` — best: the chart scrolls/zooms and
+   *      the arrows stay glued to their bars;
+   *   2. an overlay canvas above the price chart (approximate mapping from
+   *      the feed bars the content script sends alongside the markers).
+   * The chart instance is captured by:
+   *   a. wrapping window.LightweightCharts.createChart at document_start
+   *      (the page-hook runs in the MAIN world before page scripts);
+   *   b. `<lightweight-chart>` web components (chart property);
+   *   c. a bounded React-fiber scan of the chart container (bundled builds
+   *      that never expose the library globally).
+   * ==================================================================== */
+  var MARKERS = (function () {
+    var chart = null;        // lightweight-charts IChartApi
+    var series = null;       // main price series (the one that accepts setMarkers)
+    var nativeList = [];     // last normalized native marker list
+    var lastPayload = null;  // raw { asset, markers, bars } from content
+    var overlay = null;      // { el, canvas, ctx, target }
+    var mode = "none";       // "native" | "overlay" | "none"
+    var CALL_COLOR = "#3dff9a";
+    var PUT_COLOR = "#ff5d7a";
+    var MAX = 600;
+
+    function isChartLike(o) {
+      return !!o && typeof o === "object" &&
+        typeof o.timeScale === "function" &&
+        (typeof o.addCandlestickSeries === "function" || typeof o.addSeries === "function" ||
+         typeof o.addLineSeries === "function" || typeof o.addBarSeries === "function");
+    }
+
+    function isSeriesLike(s) {
+      return !!s && typeof s === "object" && typeof s.setMarkers === "function";
+    }
+
+    function findExistingSeries(c) {
+      try {
+        var arr = c.series();
+        if (Array.isArray(arr) && arr.length && isSeriesLike(arr[0])) return arr[0];
+      } catch (_) {}
+      try {
+        var keys = Object.keys(c);
+        var n = Math.min(keys.length, 40);
+        for (var i = 0; i < n; i++) {
+          var v = c[keys[i]];
+          if (Array.isArray(v)) {
+            for (var j = 0; j < v.length && j < 20; j++) if (isSeriesLike(v[j])) return v[j];
+          } else if (isSeriesLike(v)) return v;
+        }
+      } catch (_) {}
+      return null;
+    }
+
+    function captureChart(c) {
+      if (!isChartLike(c)) return false;
+      if (chart === c) return true;
+      chart = c;
+      series = findExistingSeries(c);
+      // Wrap series adders so a re-created main series (asset / timeframe
+      // switch) is captured too. Candlestick/bar adders REPLACE the marker
+      // target (they are the price chart); overlays (line/area/…/addSeries)
+      // only fill in if we have no target yet.
+      var names = ["addCandlestickSeries", "addBarSeries", "addLineSeries",
+        "addAreaSeries", "addBaselineSeries", "addHistogramSeries", "addSeries"];
+      for (var i = 0; i < names.length; i++) (function (n) {
+        var orig = c[n];
+        if (typeof orig !== "function" || orig.__cyberWrapped) return;
+        c[n] = function () {
+          var s = orig.apply(this, arguments);
+          if (isSeriesLike(s)) {
+            if (n === "addCandlestickSeries" || n === "addBarSeries") series = s;
+            else if (!series) series = s;
+          }
+          return s;
+        };
+        try { c[n].__cyberWrapped = true; } catch (_) {}
+      })(names[i]);
+      if (series) applyNative();
+      return true;
+    }
+
+    function hasChart() { return !!chart; }
+
+    /** Raw markers -> lightweight-charts setMarkers() format. */
+    function normalize(list) {
+      var byTime = Object.create(null);
+      var arr = Array.isArray(list) ? list : [];
+      for (var i = 0; i < arr.length; i++) {
+        var m = arr[i];
+        if (!m || m.time == null || !isFinite(m.time)) continue;
+        var sec = Math.floor(Number(m.time) / 1000);
+        var put = m.dir === "PUT";
+        byTime[sec] = {
+          time: sec,
+          position: put ? "aboveBar" : "belowBar",
+          color: put ? PUT_COLOR : CALL_COLOR,
+          shape: put ? "arrowDown" : "arrowUp",
+          text: put ? "PUT" : "CALL",
+        };
+      }
+      var out = [];
+      for (var t in byTime) {
+        if (Object.prototype.hasOwnProperty.call(byTime, t)) out.push(byTime[t]);
+      }
+      out.sort(function (a, b) { return a.time - b.time; });
+      if (out.length > MAX) out = out.slice(out.length - MAX);
+      return out;
+    }
+
+    function applyMarkers(payload) {
+      lastPayload = payload || null;
+      nativeList = normalize(lastPayload && lastPayload.markers);
+      // The platform may have recreated the main series (asset/timeframe
+      // switch) since the last markers message — re-resolve it if needed.
+      if (!series && chart) series = findExistingSeries(chart);
+      if (series && typeof series.setMarkers === "function") {
+        try {
+          series.setMarkers(nativeList);
+          mode = "native";
+          hideOverlay();
+          return;
+        } catch (_) { /* some builds throw on setMarkers — fall back */ }
+      }
+      mode = "overlay";
+      drawOverlay();
+    }
+
+    function applyNative() {
+      if (!series || typeof series.setMarkers !== "function") return;
+      try {
+        series.setMarkers(nativeList);
+        mode = "native";
+        hideOverlay();
+      } catch (_) {
+        drawOverlay();
+      }
+    }
+
+    /* ---------- overlay fallback ---------- */
+    function findChartCanvas() {
+      var all = document.querySelectorAll("canvas");
+      for (var i = 0; i < all.length; i++) {
+        try {
+          var r = all[i].getBoundingClientRect();
+          if (r && r.width > 240 && r.height > 140) return all[i];
+        } catch (_) {}
+      }
+      return null;
+    }
+
+    function ensureOverlay() {
+      if (overlay && overlay.el && overlay.el.isConnected) return overlay;
+      overlay = null;
+      var target = findChartCanvas();
+      if (!target || !document.body) return null;
+      var el = document.createElement("div");
+      el.style.cssText = "position:fixed;pointer-events:none;z-index:2147483000;";
+      var canvas = document.createElement("canvas");
+      canvas.style.cssText = "display:block;width:100%;height:100%;";
+      el.appendChild(canvas);
+      document.body.appendChild(el);
+      overlay = { el: el, canvas: canvas, ctx: (canvas.getContext && canvas.getContext("2d")) || null, target: target };
+      try {
+        if (window.ResizeObserver && overlay.target.parentElement) {
+          overlay.ro = new window.ResizeObserver(function () { scheduleOverlayRedraw(); });
+          overlay.ro.observe(overlay.target.parentElement);
+        }
+      } catch (_) {}
+      return overlay;
+    }
+
+    function hideOverlay() {
+      if (overlay && overlay.el) {
+        try { if (overlay.ro) overlay.ro.disconnect(); } catch (_) {}
+        try { overlay.el.remove(); } catch (_) {}
+      }
+      overlay = null;
+    }
+
+    var redrawTimer = null;
+    function scheduleOverlayRedraw() {
+      if (redrawTimer || mode !== "overlay") return;
+      redrawTimer = setTimeout(function () { redrawTimer = null; drawOverlay(); }, 120);
+    }
+
+    function drawOverlay() {
+      var ov = ensureOverlay();
+      if (!ov || !ov.ctx || !ov.target) return;
+      var rect = ov.target.getBoundingClientRect();
+      if (rect.width < 2 || rect.height < 2) return;
+      ov.el.style.left = rect.left + "px";
+      ov.el.style.top = rect.top + "px";
+      ov.el.style.width = rect.width + "px";
+      ov.el.style.height = rect.height + "px";
+      var dpr = window.devicePixelRatio || 1;
+      ov.canvas.width = Math.floor(rect.width * dpr);
+      ov.canvas.height = Math.floor(rect.height * dpr);
+      var ctx = ov.ctx;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, rect.width, rect.height);
+      var bars = (lastPayload && lastPayload.bars) || [];
+      var markers = (lastPayload && lastPayload.markers) || [];
+      if (!bars.length || !markers.length) return;
+      var t0 = Infinity, t1 = -Infinity, lo = Infinity, hi = -Infinity;
+      for (var i = 0; i < bars.length; i++) {
+        var b = bars[i];
+        if (!b) continue;
+        if (b.time < t0) t0 = b.time;
+        if (b.time > t1) t1 = b.time;
+        if (b.low < lo) lo = b.low;
+        if (b.high > hi) hi = b.high;
+      }
+      if (!isFinite(t0) || !isFinite(t1) || t1 <= t0 || !isFinite(hi) || !isFinite(lo)) return;
+      var pad = (hi - lo) * 0.08 || (hi * 0.001 || 0.001);
+      lo -= pad; hi += pad;
+      var W = rect.width, H = rect.height;
+      for (var k = 0; k < markers.length; k++) {
+        var m = markers[k];
+        if (!m || m.time == null || m.price == null) continue;
+        if (m.time < t0 || m.time > t1) continue;
+        var x = ((m.time - t0) / (t1 - t0)) * W;
+        var y = H - ((m.price - lo) / (hi - lo)) * H;
+        drawArrow(ctx, x, y, m.dir === "PUT");
+      }
+    }
+
+    function drawArrow(ctx, x, y, isPut) {
+      var s = 9;
+      ctx.fillStyle = isPut ? PUT_COLOR : CALL_COLOR;
+      ctx.beginPath();
+      if (isPut) {
+        ctx.moveTo(x, y - 6);            // tip, ABOVE the price
+        ctx.lineTo(x - s, y - 6 - s);
+        ctx.lineTo(x + s, y - 6 - s);
+      } else {
+        ctx.moveTo(x, y + 6);            // tip, BELOW the price
+        ctx.lineTo(x - s, y + 6 + s);
+        ctx.lineTo(x + s, y + 6 + s);
+      }
+      ctx.closePath();
+      ctx.fill();
+    }
+
+    /* ---------- chart discovery ---------- */
+    var scanTimer = null;
+    function scheduleScan() {
+      if (scanTimer) return;
+      var tries = 0;
+      scanTimer = setInterval(function () {
+        tries++;
+        try {
+          if (hasChart() || scanOnce()) { clearInterval(scanTimer); scanTimer = null; return; }
+        } catch (_) {}
+        if (tries > 30) { clearInterval(scanTimer); scanTimer = null; }
+      }, 2000);
+    }
+
+    function scanOnce() {
+      // a) lightweight-charts web component
+      try {
+        var els = document.querySelectorAll("lightweight-chart");
+        for (var i = 0; i < els.length; i++) {
+          if (els[i] && els[i].chart && captureChart(els[i].chart)) return true;
+        }
+      } catch (_) {}
+      // b) React fiber scan on chart containers (bundled lightweight-charts)
+      try {
+        var containers = document.querySelectorAll("[class*='tv-lightweight-charts'], [class*='chart']");
+        for (var c = 0; c < containers.length; c++) {
+          var inst = fiberScan(containers[c]);
+          if (inst && captureChart(inst)) return true;
+        }
+      } catch (_) {}
+      // c) common window handles
+      try {
+        var cands = [window.chart, window.qxChart, window.quotexChart, window.tradeChart, window.activeChart];
+        for (var j = 0; j < cands.length; j++) {
+          if (captureChart(cands[j])) return true;
+        }
+      } catch (_) {}
+      return false;
+    }
+
+    function fiberScan(el) {
+      var keys = [];
+      try { keys = Object.keys(el); } catch (_) { return null; }
+      for (var i = 0; i < keys.length; i++) {
+        if (keys[i].indexOf("__reactFiber$") === 0 || keys[i].indexOf("__reactInternalInstance$") === 0) {
+          var found = walkFiber(el[keys[i]], 0);
+          if (found) return found;
+        }
+      }
+      return null;
+    }
+
+    function walkFiber(fiber, depth) {
+      if (!fiber || depth > 60) return null;
+      var found = inspectObj(fiber.memoizedProps, 0);
+      if (found) return found;
+      found = inspectObj(fiber.memoizedState, 0);
+      if (found) return found;
+      found = inspectObj(fiber.stateNode, 0);
+      if (found) return found;
+      // Only walk the `return` chain (parent components) — bounded and
+      // linear, avoids exponential blowup from child/sibling traversal.
+      if (fiber.return) return walkFiber(fiber.return, depth + 1);
+      return null;
+    }
+
+    function inspectObj(obj, depth) {
+      if (!obj || typeof obj !== "object" || depth > 7) return null;
+      try {
+        if (isChartLike(obj)) return obj;
+        // React hook list / linked structures
+        var probe = obj;
+        var guard = 0;
+        while (probe && probe.next && guard++ < 40) {
+          if (isChartLike(probe.next)) return probe.next;
+          probe = probe.next;
+        }
+        // ref objects often carry the chart instance
+        if (obj.ref && obj.ref.current && isChartLike(obj.ref.current)) return obj.ref.current;
+        var keys = Object.keys(obj);
+        var n = Math.min(keys.length, 40);
+        for (var i = 0; i < n; i++) {
+          var v = obj[keys[i]];
+          if (v && typeof v === "object") {
+            var r = inspectObj(v, depth + 1);
+            if (r) return r;
+          }
+        }
+      } catch (_) {}
+      return null;
+    }
+
+    // Trap window.LightweightCharts (set by the page's bundle) so any chart
+    // created later is captured. Installed synchronously at document_start.
+    try {
+      var _lwc = window.LightweightCharts;
+      Object.defineProperty(window, "LightweightCharts", {
+        configurable: true,
+        enumerable: true,
+        get: function () { return _lwc; },
+        set: function (v) {
+          _lwc = v;
+          if (v && typeof v.createChart === "function" && !v.__cyberWrapped) {
+            var origCreate = v.createChart;
+            v.createChart = function () {
+              var c = origCreate.apply(this, arguments);
+              try { captureChart(c); } catch (_) {}
+              return c;
+            };
+            try { v.__cyberWrapped = true; } catch (_) {}
+          }
+        },
+      });
+      if (_lwc && typeof _lwc.createChart === "function" && !_lwc.__cyberWrapped) {
+        var origCreate2 = _lwc.createChart;
+        _lwc.createChart = function () {
+          var c = origCreate2.apply(this, arguments);
+          try { captureChart(c); } catch (_) {}
+          return c;
+        };
+        try { _lwc.__cyberWrapped = true; } catch (_) {}
+      }
+    } catch (_) {}
+
+    try {
+      window.addEventListener("resize", scheduleOverlayRedraw);
+      window.addEventListener("scroll", scheduleOverlayRedraw, true);
+    } catch (_) {}
+
+    return {
+      captureChart: captureChart,
+      applyMarkers: applyMarkers,
+      hasChart: hasChart,
+      isChartLike: isChartLike,
+      mode: function () { return mode; },
+      scheduleScan: scheduleScan,
+    };
+  })();
+
   function snapshot() {
     return {
       enabled: true,
@@ -1296,13 +1973,15 @@
       ticks: live.ticks,
       candles: live.candles,
       assetIdMap: live.assetIdMap,
+      lastWsSymbol: live.lastWsSymbol,
       socket: !!handle.lastWs,
       frames: (window.__cyber_frames || []).slice(0, 12),
     };
   }
 
   // Install the WebSocket wrapper *synchronously*. Handles text, Blob and
-  // binary frames; all decoding happens inside the router.
+  // binary frames; all decoding happens inside the router. Also wraps
+  // `send()` so OUTGOING frames reveal the active asset (see onAsset above).
   var Native = window.WebSocket;
   if (typeof Native === "function") {
     handle.native = Native;
@@ -1310,6 +1989,29 @@
       var ws = protocols !== undefined ? new Native(url, protocols) : new Native(url);
       handle.lastWs = ws;
       try { emit("open", { url: url || "" }); } catch (_) {}
+      // --- outgoing-frame sniffing: the client's own requests tell us the
+      // active asset. This is what makes auto-detection work even when the
+      // DOM uses hashed class names or ticks arrive with numeric ids. ---
+      var nativeSend = ws.send.bind(ws);
+      ws.send = function (data) {
+        try {
+          var s = typeof data === "string" ? data : "";
+          if (!s && typeof ArrayBuffer !== "undefined" && data instanceof ArrayBuffer) {
+            var u8 = new Uint8Array(data);
+            var buf = "";
+            for (var bi = 0; bi < u8.length; bi += 0x8000) {
+              buf += String.fromCharCode.apply(null, u8.subarray(bi, bi + 0x8000));
+            }
+            s = buf;
+          }
+          var hit = s ? Q.sniffOutgoing(s) : null;
+          if (hit && hit.symbol) {
+            live.lastWsSymbol = hit.symbol;
+            emit("asset", { symbol: hit.symbol, raw: "ws_out", event: hit.event });
+          }
+        } catch (_) {}
+        return nativeSend(data);
+      };
       ws.addEventListener("open", function () {
         try { emit("quotex_status", { state: "open", url: url || "" }); } catch (_) {}
       });
@@ -1337,12 +2039,18 @@
       router: router,
       live: live,
       snapshot: snapshot,
+      markers: MARKERS,
       detach: function () {
         if (handle.wrapper && window.WebSocket === handle.wrapper) window.WebSocket = handle.native;
         window.__CYBER_WS_HOOK__ = false;
       },
     };
   } catch (_) {}
+
+  // v2.3.3: try to capture the platform chart (web component / React fiber /
+  // window handles) — the LightweightCharts.createChart trap above already
+  // covers global-library builds.
+  MARKERS.scheduleScan();
 
   emit("adapter_status", { loaded: true });
 
@@ -1368,6 +2076,10 @@
       res = res || { ok: false, error: "no result" };
       res.requestId = reqId;
       emit("ws_result", res);
+    } else if (ev.data.kind === "markers") {
+      // v2.3.3: non-repainting signal arrows — content script sends the full
+      // list for the active asset; render natively or via the overlay.
+      MARKERS.applyMarkers(ev.data.payload);
     }
   });
 

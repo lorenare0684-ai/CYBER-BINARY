@@ -95,8 +95,9 @@
     const prev = i - 1;
 
     // Lean mode: skip expensive indicators (CCI, Williams, Hurst, Donchian)
-    // for backtest speed. Set lean=false from caller (e.g. live UI) to keep them.
-    const lean = cfg.lean !== false && (opts && opts.lean !== false && (opts.lean !== undefined ? opts.lean : true));
+    // for backtest speed. Set lean=false from caller (e.g. live UI) to keep
+    // them. Default is lean ON; params can force it off via cfg.lean.
+    const lean = cfg.lean !== false && !(opts && opts.lean === false);
 
     // 1m indicator suite
     const rsi = TA.rsi(c, cfg.rsiPeriod);

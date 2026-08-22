@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "CYBER BINARY \u2014 Quotex Signal Lab",
-  "version": "2.2.0",
-  "description": "v2.2: fixed Quotex integration \u2014 reliable asset auto-detection, real historical candles replace the synthetic seed, stable closed-bar MACD/signals, and a chart that matches the platform. Educational only \u2014 not financial advice.",
+  "version": "2.3.3",
+  "description": "v2.3.3: non-repainting signal arrows on the Quotex chart (native Lightweight Charts markers + overlay fallback, historical + live). Auto-detection from the full catalog, reliable placement, no spam. Educational only - not financial advice.",
   "permissions": [
     "storage",
     "windows",
@@ -65,6 +65,7 @@
         "src/lib/backtest.js",
         "src/lib/workers.js",
         "src/lib/quotex.js",
+        "src/lib/markers.js",
         "src/content.js"
       ],
       "css": [

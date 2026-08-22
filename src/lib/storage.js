@@ -68,6 +68,12 @@
   let saveTimer = null;
   const listeners = new Set();
 
+  function notify() {
+    if (!cache) return;
+    const snap = clone(cache);
+    for (const fn of listeners) try { fn(snap); } catch (_) {}
+  }
+
   function load() {
     return new Promise((resolve) => {
       if (!hasChrome) {
@@ -76,11 +82,21 @@
         resolve(cache);
         return;
       }
-      chrome.storage.local.get(KEY, (d) => {
-        cache = clone(DEFAULTS);
-        if (d && d[KEY]) deepMerge(cache, d[KEY]);
-        resolve(cache);
-      });
+      // v2.3.2: flush-before-read. The old code re-read chrome.storage on
+      // EVERY load() without first flushing the debounced save() — so two
+      // rapid setSettings() calls (e.g. mode then arm) lost the earlier
+      // patch: the second load() saw the pre-patch storage and the first
+      // mutation was never written. Flushing pending writes first keeps the
+      // in-memory sequence, while still re-reading storage afterwards so
+      // changes from other contexts (dashboard popup, other tabs) are seen.
+      const read = () => {
+        chrome.storage.local.get(KEY, (d) => {
+          cache = clone(DEFAULTS);
+          if (d && d[KEY]) deepMerge(cache, d[KEY]);
+          resolve(cache);
+        });
+      };
+      if (saveTimer) flush().then(read); else read();
     });
   }
 
@@ -91,10 +107,13 @@
 
   function flush() {
     if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
-    if (!cache) return;
-    if (!hasChrome) { for (const fn of listeners) try { fn(clone(cache)); } catch (_) {} return; }
-    chrome.storage.local.set({ [KEY]: cache });
-    for (const fn of listeners) try { fn(clone(cache)); } catch (_) {}
+    if (!cache) return Promise.resolve();
+    if (!hasChrome) { notify(); return Promise.resolve(); }
+    return new Promise((resolve) => {
+      try {
+        chrome.storage.local.set({ [KEY]: cache }, () => resolve());
+      } catch (_) { resolve(); }
+    }).then(notify);
   }
 
   async function getSettings() {
@@ -142,7 +161,7 @@
     const strat = trade.strategy || "confluence";
     const regime = trade.regime || "unknown";
 
-    if (t - (st.dailyReset || 0) > 36e5) { // reset daily on hour boundary
+    if (t - (st.dailyReset || 0) > 24 * 36e5) { // reset daily P&L every 24h
       st.dailyPnl = 0;
       st.dailyReset = t;
     }
