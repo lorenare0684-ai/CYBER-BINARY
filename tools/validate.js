@@ -126,7 +126,8 @@ else {
 // Smoke-test the runtime-asset registration in CYBER_ASSETS.
 if (sandbox.self.CYBER_ASSETS.registerQuotexAsset) {
   const a = sandbox.self.CYBER_ASSETS.registerQuotexAsset({ id: 999, symbol: "TEST_otc", name: "Test", isOtc: true, payout: 80, timeframes: [60, 120] });
-  if (!a || a.id !== "TEST_OTC") { console.error("registerQuotexAsset"); failed++; }
+  // Broker convention: base uppercase, OTC suffix lowercase (EURUSD_otc).
+  if (!a || a.id !== "TEST_otc") { console.error("registerQuotexAsset expected TEST_otc, got " + (a && a.id)); failed++; }
 }
 
 // Smoke-test new indicators

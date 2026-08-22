@@ -1,25 +1,32 @@
 "use strict";
 
 /**
- * CYBER BINARY v2.1 — content script.
+ * CYBER BINARY v2.2 — content script.
  *
  * Runs in the page's ISOLATED world. Reads the live state the page-hook
  * pushes via window.postMessage, keeps one feed per detected asset, runs
  * the confluence engine, and bridges results to the popup dashboard.
  *
- * Wires:
- *   - the real-time feed (candles + ticks) from the Quotex page,
- *   - the live balance and detected instruments list,
- *   - the auto-trade controller (alerts / click / off),
- *   - a `placeTrade` round-trip that uses the adapter to click CALL/PUT
- *     (or send an `orders/open` frame on the page's own socket).
+ * v2.2 fixes:
+ *   - Real broker history REPLACES the synthetic seed (no more mixed
+ *     synthetic/real candles, no more "chart isn't similar").
+ *   - History is accepted for ANY broker timeframe; the engine's 1m feed is
+ *     built from real 60s bars + `quotes/stream` ticks.
+ *   - Signals + MACD/indicator readings are computed on CLOSED bars only,
+ *     so they no longer jitter with every tick.
+ *   - Asset detection registers symbols on the fly (works with the broker's
+ *     own `_otc` conventions), supports numeric broker IDs, and responds to
+ *     CYBER_SET_ASSET / CYBER_DETECT_ASSET from the dashboard.
+ *   - Late attach: requests a snapshot from the page-hook (instruments,
+ *     balance, candles, orders, status) and replays it, then asks the broker
+ *     for history on the page's own socket.
  */
 (function () {
   if (window.__CYBER_BINARY__) return;
   window.__CYBER_BINARY__ = true;
 
   const TF_MS = 60000;
-  const PRICE_RE = /(?:\d{1,6}[.,]\d{2,6})/;
+  const PRICE_RE = /(?:\d{1,8}(?:[.,]\d{1,8})?)/;
   const ASSETS = self.CYBER_ASSETS;
   const STORE = self.CYBER_STORE;
   const AUTO = self.CYBER_AUTO;
@@ -29,6 +36,9 @@
   // Per-asset feeds + state.
   const feeds = Object.create(null);
   const series = Object.create(null);
+  const historySeeded = Object.create(null);   // assetId -> first batch applied
+  const historyRequestedAt = Object.create(null);
+  const chartHistory = Object.create(null);    // assetId -> {period, candles}
   let activeAsset = "EURUSD";
   let activeFeed = createFeedFor(activeAsset);
   let autoController = null;
@@ -39,10 +49,12 @@
   let pollTimer = null;
   let lastWsPrice = null;
   let lastWsSymbol = null;
+  let manualAsset = null; // set by dashboard selection; null = auto-detect
   let lastQuotexStatus = { state: "idle" };
   let lastInstruments = [];
   let lastBalance = null;
   let lastOrders = [];
+  const pendingWs = Object.create(null); // place_ws requestId -> resolver
 
   const stats = {
     wins: 0, losses: 0, pending: null, history: [],
@@ -53,7 +65,11 @@
     if (feeds[assetId]) return feeds[assetId];
     const f = self.CYBER_FEED.createFeed({ tfMs: TF_MS, max: 400 });
     feeds[assetId] = f;
-    f.setSeries(self.CYBER_FEED.syntheticSeries(ASSETS.get(assetId) || { id: assetId, basePrice: 1.0, vol: 0.0001, jumpRate: 0.005, decimals: 5 }, 120));
+    const a = ASSETS.get(assetId) || ASSETS.ensureRegistered(assetId) ||
+      { id: assetId, basePrice: 1.0, vol: 0.0001, jumpRate: 0.005, decimals: 5 };
+    // Synthetic seed only until real history/ticks arrive (v2.2: real data
+    // purges it through feed.pruneBefore + mergeCandles).
+    f.setSeries(self.CYBER_FEED.syntheticSeries(a, 120));
     return f;
   }
 
@@ -70,23 +86,47 @@
     return (el.textContent || "").replace(/\s+/g, " ").trim();
   }
 
-  /* -------- automatic asset detection (v2.1: prefer adapter instrument list) -------- */
+  /* -------- automatic asset detection (v2.2) -------- */
+  function assetFromText(text) {
+    if (!text) return null;
+    // Prefer a registered Quotex symbol (e.g. "EURUSD_otc"), then aliases.
+    if (ASSETS.ensureRegistered(String(text).replace(/\s+/g, ""))) {
+      const det = ASSETS.detect(text);
+      if (det) return det;
+    }
+    return ASSETS.detect(text);
+  }
+
   function detectAssetFromDom() {
+    // First choice: the adapter's canonical DOM helpers.
+    if (QUOTEX && QUOTEX.findAssetHeader) {
+      const h = QUOTEX.findAssetHeader();
+      if (h && h.text) {
+        const det = assetFromText(h.text);
+        if (det) return det;
+      }
+    }
     const sels = [
       "[class*='current-symbol']",
       "[class*='asset-select']",
       "[class*='pair-name']",
+      "[class*='symbol-name']",
+      "[class*='assetName']",
+      "[class*='asset-name']",
       "[class*='symbol']",
       "[class*='asset'] [class*='name']",
       "[class*='trading-pair']",
+      "[class*='active-asset']",
       "header [class*='active']",
+      "[data-testid*='asset']",
+      "[data-test*='symbol']",
     ];
     for (const s of sels) {
       const els = document.querySelectorAll(s);
       for (const el of els) {
         const t = visibleText(el);
-        if (t && t.length >= 3 && t.length < 48) {
-          const det = ASSETS.detect(t);
+        if (t && t.length >= 2 && t.length < 48) {
+          const det = assetFromText(t);
           if (det) return det;
         }
       }
@@ -96,14 +136,29 @@
     const urlAsset = ASSETS.detect(location.href);
     if (urlAsset) return urlAsset;
     if (lastWsSymbol) {
-      const det = ASSETS.detect(lastWsSymbol);
+      const det = assetFromText(lastWsSymbol);
       if (det) return det;
     }
     return null;
   }
 
   function syncActiveAsset() {
-    const detected = detectAssetFromDom() || ASSETS.get(activeAsset) || ASSETS.get("EURUSD");
+    // Manual dashboard selection pins the asset; auto-detection resumes only
+    // when a different symbol arrives from the page WS (see message router).
+    if (manualAsset) {
+      const m = ASSETS.get(manualAsset) || ASSETS.ensureRegistered(manualAsset);
+      if (m && m.id !== activeAsset) {
+        activeAsset = m.id;
+        activeFeed = createFeedFor(activeAsset);
+      }
+      return m;
+    }
+    // The page WS symbol is authoritative — DOM detection must never
+    // overwrite it (that was the "chart flips between EURUSD and the OTC
+    // pair / demo feed" bug: hidden DOM elements matched first).
+    let detected = null;
+    if (lastWsSymbol) detected = assetFromText(lastWsSymbol);
+    if (!detected) detected = detectAssetFromDom();
     if (detected && detected.id !== activeAsset) {
       activeAsset = detected.id;
       activeFeed = createFeedFor(activeAsset);
@@ -133,14 +188,14 @@
       const els = document.querySelectorAll(sel);
       for (const el of els) {
         const p = parsePrice(visibleText(el));
-        if (p && p > 0.01 && p < 1e7) return p;
+        if (p && p > 0.01 && p < 1e8) return p;
       }
     }
     const nodes = document.querySelectorAll("span, div, strong, b");
     for (const el of nodes) {
       if (el.children.length > 1) continue;
       const t = visibleText(el);
-      if (t.length < 3 || t.length > 18) continue;
+      if (t.length < 2 || t.length > 22) continue;
       const p = parsePrice(t);
       if (!p) continue;
       const cls = (el.className || "").toString().toLowerCase();
@@ -237,26 +292,104 @@
     return s;
   }
 
-  /* -------- v2.1: real-candle ingest from the page WS -------- */
+  /* -------- v2.2: real-candle ingest from the page WS -------- */
   function ingestLiveCandles(asset, period, candles) {
     if (!asset || !Array.isArray(candles) || !candles.length) return;
-    const det = ASSETS.detect(asset) || ASSETS.get(asset);
+    const det = ASSETS.ensureRegistered(asset);
     if (!det) return;
-    const feed = createFeedFor(det.id);
+    const id = det.id;
+    const feed = createFeedFor(id);
+    const real = [];
+    let minT = Infinity;
     for (const c of candles) {
       if (!c || typeof c.time !== "number") continue;
-      const ev = feed.ingestCandle(c);
+      if (c.time < minT) minT = c.time;
+      real.push(c);
+    }
+    if (!real.length) return;
+
+    // The engine runs on 1m bars; accept 60s history directly and build 1m
+    // from ticks for everything else (the chart shows the broker timeframe).
+    const useForEngine = !period || period === 60;
+    if (!historySeeded[id]) {
+      historySeeded[id] = true;
+      if (useForEngine) {
+        // First real batch REPLACES the synthetic seed wholesale (never merge
+        // — synthetic+real mixing produced discontinuous charts and MACD
+        // glitches). Later batches merge incrementally.
+        feed.setSeries(real);
+        const ev = feed.mergeCandles([]);
+        if (ev && ev.closed) settlePending(ev.closed.close, ev.closed.time);
+      }
+    } else if (useForEngine) {
+      const ev = feed.mergeCandles(real);
       if (ev && ev.closed) settlePending(ev.closed.close, ev.closed.time);
     }
-    if (det.id !== activeAsset) {
-      activeAsset = det.id;
+    chartHistory[id] = {
+      period: period || 60,
+      candles: real.slice(-400),
+      ts: Date.now(),
+    };
+    if (id !== activeAsset) {
+      activeAsset = id;
       activeFeed = feed;
+    }
+  }
+
+  function applyHookSnapshot(snap) {
+    if (!snap || typeof snap !== "object") return;
+    if (snap.status) lastQuotexStatus = snap.status;
+    if (Array.isArray(snap.instruments) && snap.instruments.length) {
+      lastInstruments = snap.instruments;
+      for (const it of lastInstruments) {
+        if (it && it.symbol) { try { ASSETS.registerQuotexAsset(it); } catch (_) {} }
+      }
+      try { chrome.runtime.sendMessage({ type: "CYBER_QUOTEX_INSTRUMENTS", payload: lastInstruments }).catch(() => {}); } catch (_) {}
+    }
+    if (snap.balance) {
+      lastBalance = snap.balance;
+      try { chrome.runtime.sendMessage({ type: "CYBER_QUOTEX_BALANCE", payload: lastBalance }).catch(() => {}); } catch (_) {}
+    }
+    if (Array.isArray(snap.orders) && snap.orders.length) {
+      lastOrders = snap.orders.slice(0, 50);
+      try { chrome.runtime.sendMessage({ type: "CYBER_QUOTEX_TRADE_RESULT", payload: lastOrders[0] }).catch(() => {}); } catch (_) {}
+    }
+    const ticks = snap.ticks || {};
+    let bestSymbol = lastWsSymbol;
+    let bestTime = 0;
+    for (const sym in ticks) {
+      const q = ticks[sym];
+      if (q && q.symbol && (!bestTime || (q.time || 0) >= bestTime)) {
+        bestTime = q.time || 0;
+        bestSymbol = sym;
+        lastWsPrice = q.price;
+        lastWsSymbol = q.symbol;
+      }
+    }
+    if (bestSymbol) {
+      const det = ASSETS.ensureRegistered(bestSymbol);
+      if (det && det.id !== activeAsset) {
+        activeAsset = det.id;
+        activeFeed = createFeedFor(activeAsset);
+      }
+    }
+    const candlesMap = snap.candles || {};
+    for (const key in candlesMap) {
+      const m = key.match(/^(.+)@(\d+)$/);
+      if (!m) continue;
+      const list = candlesMap[key];
+      if (Array.isArray(list) && list.length) ingestLiveCandles(m[1], parseInt(m[2], 10) || 60, list);
     }
   }
 
   async function maybeSignal() {
     const asset = syncActiveAsset();
-    const a = activeFeed.series();
+    const full = activeFeed.series();
+    // v2.2: compute indicators on CLOSED bars only — the last element of the
+    // feed is the in-progress bar, so exclude it for stable MACD/signals.
+    let a = full;
+    if (full.length > 1) a = full.slice(0, -1);
+    if (a.length < 2) a = full;
     const strat = STRAT.get(currentStrategy) || STRAT.defaults();
     const sig = self.CYBER_ENGINE.analyze(a, { strategy: currentStrategy, params: strat.params, weights: strat.weights, lean: false });
     sig.asset = asset ? asset.id : activeAsset;
@@ -272,7 +405,7 @@
     if (!sig.ready || sig.direction === "WAIT") return;
     if (stats.pending) return;
     if (a.length < 2) return;
-    const closed = a[a.length - 2];
+    const closed = a[a.length - 1];
     const key = closed.time + ":" + sig.direction;
     if (key === lastSignalKey) return;
     lastSignalKey = key;
@@ -290,6 +423,7 @@
 
   function pushState(sig) {
     const total = stats.wins + stats.losses;
+    const chart = chartHistory[activeAsset] || null;
     const payload = {
       attached: true,
       source: lastWsPrice ? "websocket" : "dom",
@@ -297,6 +431,9 @@
       assetId: activeAsset,
       price: activeFeed.lastPrice(),
       candles: activeFeed.series(),
+      // v2.2: real broker candles (any timeframe) for the chart view.
+      chartCandles: chart ? chart.candles : null,
+      chartPeriod: chart ? chart.period : 60,
       signal: sig,
       wins: stats.wins,
       losses: stats.losses,
@@ -307,7 +444,6 @@
       autoState: autoController ? autoController.getState() : null,
       strategy: currentStrategy,
       ts: Date.now(),
-      // v2.1: real platform state
       quotex: {
         status: lastQuotexStatus,
         balance: lastBalance,
@@ -388,11 +524,29 @@
     }
   }
 
+  function ensureHistorySubscription(det) {
+    if (!det || !QUOTEX || !QUOTEX.subscribeHistory) return;
+    const id = det.id;
+    const at = historyRequestedAt[id] || 0;
+    if (Date.now() - at < 30000) return; // at most one request / 30s per asset
+    historyRequestedAt[id] = Date.now();
+    try {
+      window.postMessage({
+        source: "CYBER_BINARY_CONTENT",
+        kind: "subscribe",
+        payload: { asset: id, period: 60 },
+      }, "*");
+    } catch (_) {}
+  }
+
   function tick() {
-    syncActiveAsset();
+    const det = syncActiveAsset();
+    const ev = activeFeed.forceClose(Date.now());
+    if (ev && ev.closed) settlePending(ev.closed.close, ev.closed.time);
     const p = findPrice();
-    if (p) ingest(p);
+    if (p) ingest(p, det && det.id);
     maybeSignal();
+    ensureHistorySubscription(det || ASSETS.get(activeAsset));
   }
 
   function injectHook() {
@@ -400,28 +554,49 @@
       const url = chrome.runtime.getURL("src/page-hook.js");
       const s = document.createElement("script");
       s.src = url;
-      s.onload = function () { s.remove(); };
+      s.onload = function () {
+        s.remove();
+        requestHookSync();
+      };
       (document.head || document.documentElement).appendChild(s);
     } catch (_) {}
   }
 
-  /* -------- v2.1: page-hook message router -------- */
+  function requestHookSync() {
+    try {
+      window.postMessage({ source: "CYBER_BINARY_CONTENT", kind: "sync_request", payload: {} }, "*");
+    } catch (_) {}
+  }
+
+  /* -------- page-hook message router (v2.2: + snapshot/ws results) -------- */
   window.addEventListener("message", function (ev) {
     if (!ev.data || ev.data.source !== "CYBER_BINARY_HOOK") return;
     const p = ev.data.payload || {};
     switch (ev.data.kind) {
+      case "snapshot": {
+        applyHookSnapshot(p);
+        break;
+      }
       case "tick": {
         if (p.price) {
           lastWsPrice = p.price;
-          if (p.symbol) lastWsSymbol = p.symbol;
-          ingest(p.price, p.symbol && (ASSETS.detect(p.symbol) || {}).id);
+          if (p.symbol) {
+            lastWsSymbol = p.symbol;
+            // The page is authoritative: a different live symbol clears any
+            // manual pin so auto-detection follows the chart again.
+            const detSym = ASSETS.ensureRegistered(p.symbol);
+            if (manualAsset && detSym && detSym.id !== manualAsset) manualAsset = null;
+          }
+          const det = ASSETS.ensureRegistered(p.symbol);
+          ingest(p.price, det && det.id);
         }
         break;
       }
       case "asset": {
         if (p.symbol) {
           lastWsSymbol = p.symbol;
-          const det = ASSETS.detect(p.symbol);
+          const det = ASSETS.ensureRegistered(p.symbol);
+          if (manualAsset && det && det.id !== manualAsset) manualAsset = null;
           if (det && det.id !== activeAsset) {
             activeAsset = det.id;
             activeFeed = createFeedFor(activeAsset);
@@ -466,7 +641,17 @@
         try { chrome.runtime.sendMessage({ type: "CYBER_QUOTEX_STATUS", payload: { state: p && p.loaded ? "adapter_loaded" : "fallback" } }).catch(() => {}); } catch (_) {}
         break;
       }
-      case "ready": break;
+      case "ready": {
+        requestHookSync();
+        break;
+      }
+      case "ws_result": {
+        if (p && p.requestId && pendingWs[p.requestId]) {
+          try { pendingWs[p.requestId](p); } catch (_) {}
+          delete pendingWs[p.requestId];
+        }
+        break;
+      }
       case "url": break;
       case "open": break;
     }
@@ -484,16 +669,16 @@
     ensureHud();
     pollTimer = setInterval(tick, 500);
     tick();
+    setTimeout(requestHookSync, 1200); // hook may still be loading
   }
 
-  /* -------- v2.1: real platform trade placement -------- */
+  /* -------- real platform trade placement (dom click + page-socket ws) -------- */
   async function placeTrade(args) {
     if (!QUOTEX) return { ok: false, error: "adapter missing" };
     const s = await STORE.getSettings();
     const stake = (args && args.stake) || s.stake || 1;
     const expiry = (args && args.expiry) || s.expiry || 1; // minutes
     const expirySec = Math.max(30, Math.round(expiry * 60));
-    const ws = (window.__cyber && window.__cyber.handle && window.__cyber.handle.lastWs) || null;
     // Try DOM click first (always works if buttons are visible).
     const domResult = QUOTEX.placeTradeDom({
       dir: args.dir,
@@ -501,15 +686,34 @@
       expiry: expirySec,
     });
     if (domResult && domResult.ok) return Object.assign({ mode: "dom" }, domResult);
-    // Fall back to ws frame if user opted in via `args.mode === "ws"`.
-    if (args && args.mode === "ws" && ws) {
-      return QUOTEX.placeTradeWs(ws, {
-        asset: (args.asset || lastWsSymbol || activeAsset),
-        dir: args.dir,
-        amount: stake,
-        expiry: expirySec,
-        isDemo: !!(lastBalance && lastBalance.isDemo),
+    // WS frame on the page's own socket (requested through the page-hook,
+    // because the isolated world has no access to the page's WebSocket).
+    if (args && args.mode === "ws") {
+      const requestId = "cb_" + Date.now() + "_" + Math.floor(Math.random() * 1e6);
+      const res = await new Promise((resolve) => {
+        pendingWs[requestId] = resolve;
+        setTimeout(() => {
+          if (pendingWs[requestId]) { delete pendingWs[requestId]; resolve({ ok: false, error: "ws timeout" }); }
+        }, 4000);
+        try {
+          window.postMessage({
+            source: "CYBER_BINARY_CONTENT",
+            kind: "place_ws",
+            payload: {
+              requestId,
+              asset: args.asset || lastWsSymbol || activeAsset,
+              dir: args.dir,
+              amount: stake,
+              expiry: expirySec,
+              isDemo: !!(lastBalance && lastBalance.isDemo),
+              optionType: args.optionType,
+            },
+          }, "*");
+        } catch (e) {
+          if (pendingWs[requestId]) { delete pendingWs[requestId]; resolve({ ok: false, error: String(e) }); }
+        }
       });
+      return res || { ok: false, error: "ws request failed" };
     }
     return domResult;
   }
@@ -527,6 +731,21 @@
       STORE.setSettings({ strategy: currentStrategy });
       sendResponse({ ok: true, strategy: currentStrategy });
     }
+    if (msg && msg.type === "CYBER_SET_ASSET") {
+      const det = ASSETS.ensureRegistered(msg.asset) || ASSETS.get(msg.asset);
+      if (det) {
+        manualAsset = det.id;
+        activeAsset = det.id;
+        activeFeed = createFeedFor(activeAsset);
+      }
+      sendResponse({ ok: true, asset: det ? det.id : (msg.asset || activeAsset), manual: !!manualAsset });
+    }
+    if (msg && msg.type === "CYBER_DETECT_ASSET") {
+      manualAsset = null; // explicit "Detect" re-enables auto-follow
+      const det = detectAssetFromDom();
+      const id = det ? det.id : (ASSETS.ensureRegistered(lastWsSymbol) ? ASSETS.get(lastWsSymbol).id : activeAsset);
+      sendResponse({ ok: true, asset: id, name: det ? det.name : assetName() });
+    }
     if (msg && msg.type === "CYBER_SET_AUTO") {
       STORE.setSettings({ autoMode: msg.mode, armed: !!msg.armed });
       if (autoController) {
@@ -537,7 +756,8 @@
     }
     if (msg && msg.type === "CYBER_FORCE_TRADE") {
       const series = activeFeed.series();
-      const sig = self.CYBER_ENGINE.analyze(series, { strategy: currentStrategy, lean: false });
+      const closed = series.length > 1 ? series.slice(0, -1) : series;
+      const sig = self.CYBER_ENGINE.analyze(closed, { strategy: currentStrategy, lean: false });
       sig.asset = activeAsset;
       sig.assetName = assetName();
       sig.strategy = currentStrategy;
@@ -551,10 +771,8 @@
       return true;
     }
     if (msg && msg.type === "CYBER_QUOTEX_SET_AUTH") {
-      // v2.1: explicit user request to use the page's WS for direct orders.
       // The extension never reads the SSID itself; the page-hook already
-      // captured it from the page's traffic. Here we just flip a flag the
-      // next `placeTrade` will honor when `mode: "ws"` is passed.
+      // captured it from the page's traffic. We just flip the ws mode flag.
       sendResponse({ ok: true, mode: "ws_ready" });
     }
   });

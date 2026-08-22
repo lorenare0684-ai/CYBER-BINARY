@@ -24,11 +24,23 @@
   let autoState = null;
   let settings = null;
   let btResults = null;
+  // Last rendered chart state (used by `scale()` on resize).
+  let lastChartCandles = null;
+  let lastChartMeta = {};
+  let lastBtEquity = null;
   // v2.1: live Quotex state
   let qxStatus = { state: "idle" };
   let qxInstruments = [];
   let qxBalance = null;
   let qxOrders = [];
+
+  function tfLabel(sec) {
+    if (!sec) return "1m";
+    sec = Number(sec) || 60;
+    if (sec === 60) return "1m";
+    if (sec % 60 === 0) return (sec / 60) + "m";
+    return sec + "s";
+  }
 
   function $(id) { return document.getElementById(id); }
   function $all(sel) { return document.querySelectorAll(sel); }
@@ -68,7 +80,11 @@
     const o = opts || {};
     const parent = canvas.parentElement;
     const w = Math.max(280, parent.clientWidth);
-    const h = Math.max(140, Math.round(w * 0.34));
+    const useMacd = o.macd !== false;
+    const priceH = Math.max(92, Math.round(w * 0.24));
+    const macdH = useMacd ? Math.max(52, Math.round(w * 0.14)) : 0;
+    const timeAxisH = 18;
+    const h = priceH + macdH + timeAxisH;
     const dpr = window.devicePixelRatio || 1;
     canvas.width = Math.floor(w * dpr);
     canvas.height = Math.floor(h * dpr);
@@ -79,20 +95,25 @@
     ctx.clearRect(0, 0, w, h);
     ctx.fillStyle = o.bg || "#0c1422";
     ctx.fillRect(0, 0, w, h);
-    if (!candles || candles.length < 2) return;
-
+    if (!candles || candles.length < 2) {
+      ctx.fillStyle = "rgba(255,255,255,0.45)";
+      ctx.font = "11px system-ui, sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText("Waiting for candles…", w / 2, h / 2);
+      return;
+    }
     if (o.equity) {
       // Equity curve: simple line
       const eq = candles;
-      let lo = -Math.max(1, Math.abs(eq[0].equity || 0));
-      let hi = Math.max(1, Math.abs(eq[0].equity || 0));
+      let eqLo = -Math.max(1, Math.abs(eq[0].equity || 0));
+      let eqHi = Math.max(1, Math.abs(eq[0].equity || 0));
       for (let i = 0; i < eq.length; i++) {
-        if (eq[i].equity < lo) lo = eq[i].equity;
-        if (eq[i].equity > hi) hi = eq[i].equity;
+        if (eq[i].equity < eqLo) eqLo = eq[i].equity;
+        if (eq[i].equity > eqHi) eqHi = eq[i].equity;
       }
-      const pad = (hi - lo) * 0.1 || 1;
-      lo -= pad; hi += pad;
-      const zeroY = h - ((0 - lo) / (hi - lo)) * (h - 16) - 8;
+      const pad = (eqHi - eqLo) * 0.1 || 1;
+      eqLo -= pad; eqHi += pad;
+      const zeroY = priceH - ((0 - eqLo) / (eqHi - eqLo)) * (priceH - 16) - 8;
       ctx.strokeStyle = "rgba(255,255,255,0.06)";
       ctx.beginPath(); ctx.moveTo(0, zeroY); ctx.lineTo(w, zeroY); ctx.stroke();
       ctx.strokeStyle = "#4aa3ff";
@@ -100,24 +121,27 @@
       ctx.beginPath();
       for (let i = 0; i < eq.length; i++) {
         const x = 8 + (i / (eq.length - 1)) * (w - 16);
-        const y = h - ((eq[i].equity - lo) / (hi - lo)) * (h - 16) - 8;
+        const y = priceH - ((eq[i].equity - eqLo) / (eqHi - eqLo)) * (priceH - 16) - 8;
         if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
       }
       ctx.stroke();
-      // fill
-      const grad = ctx.createLinearGradient(0, 0, 0, h);
+      const grad = ctx.createLinearGradient(0, 0, 0, priceH);
       grad.addColorStop(0, "rgba(74,163,255,0.3)");
       grad.addColorStop(1, "rgba(74,163,255,0)");
       ctx.fillStyle = grad;
-      ctx.lineTo(w - 8, h - 8);
-      ctx.lineTo(8, h - 8);
+      ctx.lineTo(w - 8, priceH - 8);
+      ctx.lineTo(8, priceH - 8);
       ctx.closePath();
       ctx.fill();
+      ctx.fillStyle = "rgba(255,255,255,0.45)";
+      ctx.font = "9px system-ui, sans-serif";
+      ctx.fillText("Equity · " + eq.length + " trades", 8, 12);
       return;
     }
-
-    // Candle
-    const view = candles.slice(-80);
+    // Chart util: y-map for the price pane.
+    const padL = 8, padR = 54;
+    const plotW = w - padL - padR;
+    const view = candles.slice(-(o.bars || 100));
     let lo = Infinity, hi = -Infinity;
     for (let i = 0; i < view.length; i++) {
       lo = Math.min(lo, view[i].low);
@@ -125,14 +149,36 @@
     }
     const pad = (hi - lo) * 0.08 || 0.0001;
     lo -= pad; hi += pad;
-    const bw = (w - 16) / view.length;
+    const yPrice = (p) => priceH - ((p - lo) / (hi - lo)) * (priceH - 10) - 5;
+    const xFor = (i) => padL + (i / Math.max(1, view.length - 1)) * plotW;
+
+    // Grid + right-side price axis
+    ctx.strokeStyle = "rgba(255,255,255,0.07)";
+    ctx.fillStyle = "rgba(255,255,255,0.5)";
+    ctx.font = "10px system-ui, sans-serif";
+    ctx.textAlign = "left";
+    ctx.lineWidth = 1;
+    const rows = 4;
+    for (let g = 0; g <= rows; g++) {
+      const p = lo + ((hi - lo) * g) / rows;
+      const y = yPrice(p);
+      ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(padL + plotW, y); ctx.stroke();
+      ctx.fillText(fmtPx(p), w - padR + 6, y + 3);
+    }
+
+    // Candles + EMA overlays
+    const bw = plotW / view.length;
+    let emaFast = null, emaSlow = null;
+    if (self.CYBER_TA) {
+      const closes = view.map((c) => c.close);
+      emaFast = self.CYBER_TA.ema(closes, 8);
+      emaSlow = self.CYBER_TA.ema(closes, 21);
+    }
     for (let i = 0; i < view.length; i++) {
       const c = view[i];
-      const x = 8 + i * bw + bw / 2;
-      const yH = h - ((c.high - lo) / (hi - lo)) * (h - 16) - 8;
-      const yL = h - ((c.low - lo) / (hi - lo)) * (h - 16) - 8;
-      const yO = h - ((c.open - lo) / (hi - lo)) * (h - 16) - 8;
-      const yC = h - ((c.close - lo) / (hi - lo)) * (h - 16) - 8;
+      const x = padL + i * bw + bw / 2;
+      const yH = yPrice(c.high), yL = yPrice(c.low);
+      const yO = yPrice(c.open), yC = yPrice(c.close);
       const up = c.close >= c.open;
       ctx.strokeStyle = up ? "#3dff9a" : "#ff5d7a";
       ctx.fillStyle = up ? "#3dff9a" : "#ff5d7a";
@@ -141,6 +187,99 @@
       const bh = Math.max(1, Math.abs(yC - yO));
       ctx.fillRect(x - Math.max(1, bw * 0.32), top, Math.max(2, bw * 0.64), bh);
     }
+    const drawLine = (arr, color) => {
+      if (!arr) return;
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      let started = false;
+      for (let i = 0; i < arr.length; i++) {
+        if (arr[i] == null) continue;
+        const x = xFor(i), y = yPrice(arr[i]);
+        if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+      ctx.lineWidth = 1;
+    };
+    drawLine(emaFast, "rgba(77,163,255,0.85)");
+    drawLine(emaSlow, "rgba(255,196,87,0.85)");
+
+    // Last price line + tag
+    const lastC = view[view.length - 1].close;
+    const lastY = yPrice(lastC);
+    ctx.setLineDash([4, 4]);
+    ctx.strokeStyle = "rgba(255,255,255,0.35)";
+    ctx.beginPath(); ctx.moveTo(padL, lastY); ctx.lineTo(padL + plotW, lastY); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = lastC >= view[0].open ? "#3dff9a" : "#ff5d7a";
+    ctx.fillRect(w - padR - 42, lastY - 8, 44, 15);
+    ctx.fillStyle = "#0c1422";
+    ctx.font = "bold 9px system-ui, sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText(fmtPx(lastC), w - padR - 20, lastY + 3);
+    ctx.textAlign = "left";
+
+    // Time axis (approx labels)
+    ctx.strokeStyle = "rgba(255,255,255,0.07)";
+    ctx.beginPath(); ctx.moveTo(padL, priceH + 0.5); ctx.lineTo(padL + plotW, priceH + 0.5); ctx.stroke();
+    ctx.fillStyle = "rgba(255,255,255,0.45)";
+    ctx.font = "9px system-ui, sans-serif";
+    const labelEvery = Math.max(1, Math.floor(view.length / 6));
+    for (let i = 0; i < view.length; i += labelEvery) {
+      const d = new Date(view[i].time);
+      const lbl = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      ctx.fillText(lbl, xFor(i), priceH + 12);
+    }
+
+    // MACD subplot (histogram + MACD + signal) — matches the broker chart
+    if (useMacd && self.CYBER_TA) {
+      const m = self.CYBER_TA.macd(view.map((c) => c.close), 12, 26, 9);
+      let mMax = 1e-9;
+      for (let i = 0; i < m.hist.length; i++) {
+        for (const v of [m.hist[i], m.line[i], m.signal[i]]) {
+          if (v != null && Math.abs(v) > mMax) mMax = Math.abs(v);
+        }
+      }
+      const y0 = priceH + 4 + macdH / 2;
+      const yMacd = (v) => y0 - ((v || 0) / mMax) * (macdH / 2 - 5);
+      ctx.strokeStyle = "rgba(255,255,255,0.12)";
+      ctx.beginPath(); ctx.moveTo(padL, y0); ctx.lineTo(padL + plotW, y0); ctx.stroke();
+      const mw = plotW / view.length;
+      for (let i = 0; i < m.hist.length; i++) {
+        if (m.hist[i] == null) continue;
+        const x = padL + i * mw + mw / 2;
+        const v = m.hist[i];
+        ctx.fillStyle = v >= 0 ? "rgba(61,255,154,0.85)" : "rgba(255,93,122,0.85)";
+        ctx.fillRect(x - Math.max(1, mw * 0.28), Math.min(y0, yMacd(v)), Math.max(2, mw * 0.56), Math.max(1, Math.abs(y0 - yMacd(v))));
+      }
+      // MACD line/signal plot in the SUBPLOT coordinate space, never the price
+      // pane's y-scale (that was the "MACD stuck at the bottom" glitch).
+      const drawMacdLine = (arr, color) => {
+        if (!arr) return;
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1.2;
+        ctx.beginPath();
+        let started = false;
+        for (let i = 0; i < arr.length; i++) {
+          if (arr[i] == null) continue;
+          const x = padL + i * mw + mw / 2;
+          const y = yMacd(arr[i]);
+          if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+        ctx.lineWidth = 1;
+      };
+      drawMacdLine(m.line, "#4aa3ff");
+      drawMacdLine(m.signal, "#ffc457");
+      ctx.fillStyle = "rgba(255,255,255,0.45)";
+      ctx.font = "9px system-ui, sans-serif";
+      ctx.fillText("MACD 12/26/9", padL + 4, priceH + 14);
+    }
+
+    // Watermark-ish label
+    ctx.fillStyle = "rgba(255,255,255,0.35)";
+    ctx.font = "9px system-ui, sans-serif";
+    ctx.fillText("CYBER BINARY · " + (o.label || o.timeframe || "1m") + " · " + view.length + " bars", padL + 4, 12);
   }
 
   /* ---------- tab routing ---------- */
@@ -318,12 +457,25 @@
       });
     }
 
-    if (state.candles && state.candles.length) drawChart($("chart"), state.candles);
+    // v2.2: prefer the broker's own history for the chart; fall back to the
+    // engine's 1m series. Real data replaces the synthetic seed, so the
+    // chart matches the platform chart (same candles, EMA + MACD subplot).
+    const chartCandles = (state.chartCandles && state.chartCandles.length)
+      ? state.chartCandles : state.candles;
+    if (chartCandles && chartCandles.length) {
+      lastChartCandles = chartCandles.slice();
+      lastChartMeta = { timeframe: tfLabel(state.chartPeriod || 60) };
+      drawChart($("chart"), lastChartCandles, lastChartMeta);
+    }
     if (state.autoState) updateAutoUI(state.autoState);
   }
 
   /* ---------- local demo rendering (no extension) ---------- */
   function renderLocalTick() {
+    // v2.2: never let the demo loop overwrite live extension state — this was
+    // the "shows demo, flickers to live" bug. Once a live state arrives the
+    // demo loop becomes a no-op for the rest of the session.
+    if (liveFromExt) return;
     const last = localFeed.lastPrice() || 1.0854;
     const ev = localFeed.ingest(FEED.demoTick(last), Date.now());
     const series = localFeed.series();
@@ -333,6 +485,8 @@
     sig.assetName = (ASSETS.get(activeAsset) || {}).name || activeAsset;
     sig.strategy = activeStrategy;
     const det = ASSETS.get(activeAsset) || {};
+    lastChartCandles = series.slice();
+    lastChartMeta = { timeframe: "demo" };
     renderLive({
       attached: false,
       source: "demo",
@@ -606,6 +760,7 @@
       for (let i = 0; i < r.wins; i++) { running++; seq.push({ equity: running }); }
       for (let i = 0; i < r.losses; i++) { running--; seq.push({ equity: running }); }
     }
+    lastBtEquity = seq;
     drawChart($("bt-equity"), seq, { equity: true });
 
     // Per-strategy
@@ -814,6 +969,7 @@
             try { ASSETS.registerQuotexAsset(it); } catch (_) {}
           }
         }
+        refreshSelectors(); // v2.2: broker assets appear in the dropdown immediately
         refreshInstrumentsTab();
       }
       if (msg && msg.type === "CYBER_QUOTEX_BALANCE" && msg.payload) {
@@ -839,9 +995,10 @@
   function scale() {
     const w = window.innerWidth;
     document.documentElement.style.fontSize = Math.max(12, Math.min(17, w / 32)) + "px";
-    const series = localFeed.series();
-    if (series.length) drawChart($("chart"), series);
-    if (btResults) drawChart($("bt-equity"), [], { equity: true });
+    // Redraw whatever was last rendered (live chart or demo chart), never a
+    // stale local feed over live state.
+    if (lastChartCandles && lastChartCandles.length) drawChart($("chart"), lastChartCandles, lastChartMeta);
+    if (lastBtEquity) drawChart($("bt-equity"), lastBtEquity, { equity: true });
   }
   window.addEventListener("resize", scale);
 

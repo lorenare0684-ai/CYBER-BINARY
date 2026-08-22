@@ -73,20 +73,38 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return;
   }
 
-  // Asset/strategy setters — relay to the active tab.
+  // Asset/strategy setters — relay to the Quotex tab (the dashboard popup is
+  // a separate window, so "active tab" is often the dashboard itself).
   if (msg.type === "CYBER_SET_ASSET" || msg.type === "CYBER_SET_STRATEGY" ||
       msg.type === "CYBER_SET_AUTO" || msg.type === "CYBER_FORCE_TRADE" ||
       msg.type === "CYBER_DETECT_ASSET" || msg.type === "CYBER_QUOTEX_SET_AUTH") {
-    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-      if (tabs && tabs[0]) {
-        chrome.tabs.sendMessage(tabs[0].id, msg).then(
-          (r) => sendResponse(r || { ok: true }),
-          () => sendResponse({ ok: false })
-        );
-      } else {
-        sendResponse({ ok: false });
+    chrome.tabs.query({}, (tabs) => {
+      let target = null;
+      for (const t of tabs || []) {
+        if (t && t.url && /(qxbroker|quotex)\.(com|io)/i.test(t.url)) {
+          target = t;
+          break;
+        }
       }
+      if (!target) {
+        chrome.tabs.query({ active: true, currentWindow: true }, (at) => {
+          if (at && at[0]) target = at[0];
+          dispatchToTab(target);
+        });
+        return;
+      }
+      dispatchToTab(target);
     });
+    function dispatchToTab(tab) {
+      if (!tab || tab.id == null) {
+        sendResponse({ ok: false });
+        return;
+      }
+      chrome.tabs.sendMessage(tab.id, msg).then(
+        (r) => sendResponse(r || { ok: true }),
+        () => sendResponse({ ok: false })
+      );
+    }
     return true;
   }
 
