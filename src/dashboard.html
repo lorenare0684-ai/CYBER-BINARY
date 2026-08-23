@@ -297,9 +297,10 @@
         </section>
 
         <p class="disclaimer">
-          Backtests use deterministic synthetic 1m candles for each asset (volatility
-          profile matches the asset class) plus whatever live candles you have in
-          storage. They are <strong>not</strong> a guarantee of future accuracy.
+          Backtests now use only cached Quotex live/tick-built 1m candles from
+          the platform feed. If no live cache exists yet, open Quotex and let
+          ticks stream for a few minutes first. They are <strong>not</strong> a
+          guarantee of future accuracy.
         </p>
       </section>
 

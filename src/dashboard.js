@@ -690,7 +690,7 @@
             if (r[0] === "-DI" && r[1] > 30) cls = "put";
           }
           const rendered = typeof r[1] === "number"
-            ? (Number.isFinite(r[1]) ? (Math.abs(r[1]) < 0.001 ? r[1].toExponential(2) : r[1].toFixed(4)) : "—")
+            ? (Number.isFinite(r[1]) ? (Math.abs(r[1]) < 1e-10 ? "0" : (Math.abs(r[1]) < 0.0001 ? r[1].toExponential(3) : r[1].toFixed(4))) : "—")
             : r[1];
           return '<div class="reading ' + cls + '"><span>' + esc(r[0]) + '</span><b>' + esc(rendered) +
             '</b></div>';
@@ -1072,34 +1072,54 @@
     const minConf = Number.isFinite(rawMinConf) ? Math.max(0, Math.min(100, rawMinConf)) : 0;
     const kind = $("bt-kinds").value;
     const kinds = kind === "all" ? null : [kind];
-    const o = { days, horizon, minConf, kinds, minBars: 150 };
+    const o = { days, horizon, minConf, kinds, minBars: 150, liveOnly: true, requireLive: true };
 
     const btn = $("bt-run");
     btn.disabled = true;
     const origLabel = btn.textContent;
-    btn.textContent = "Starting…";
+    btn.textContent = "Loading Quotex candles…";
 
     function tick(progress, total) {
       const i = progress && typeof progress === "object" ? progress.i : progress;
       const n = progress && typeof progress === "object" ? progress.total : total;
-      if (n) btn.textContent = "Running " + i + " / " + n + "…";
+      if (n) btn.textContent = "Running live-feed backtest " + i + " / " + n + "…";
     }
-    const useWorkers = WORKERS && WORKERS.runBrowser;
-    if (useWorkers) o.onProgress = tick;
-    let p;
-    try {
-      p = useWorkers
+
+    const assetPool = ASSETS.list().filter((a) => !kinds || kinds.includes(a.kind)).slice(0, 256);
+    const minNeeded = Math.max(40, o.minBars + horizon + 2);
+    const loadLiveCache = Promise.all(assetPool.map((a) =>
+      STORE.getCandles(a.id).then((bars) => ({ asset: a, bars })).catch(() => ({ asset: a, bars: [] }))
+    )).then((rows) => {
+      const cachedByAsset = Object.create(null);
+      const liveAssets = [];
+      rows.forEach((row) => {
+        const bars = Array.isArray(row.bars) ? row.bars : [];
+        if (bars.length >= minNeeded) {
+          cachedByAsset[row.asset.id] = bars;
+          liveAssets.push(row.asset);
+        }
+      });
+      if (!liveAssets.length) {
+        return { results: [], count: 0, liveOnly: true, error: "No cached Quotex live candles yet. Open Quotex, let the tick feed run for a few minutes, then retry." };
+      }
+      o.assets = liveAssets;
+      o.cachedByAsset = cachedByAsset;
+      o.onProgress = tick;
+      const useWorkers = WORKERS && WORKERS.runBrowser;
+      return useWorkers
         ? WORKERS.runBrowser(o)
         : new Promise((resolve, reject) => setTimeout(() => {
           try { resolve(HIST.runMatrix(o)); } catch (e) { reject(e); }
         }, 30));
-    } catch (e) {
-      p = Promise.reject(e);
-    }
+    });
 
-    p.then((r) => {
+    loadLiveCache.then((r) => {
       btResults = r;
       paintBacktest(r, o);
+      if (r && r.error) {
+        const body = $("bt-assets") && $("bt-assets").querySelector("tbody");
+        if (body) body.innerHTML = "<tr><td colspan='5'>" + esc(r.error) + "</td></tr>";
+      }
     }).catch((e) => {
       console.error(e);
     }).then(() => {

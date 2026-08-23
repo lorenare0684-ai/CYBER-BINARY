@@ -90,6 +90,10 @@
   let pendingDomOrder = null;                  // conservative single DOM fallback waiter
   let placementInFlight = false;               // serialize auto/manual placement paths
   let hudArmPending = false;                    // debounce the explicit HUD arm gesture
+  let tickSignalQueued = false;                 // coalesce per-tick dashboard refreshes
+  let lastTickSignalAt = 0;
+  const candlePersistTimers = Object.create(null);
+  const candlePersistLastAt = Object.create(null);
 
   // v2.3.3: non-repainting signal markers. Anchors are (asset, barTime,
   // price, direction) fixed at creation; the store dedupes per bar so an
@@ -587,6 +591,40 @@
     return freshest;
   }
 
+  function scheduleTickSignalRefresh() {
+    if (tickSignalQueued) return;
+    tickSignalQueued = true;
+    const now = Date.now();
+    const delay = Math.max(0, 150 - (now - lastTickSignalAt));
+    setTimeout(function () {
+      tickSignalQueued = false;
+      lastTickSignalAt = Date.now();
+      try { maybeSignal(); } catch (_) {}
+    }, delay);
+  }
+
+  function persistLiveCandles(assetId, immediate) {
+    const id = String(assetId || activeAsset || "").slice(0, 96);
+    if (!id || !STORE || typeof STORE.setCandles !== "function") return;
+    // Never persist the synthetic warm-up seed. The backtester consumes this
+    // cache as Quotex-only data, so storage starts only after genuine broker
+    // 1m history has replaced the seed.
+    if (!historySeeded[id] && !realHistoryReady[id]) return;
+    const now = Date.now();
+    const minGap = immediate ? 1000 : 5000;
+    const wait = Math.max(0, minGap - (now - (candlePersistLastAt[id] || 0)));
+    if (candlePersistTimers[id]) return;
+    candlePersistTimers[id] = setTimeout(function () {
+      candlePersistTimers[id] = null;
+      candlePersistLastAt[id] = Date.now();
+      try {
+        const feed = createFeedFor(id);
+        const series = feed && typeof feed.series === "function" ? feed.series().slice(-5000) : [];
+        if (series.length >= 2) STORE.setCandles(id, series, 5000).catch(function () {});
+      } catch (_) {}
+    }, wait);
+  }
+
   function ingestLiveCandles(asset, period, candles) {
     if (!asset || !Array.isArray(candles) || !candles.length) return;
     const det = typeof asset === "string" && asset.length <= 80 ? ASSETS.ensureRegistered(asset) : null;
@@ -638,6 +676,7 @@
       const ev = feed.mergeCandles(real);
       settleFeedEvent(ev, id);
     }
+    if (useForEngine && feed.series().length >= 2) persistLiveCandles(id, true);
     if (useForEngine && feed.series().length >= 40) realHistoryReady[id] = true;
     const newestRealTime = real[real.length - 1].time;
     if (useForEngine && newestRealTime >= Date.now() - 2 * TF_MS && newestRealTime <= Date.now() + TF_MS) {
@@ -913,7 +952,7 @@
     // not serialize two candle arrays every second when nothing changed.
     if (!force && fingerprint === lastStateFingerprint && now - lastStatePushAt < 10000) return;
     lastStateFingerprint = fingerprint;
-    const minGap = 750;
+    const minGap = 250;
     if (force || !lastStatePushAt || now - lastStatePushAt >= minGap) {
       if (statePushTimer) { clearTimeout(statePushTimer); statePushTimer = null; }
       lastStatePushAt = now;
@@ -933,6 +972,8 @@
     if (!sig) return;
     const total = stats.wins + stats.losses;
     const chart = chartForActiveAsset();
+    const feedSeries = activeFeed.series().slice(-220);
+    const chartSeries = chart && chart.period !== 60 ? chart.candles.slice(-220) : feedSeries;
     const payload = {
       attached: true,
       primary: isPrimaryContext,
@@ -940,10 +981,10 @@
       asset: assetName(),
       assetId: activeAsset,
       price: activeFeed.lastPrice(),
-      candles: activeFeed.series().slice(-220),
-      // Keep messages compact: shipping two 400-bar arrays every 750ms was a
-      // major source of dashboard serialization/render lag.
-      chartCandles: chart ? chart.candles.slice(-220) : null,
+      candles: feedSeries,
+      // Keep messages compact while allowing the active 1m candle to move on
+      // every accepted Quotex tick instead of waiting for a history refresh.
+      chartCandles: chartSeries,
       chartPeriod: chart ? chart.period : 60,
       signal: sig,
       wins: stats.wins,
@@ -1059,6 +1100,7 @@
       // or after the exact expiry rather than waiting for a later bar close.
       settlePending(safePrice, ts, assetOverride);
       settleFeedEvent(backgroundEvent, assetOverride);
+      persistLiveCandles(assetOverride, false);
       return true;
     }
     const ev = activeFeed.ingest(safePrice, ts);
@@ -1066,6 +1108,8 @@
     lastAcceptedQuoteAt[activeAsset] = Date.now();
     settlePending(safePrice, ts, activeAsset);
     settleFeedEvent(ev, activeAsset);
+    persistLiveCandles(activeAsset, false);
+    scheduleTickSignalRefresh();
     if (!dashOpened && attached && ev && isPrimaryContext) {
       dashOpened = true;
       chrome.runtime.sendMessage({ type: "CYBER_OPEN_DASH" }).catch(() => {});
