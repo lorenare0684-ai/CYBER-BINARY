@@ -41,6 +41,7 @@
   let activeTab = "live";
   let assetsRenderToken = 0;
   let historyRenderToken = 0;
+  let lastTopAccFetchTs = 0;
   const recentAutoLogKeys = new Set();
   const recentAutoLogOrder = [];
   const liveCandlesByAsset = Object.create(null);
@@ -186,7 +187,7 @@
         ctx.fillStyle = "rgba(255,255,255,0.45)";
         ctx.font = "11px system-ui, sans-serif";
         ctx.textAlign = "center";
-        ctx.fillText("Waiting for valid equity data…", w / 2, h / 2);
+        ctx.fillText(o.emptyMessage || "Waiting for valid equity data…", w / 2, h / 2);
         return;
       }
       let eqLo = -Math.max(1, Math.abs(eq[0].equity));
@@ -441,10 +442,21 @@
     if (name !== "history") historyRenderToken++;
     $all(".tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === name));
     $all(".tab-pane").forEach((p) => p.classList.toggle("active", p.dataset.pane === name));
+    if (name === "live") {
+      setTimeout(() => {
+        if (lastChartCandles && lastChartCandles.length) drawChart($("chart"), lastChartCandles, lastChartMeta);
+        STORE.getStats().then(renderTopAccuracyTable).catch(() => {});
+      }, 30);
+    }
     if (name === "assets") refreshAssetsTab();
     if (name === "history") refreshHistoryTab();
     if (name === "settings") refreshSettingsTab();
     if (name === "instruments") refreshInstrumentsTab();
+    if (name === "backtest") {
+      setTimeout(() => {
+        if (lastBtEquity) drawChart($("bt-equity"), lastBtEquity, { equity: true, equityLabel: "runs" });
+      }, 30);
+    }
   }
   $all(".tab").forEach((t) => t.addEventListener("click", () => activateTab(t.dataset.tab)));
 
@@ -706,14 +718,20 @@
           const isSelected = sig.selectedStrategy === stratId;
           const label = item.label || stratId;
           const fit = item.fitness || 0;
+          const stratDir = item.direction === "PUT" ? "put" : item.direction === "CALL" ? "call" : "";
           const dirTxt = item.direction && item.direction !== "WAIT" ? " [" + item.direction + "]" : "";
-          fitnessHtml += '<div class="meter small' + (isSelected ? ' selected' : '') + '"><span>' + esc(label) + dirTxt + '</span><div class="bar call"><i style="width:' + fit + '%"></i></div><span>' + fit + '/100</span></div>';
+          fitnessHtml += '<div class="meter small' + (isSelected ? ' selected' : '') + '"><span>' + esc(label) + dirTxt + '</span><div class="bar ' + stratDir + '"><i style="width:' + fit + '%"></i></div><span>' + fit + '/100</span></div>';
         }
         fitnessContainer.innerHTML = fitnessHtml;
       }
     }
 
-    STORE.getStats().then(renderTopAccuracyTable).catch(() => {});
+    // Throttle stats fetch for high-accuracy asset table (at most once every 3s)
+    const now = Date.now();
+    if (now - lastTopAccFetchTs > 3000) {
+      lastTopAccFetchTs = now;
+      STORE.getStats().then(renderTopAccuracyTable).catch(() => {});
+    }
 
     $("wins").textContent = String(Math.max(0, Math.floor(finite(state.wins, 0))));
     $("losses").textContent = String(Math.max(0, Math.floor(finite(state.losses, 0))));
@@ -865,6 +883,12 @@
         expiryTime: finite(rawLastTrade.expiryTime, 0),
       } : null,
     };
+
+    const modeSelect = $("auto-mode");
+    if (modeSelect && document.activeElement !== modeSelect) {
+      modeSelect.value = mode;
+    }
+
     $("auto-mode-label").textContent = mode.toUpperCase();
     $("auto-hero").dataset.dir = mode === "click" ? "CALL" : mode === "alerts" ? "WAIT" : "PUT";
     $("auto-reason").textContent = autoState.armed
@@ -970,14 +994,25 @@
     filtered.sort((a, b) => (b.payout || 0) - (a.payout || 0));
     for (const it of filtered.slice(0, 500)) {
       const tr = document.createElement("tr");
+      tr.className = "clickable";
       const tfs = (it.timeframes || []).map((t) => QUOTEX.KNOWN_TIMEFRAMES[t] || t + "s").slice(0, 6).join(", ");
       tr.innerHTML =
-        "<td>" + esc(it.symbol || "—") + "</td>" +
+        "<td><strong>" + esc(it.symbol || "—") + "</strong></td>" +
         "<td>" + esc(it.name || "—") + "</td>" +
         "<td>" + esc(it.type || "—") + "</td>" +
         "<td>" + (finite(it.payout, null) != null ? esc(finite(it.payout, 0)) + "%" : "—") + "</td>" +
         "<td>" + esc(tfs || "—") + "</td>" +
-        "<td class='" + (it.isOpen ? "win" : "loss") + "'>" + (it.isOpen ? "OPEN" : "closed") + "</td>";
+        "<td class='" + (it.isOpen ? "win" : "loss") + "'>" + (it.isOpen ? "OPEN" : "closed") + "</td>" +
+        "<td><button type='button' class='arm-btn tiny'>Select</button></td>";
+
+      const selectInstrument = () => {
+        const canonical = it.id || it.symbol;
+        selectAsset(canonical);
+        activateTab("live");
+      };
+      const btn = tr.querySelector("button");
+      if (btn) btn.addEventListener("click", (e) => { e.stopPropagation(); selectInstrument(); });
+      tr.addEventListener("click", selectInstrument);
       tb.appendChild(tr);
     }
 
@@ -1080,6 +1115,7 @@
     bindNumberSetting("cooldown", "cooldownBars");
     const bindBooleanSetting = (id, key) => {
       const el = $(id);
+      if (!el) return;
       el.addEventListener("change", () => {
         setSettings({ [key]: el.checked }).then((saved) => { el.checked = !!saved[key]; }).catch(() => {
           el.checked = !!(settings && settings[key]);
@@ -1128,6 +1164,7 @@
       $("notify-sound").checked = s.notifySound !== false;
       $("notify-desktop").checked = !!s.notifyDesktop;
       if ($("auto-high-accuracy")) $("auto-high-accuracy").checked = s.autoHighAccuracy !== false;
+      if ($("set-auto-high-accuracy")) $("set-auto-high-accuracy").checked = s.autoHighAccuracy !== false;
       activeStrategy = STRAT.get(s.strategy) ? s.strategy : "auto_adaptive";
       const sel = $("strategy-select");
       if (sel) sel.value = activeStrategy;
@@ -1392,8 +1429,19 @@
     $("hist-asset").addEventListener("change", refreshHistoryTab);
     $("hist-export").addEventListener("click", () => {
       STORE.getStats().then((s) => {
+        const dir = $("hist-dir").value;
+        const out = $("hist-outcome").value;
+        const asset = $("hist-asset").value;
+        const list = (s.history || []).filter((h) => {
+          if (dir !== "all" && h.dir !== dir) return false;
+          if (out === "win" && h.won !== true) return false;
+          if (out === "loss" && h.won !== false) return false;
+          if (asset !== "all" && h.asset !== asset) return false;
+          return true;
+        });
+
         const rows = [["entry_time", "expiry_time", "exit_time", "expiry_minutes", "asset", "dir", "outcome", "won", "entry_price", "exit_price", "confidence", "regime", "strategy", "pnl"]];
-        for (const h of (s.history || [])) {
+        for (const h of list) {
           const entryTime = h.entryTime != null ? h.entryTime : h.at;
           const outcome = tradeOutcome(h).label;
           rows.push([
@@ -1501,6 +1549,12 @@
   function refreshSettingsTab() {
     if (!settings) return;
     $("set-calibration").checked = settings.calibration !== false;
+    if ($("set-auto-adaptive")) {
+      $("set-auto-adaptive").checked = settings.strategy === "auto_adaptive";
+    }
+    if ($("set-auto-high-accuracy")) {
+      $("set-auto-high-accuracy").checked = settings.autoHighAccuracy !== false;
+    }
   }
   function bindSettingsTab() {
     $("set-calibration").addEventListener("change", (e) => {
@@ -1516,6 +1570,15 @@
           activeStrategy = targetStrategy;
           const sel = $("strategy-select");
           if (sel) sel.value = targetStrategy;
+        }).catch(() => {});
+      });
+    }
+    if ($("set-auto-high-accuracy")) {
+      $("set-auto-high-accuracy").addEventListener("change", (e) => {
+        const checked = e.target.checked;
+        STORE.setSettings({ autoHighAccuracy: checked }).then((s) => {
+          settings = s;
+          if ($("auto-high-accuracy")) $("auto-high-accuracy").checked = checked;
         }).catch(() => {});
       });
     }
