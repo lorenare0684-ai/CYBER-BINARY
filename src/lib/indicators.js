@@ -176,6 +176,17 @@
     return { line, signal: sig, hist };
   }
 
+  /**
+   * v2.6.5: clamp a bar's high/low into the valid range instead of voiding
+   * the whole indicator. One glitched live update (h < l or close outside
+   * the range) used to blank every oscillator on the chart; now the bar is
+   * repaired to the closest valid OHLC and the series keeps flowing.
+   * Non-finite values still void the result (genuinely unusable input).
+   */
+  function clampHighLow(h, l, o, c) {
+    return { high: Math.max(h, l, o, c), low: Math.min(h, l, o, c) };
+  }
+
   function stochastic(highs, lows, closes, kPeriod, dPeriod) {
     const len = Array.isArray(closes) ? closes.length : 0;
     const k = new Array(len).fill(null);
@@ -188,10 +199,11 @@
     const hNums = new Array(len), lNums = new Array(len), cNums = new Array(len);
     for (let i = 0; i < len; i++) {
       const h = numeric(highs[i]), l = numeric(lows[i]), c = numeric(closes[i]);
-      if (!Number.isFinite(h) || !Number.isFinite(l) || !Number.isFinite(c) || h < l || c > h || c < l) {
+      if (!Number.isFinite(h) || !Number.isFinite(l) || !Number.isFinite(c)) {
         return { k, d: new Array(len).fill(null) };
       }
-      hNums[i] = h; lNums[i] = l; cNums[i] = c;
+      const clamped = clampHighLow(h, l, c, c);
+      hNums[i] = clamped.high; lNums[i] = clamped.low; cNums[i] = c;
     }
     for (let i = kPeriod - 1; i < len; i++) {
       let hh = -Infinity, ll = Infinity;
@@ -241,18 +253,18 @@
     if (!Array.isArray(highs) || !Array.isArray(lows) || !len || highs.length !== len || lows.length !== len) return [];
     const tr = new Array(len).fill(null);
     const firstHigh = numeric(highs[0]), firstLow = numeric(lows[0]), firstClose = numeric(closes[0]);
-    if (!Number.isFinite(firstHigh) || !Number.isFinite(firstLow) || !Number.isFinite(firstClose) ||
-        firstHigh < firstLow || firstClose > firstHigh || firstClose < firstLow) return tr;
-    tr[0] = firstHigh - firstLow;
+    if (!Number.isFinite(firstHigh) || !Number.isFinite(firstLow) || !Number.isFinite(firstClose)) return tr;
+    const firstClamped = clampHighLow(firstHigh, firstLow, firstClose, firstClose);
+    tr[0] = firstClamped.high - firstClamped.low;
     for (let i = 1; i < len; i++) {
       const high = numeric(highs[i]), low = numeric(lows[i]);
       const currentClose = numeric(closes[i]), previousClose = numeric(closes[i - 1]);
-      if (!Number.isFinite(high) || !Number.isFinite(low) || high < low ||
-          !Number.isFinite(currentClose) || currentClose > high || currentClose < low ||
-          !Number.isFinite(previousClose)) return new Array(len).fill(null);
-      const hl = high - low;
-      const hc = Math.abs(high - previousClose);
-      const lc = Math.abs(low - previousClose);
+      if (!Number.isFinite(high) || !Number.isFinite(low) ||
+          !Number.isFinite(currentClose) || !Number.isFinite(previousClose)) return new Array(len).fill(null);
+      const clamped = clampHighLow(high, low, currentClose, currentClose);
+      const hl = clamped.high - clamped.low;
+      const hc = Math.abs(clamped.high - previousClose);
+      const lc = Math.abs(clamped.low - previousClose);
       tr[i] = Math.max(hl, hc, lc);
     }
     return rma(tr, period);
@@ -269,11 +281,11 @@
       return { tr, plus: plusDM, minus: minusDM, adx: new Array(len).fill(null) };
     }
     const firstHigh = numeric(highs[0]), firstLow = numeric(lows[0]), firstClose = numeric(closes[0]);
-    if (!Number.isFinite(firstHigh) || !Number.isFinite(firstLow) || !Number.isFinite(firstClose) ||
-        firstHigh < firstLow || firstClose > firstHigh || firstClose < firstLow) {
+    if (!Number.isFinite(firstHigh) || !Number.isFinite(firstLow) || !Number.isFinite(firstClose)) {
       return { tr, plus: plusDM, minus: minusDM, adx: new Array(len).fill(null) };
     }
-    tr[0] = firstHigh - firstLow;
+    const firstClamped = clampHighLow(firstHigh, firstLow, firstClose, firstClose);
+    tr[0] = firstClamped.high - firstClamped.low;
     plusDM[0] = 0;
     minusDM[0] = 0;
 
@@ -281,17 +293,18 @@
       const high = numeric(highs[i]), priorHigh = numeric(highs[i - 1]);
       const low = numeric(lows[i]), priorLow = numeric(lows[i - 1]);
       const close = numeric(closes[i]), priorClose = numeric(closes[i - 1]);
-      if (![high, priorHigh, low, priorLow, close, priorClose].every(Number.isFinite) ||
-          high < low || close > high || close < low || priorHigh < priorLow) {
+      if (![high, priorHigh, low, priorLow, close, priorClose].every(Number.isFinite)) {
         return { tr, plus: plusDM, minus: minusDM, adx: new Array(len).fill(null) };
       }
-      const up = high - priorHigh;
-      const dn = priorLow - low;
+      const clamped = clampHighLow(high, low, close, close);
+      const clampedPrev = clampHighLow(priorHigh, priorLow, priorClose, priorClose);
+      const up = clamped.high - clampedPrev.high;
+      const dn = clampedPrev.low - clamped.low;
       plusDM[i] = up > dn && up > 0 ? up : 0;
       minusDM[i] = dn > up && dn > 0 ? dn : 0;
-      const hl = high - low;
-      const hc = Math.abs(high - priorClose);
-      const lc = Math.abs(low - priorClose);
+      const hl = clamped.high - clamped.low;
+      const hc = Math.abs(clamped.high - priorClose);
+      const lc = Math.abs(clamped.low - priorClose);
       tr[i] = Math.max(hl, hc, lc);
     }
     const trN = rma(tr, period);
@@ -360,8 +373,9 @@
     const hNums = new Array(len), lNums = new Array(len);
     for (let i = 0; i < len; i++) {
       const high = numeric(highs[i]), low = numeric(lows[i]);
-      if (!Number.isFinite(high) || !Number.isFinite(low) || high < low) return out;
-      hNums[i] = high; lNums[i] = low;
+      if (!Number.isFinite(high) || !Number.isFinite(low)) return out;
+      const clamped = clampHighLow(high, low, high, low);
+      hNums[i] = clamped.high; lNums[i] = clamped.low;
     }
     let bull = (hNums[1] + lNums[1]) >= (hNums[0] + lNums[0]);
     let af = step;
@@ -415,10 +429,11 @@
     const hNums = new Array(len), lNums = new Array(len), cNums = new Array(len);
     for (let i = 0; i < len; i++) {
       const high = numeric(highs[i]), low = numeric(lows[i]), close = numeric(closes[i]);
-      if (![high, low, close].every(Number.isFinite) || high < low || close > high || close < low) {
+      if (![high, low, close].every(Number.isFinite)) {
         return { upper, lower, st, trend };
       }
-      hNums[i] = high; lNums[i] = low; cNums[i] = close;
+      const clamped = clampHighLow(high, low, close, close);
+      hNums[i] = clamped.high; lNums[i] = clamped.low; cNums[i] = close;
       if (a[i] == null) continue;
       const hl2 = (high + low) / 2;
       upper[i] = hl2 + mult * a[i];
@@ -471,11 +486,11 @@
     let cumV = 0;
     for (let i = 0; i < len; i++) {
       const high = numeric(highs[i]), low = numeric(lows[i]), close = numeric(closes[i]);
-      if (!Number.isFinite(high) || !Number.isFinite(low) || !Number.isFinite(close) ||
-          high < low || close > high || close < low) continue;
+      if (!Number.isFinite(high) || !Number.isFinite(low) || !Number.isFinite(close)) continue;
       const rawVolume = volumes && volumes[i] != null ? numeric(volumes[i]) : 1;
       const v = Number.isFinite(rawVolume) && rawVolume >= 0 ? rawVolume : 0;
-      const tp = (high + low + close) / 3;
+      const clamped = clampHighLow(high, low, close, close);
+      const tp = (clamped.high + clamped.low + close) / 3;
       const nextPV = cumPV + tp * v;
       const nextV = cumV + v;
       if (!Number.isFinite(nextPV) || !Number.isFinite(nextV)) continue;
@@ -540,10 +555,11 @@
     const hNums = new Array(len), lNums = new Array(len), cNums = new Array(len);
     for (let i = 0; i < len; i++) {
       const h = numeric(highs[i]), l = numeric(lows[i]), c = numeric(closes[i]);
-      if (!Number.isFinite(h) || !Number.isFinite(l) || !Number.isFinite(c) || h < l || c > h || c < l) {
+      if (!Number.isFinite(h) || !Number.isFinite(l) || !Number.isFinite(c)) {
         return out;
       }
-      hNums[i] = h; lNums[i] = l; cNums[i] = c;
+      const clamped = clampHighLow(h, l, c, c);
+      hNums[i] = clamped.high; lNums[i] = clamped.low; cNums[i] = c;
     }
     for (let i = period - 1; i < len; i++) {
       let hh = -Infinity, ll = Infinity;
@@ -566,8 +582,9 @@
     const tp = new Array(len);
     for (let i = 0; i < len; i++) {
       const high = numeric(highs[i]), low = numeric(lows[i]), close = numeric(closes[i]);
-      if (![high, low, close].every(Number.isFinite) || high < low || close > high || close < low) return out;
-      tp[i] = (high + low + close) / 3;
+      if (![high, low, close].every(Number.isFinite)) return out;
+      const clamped = clampHighLow(high, low, close, close);
+      tp[i] = (clamped.high + clamped.low + close) / 3;
     }
     const smaTP = sma(tp, period);
     for (let i = period - 1; i < len; i++) {
@@ -592,13 +609,13 @@
       let pos = 0, neg = 0, valid = true;
       for (let j = i - period + 1; j <= i; j++) {
         const values = [highs[j], lows[j], closes[j], highs[j - 1], lows[j - 1], closes[j - 1], volumes[j]].map(numeric);
-        if (!values.every(Number.isFinite) || values[6] < 0 ||
-            values[0] < values[1] || values[2] > values[0] || values[2] < values[1] ||
-            values[3] < values[4] || values[5] > values[3] || values[5] < values[4]) {
+        if (!values.every(Number.isFinite) || values[6] < 0) {
           valid = false; break;
         }
-        const tp = (values[0] + values[1] + values[2]) / 3;
-        const tpPrev = (values[3] + values[4] + values[5]) / 3;
+        const clamped = clampHighLow(values[0], values[1], values[2], values[2]);
+        const clampedPrev = clampHighLow(values[3], values[4], values[5], values[5]);
+        const tp = (clamped.high + clamped.low + values[2]) / 3;
+        const tpPrev = (clampedPrev.high + clampedPrev.low + values[5]) / 3;
         const flow = tp * values[6];
         if (tp > tpPrev) pos += flow;
         else if (tp < tpPrev) neg += flow;
@@ -639,10 +656,11 @@
     const hNums = new Array(len), lNums = new Array(len);
     for (let i = 0; i < len; i++) {
       const h = numeric(highs[i]), l = numeric(lows[i]);
-      if (!Number.isFinite(h) || !Number.isFinite(l) || h < l) {
+      if (!Number.isFinite(h) || !Number.isFinite(l)) {
         return { upper, lower, mid: upper.slice() };
       }
-      hNums[i] = h; lNums[i] = l;
+      const clamped = clampHighLow(h, l, h, l);
+      hNums[i] = clamped.high; lNums[i] = clamped.low;
     }
     for (let i = period - 1; i < len; i++) {
       let hh = -Infinity, ll = Infinity;

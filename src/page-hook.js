@@ -659,7 +659,6 @@
     }
 
     if (!Array.isArray(rows) || !rows.length) return null;
-
     if (typeof period === "object" && period != null) {
       period = period.time != null ? period.time : (period.value != null ? period.value : 60);
     }
@@ -689,6 +688,32 @@
     if (!raw.length) return [];
     var byTime = Object.create(null);
     var start = Math.max(0, raw.length - 5000);
+    // v2.6.5: vote on the array-row layout across the whole batch instead
+    // of guessing per row. Layout A is Quotex's [ts, open, close, high,
+    // low]; layout B is [ts, open, high, low, close]. A row only votes when
+    // its unique max/min positions are unambiguous, so flat bars and
+    // close-at-extreme bars abstain instead of corrupting the tally.
+    var votesA = 0, votesB = 0;
+    for (var vi = start; vi < raw.length; vi++) {
+      var vrow = raw[vi];
+      if (!Array.isArray(vrow) || vrow.length < 5) continue;
+      var vo = numberValue(vrow[1]), vp2 = numberValue(vrow[2]), vp3 = numberValue(vrow[3]), vp4 = numberValue(vrow[4]);
+      if (vo == null || vp2 == null || vp3 == null || vp4 == null ||
+          vo <= 0 || vp2 <= 0 || vp3 <= 0 || vp4 <= 0) continue;
+      var vall = [vo, vp2, vp3, vp4];
+      var vmax = Math.max(vall[0], vall[1], vall[2], vall[3]);
+      var vmin = Math.min(vall[0], vall[1], vall[2], vall[3]);
+      if (vmax === vmin) continue;
+      var vmaxAt = -1, vminAt = -1, vmaxTies = 0, vminTies = 0;
+      for (var vk = 0; vk < 4; vk++) {
+        if (vall[vk] === vmax) { vmaxAt = vk; vmaxTies++; }
+        if (vall[vk] === vmin) { vminAt = vk; vminTies++; }
+      }
+      if (vmaxTies !== 1 || vminTies !== 1) continue;
+      if (vmaxAt === 2 && vminAt === 3) votesA++;
+      else if (vmaxAt === 1 && vminAt === 2) votesB++;
+    }
+    var layoutB = votesB > votesA;
     for (var i = start; i < raw.length; i++) {
       var row = raw[i];
       if (!row) continue;
@@ -719,17 +744,12 @@
         var p4 = numberValue(row[4]);
         if (o != null && p2 != null && p3 != null && p4 != null &&
             o > 0 && p2 > 0 && p3 > 0 && p4 > 0) {
-          var maxP = Math.max(o, p2, p3, p4);
-          var minP = Math.min(o, p2, p3, p4);
-          if (p2 === maxP && p3 === minP && p4 !== maxP && p4 !== minP) {
-            c = p4;
-            hi = p2;
-            lo = p3;
-          } else {
-            c = p2;
-            hi = Math.max(o, c, p3, p4);
-            lo = Math.min(o, c, p3, p4);
-          }
+          // v2.6.5: honour the batch-level layout vote; clamp into a valid
+          // OHLC range afterwards so one glitched row can never poison it.
+          if (layoutB) { c = p4; hi = p2; lo = p3; }
+          else { c = p2; hi = p3; lo = p4; }
+          hi = Math.max(o, c, hi, lo);
+          lo = Math.min(o, c, p2, p3, p4);
           if (row.length > 5 && row[5] != null) vol = numberValue(row[5]) || 0;
         }
       }
@@ -737,7 +757,11 @@
           o <= 0 || c <= 0 || hi <= 0 || lo <= 0 ||
           o > 1e100 || c > 1e100 || hi > 1e100 || lo > 1e100) continue;
       var tMs = toMs(ts);
-      if (tMs == null || tMs < 946684800000 || tMs > Date.now() + 300000) continue;
+      // v2.6.5: tolerate up to 24h of broker-server-vs-local clock skew. The
+      // old +5min bound silently dropped EVERY candle whenever the user's PC
+      // clock ran behind Quotex's server, which kept the dashboard on its
+      // synthetic seed forever ("candles don't match the platform").
+      if (tMs == null || tMs < 946684800000 || tMs > Date.now() + 86400000) continue;
       byTime[tMs] = {
         time: tMs,
         open: o, high: hi, low: lo, close: c,

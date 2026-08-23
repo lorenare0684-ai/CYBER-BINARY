@@ -682,7 +682,7 @@
       const time = Math.abs(rawTime) >= 1e14 ? Math.floor(rawTime / 1000)
         : Math.abs(rawTime) >= 1e11 ? Math.floor(rawTime) : Math.floor(rawTime * 1000);
       if (![time, open, close, rawHigh, rawLow].every(Number.isFinite) ||
-          time < 946684800000 || time > Date.now() + 300000 ||
+          time < 946684800000 || time > Date.now() + 86400000 ||
           open <= 0 || close <= 0 || rawHigh <= 0 || rawLow <= 0 ||
           Math.max(open, close, rawHigh, rawLow) > 1e12) continue;
       const rawVolume = Number(c.volume);
@@ -713,7 +713,10 @@
     if (useForEngine && feed.series().length >= 2) persistLiveCandles(id, true);
     if (useForEngine && feed.series().length >= 40) realHistoryReady[id] = true;
     const newestRealTime = real[real.length - 1].time;
-    if (useForEngine && newestRealTime >= Date.now() - 2 * TF_MS && newestRealTime <= Date.now() + TF_MS) {
+    // v2.6.5: the upper bound tolerates broker-server clock skew (old bound
+    // was +1 minute, which made "live" detection fail whenever the server
+    // clock ran ahead of the user's PC).
+    if (useForEngine && newestRealTime >= Date.now() - 2 * TF_MS && newestRealTime <= Date.now() + 86400000) {
       lastAcceptedQuoteAt[id] = Date.now();
     }
     // Merge incremental batches instead of replacing the dashboard series

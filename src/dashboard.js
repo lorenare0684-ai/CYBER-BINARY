@@ -826,6 +826,8 @@
       lastChartMeta = { timeframe: tfLabel(state.chartPeriod || 60), markers };
       drawChart($("chart"), lastChartCandles, lastChartMeta);
     }
+    const demoBadge = $("chart-demo-badge");
+    if (demoBadge && chartCandles.length) demoBadge.hidden = true;
     if (state.autoState) updateAutoUI(state.autoState);
   }
 
@@ -839,6 +841,8 @@
       lastChartKey = "";
       paintQuotexPill();
     }
+    const demoBadge = $("chart-demo-badge");
+    if (demoBadge) demoBadge.hidden = false;
     const last = localFeed.lastPrice() || 1.0854;
     localFeed.ingest(FEED.demoTick(last), Date.now());
     const series = localFeed.series();

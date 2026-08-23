@@ -4,6 +4,18 @@ Chrome extension (Manifest V3) that attaches to a Quotex / QX Broker chart, buil
 
 > Live signal analysis and explicitly armed automated execution for Quotex. This third-party tool can place real trades. Binary options are high risk, losses can quickly outweigh returns, and no result or profit is guaranteed.
 
+## What's new in v2.6.5 — Clean Candle Data + Indicator Hardening
+
+Why the dashboard candles could diverge from the Quotex chart, and what changed:
+
+- **Clock-skew fix (root cause)**: candle batches whose broker timestamps ran more than 5 minutes ahead of the PC clock were silently dropped at TWO layers (page hook + content script) — the feed then kept its 120-bar synthetic seed forever, so the dashboard never matched the platform. Both filters now tolerate up to 24h of server-vs-local skew (still rejecting unit mix-ups like seconds-vs-milliseconds), and the live-detection heartbeat got the same tolerance.
+- **Array-row layout voting**: Quotex history rows are [ts, open, close, high, low], but the parser used a per-row guess that could mis-assign close on bars where close equals the extreme. The whole batch now votes on the layout from unambiguous rows, then parses consistently and clamps into a valid OHLC range.
+- **Indicators no longer blank out on one glitched bar**: ATR, ADX, Stochastic, Supertrend, PSAR, Williams %R, CCI, MFI, VWAP and Donchian used to return all-null if a single bar arrived with h < l or close outside the range. They now repair that bar to the closest valid OHLC and keep flowing. Verified bit-identical on clean data (full suite + 57.03% baseline + 97.13% accuracy unchanged).
+- **Demo-data badge**: when the dashboard chart is running on synthetic candles (extension disconnected / Quotex tab closed), an orange "DEMO DATA" badge makes it explicit instead of looking like a real feed.
+- **New tool** `node tools/data-quality.js`: audits candle exports (from the "Export live candles" button) for duplicates, non-monotonic or off-grid timestamps, OHLC violations, missing-minute gaps, extreme jumps, flat bars and staleness. `--candles <file>` mode fails only on structural corruption; gaps/spikes are reported since real OTC feeds have them.
+
+The math of every indicator was also re-audited against reference definitions (Wilder RSI/ATR/ADX, standard CCI/MFI/%R/OBV/Donchian/Keltner/PSAR/Supertrend, R/S Hurst) — no formula errors found; the bugs were in data handling, not the formulas.
+
 ## What's new in v2.6.4 — Monte Carlo & Hostile-Market Validation
 
 New tool: `node tools/montecarlo.js` — the statistically hard tests for the High-Accuracy preset:
