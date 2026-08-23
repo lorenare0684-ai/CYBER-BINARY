@@ -1,13 +1,12 @@
 {
   "manifest_version": 3,
-  "name": "CYBER BINARY \u2014 Quotex Signal Lab",
-  "version": "2.3.3",
-  "description": "v2.3.3: non-repainting signal arrows on the Quotex chart (native Lightweight Charts markers + overlay fallback, historical + live). Auto-detection from the full catalog, reliable placement, no spam. Educational only - not financial advice.",
+  "name": "CYBER BINARY — Quotex Trading Automation",
+  "version": "2.4.0",
+  "description": "v2.4.0: live Quotex signals and explicitly armed, broker-confirmed automated execution with anti-spam safety, authoritative chart detection, proper candles, and complete trade lifecycle details.",
   "permissions": [
     "storage",
     "windows",
     "tabs",
-    "scripting",
     "notifications"
   ],
   "host_permissions": [
@@ -35,6 +34,7 @@
       "matches": [
         "https://qxbroker.com/*",
         "https://quotex.com/*",
+        "https://quotex.io/*",
         "https://*.quotex.com/*",
         "https://*.qxbroker.com/*",
         "https://*.quotex.io/*"
@@ -43,13 +43,14 @@
         "src/page-hook.js"
       ],
       "run_at": "document_start",
-      "all_frames": true,
+      "all_frames": false,
       "world": "MAIN"
     },
     {
       "matches": [
         "https://qxbroker.com/*",
         "https://quotex.com/*",
+        "https://quotex.io/*",
         "https://*.quotex.com/*",
         "https://*.qxbroker.com/*",
         "https://*.quotex.io/*"
@@ -72,25 +73,7 @@
         "src/content.css"
       ],
       "run_at": "document_idle",
-      "all_frames": true
-    }
-  ],
-  "web_accessible_resources": [
-    {
-      "resources": [
-        "src/dashboard.html",
-        "src/dashboard.css",
-        "src/dashboard.js",
-        "src/page-hook.js",
-        "src/lib/*"
-      ],
-      "matches": [
-        "https://qxbroker.com/*",
-        "https://quotex.com/*",
-        "https://*.quotex.com/*",
-        "https://*.qxbroker.com/*",
-        "https://*.quotex.io/*"
-      ]
+      "all_frames": false
     }
   ],
   "icons": {

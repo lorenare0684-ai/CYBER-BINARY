@@ -12,18 +12,77 @@
   const FEED = root.CYBER_FEED;
   const ENG = root.CYBER_ENGINE;
   const ASSETS = root.CYBER_ASSETS;
+  const STRATEGIES = root.CYBER_STRATEGIES;
 
-  if (!FEED || !ENG || !ASSETS) {
+  if (!FEED || !ENG || !ASSETS || !STRATEGIES) {
     root.CYBER_WORKERS = null;
     return;
   }
 
+  function numberValue(value) {
+    if (value == null || typeof value === "boolean" ||
+        (typeof value === "string" && !value.trim())) return null;
+    try {
+      const n = Number(value);
+      return Number.isFinite(n) ? n : null;
+    } catch (_) { return null; }
+  }
+
+  function boundedDays(value) {
+    const n = numberValue(value);
+    return n != null ? Math.max(1, Math.min(31, Math.floor(n))) : 2;
+  }
+
+  function resolveAsset(value) {
+    const id = typeof value === "string" ? value
+      : (value && typeof value === "object" && typeof value.id === "string" ? value.id : "");
+    return id ? ASSETS.get(id) : null;
+  }
+
+  function resolveStrategy(value) {
+    const id = typeof value === "string" ? value
+      : (value && typeof value === "object" && typeof value.id === "string" ? value.id : "");
+    return id ? STRATEGIES.get(id) : null;
+  }
+
+  function sortResults(results, requestedKey) {
+    const allowed = new Set(["winrate", "wins", "losses", "draws", "total", "payoff", "pnl", "maxDrawdown", "maxWinStreak", "maxLossStreak"]);
+    const key = allowed.has(requestedKey) ? requestedKey : "winrate";
+    results.sort((x, y) => {
+      const rawA = x && typeof x[key] === "number" ? numberValue(x[key]) : null;
+      const rawB = y && typeof y[key] === "number" ? numberValue(y[key]) : null;
+      const a = rawA == null ? -Infinity : rawA;
+      const b = rawB == null ? -Infinity : rawB;
+      return a === b ? 0 : (b > a ? 1 : -1);
+    });
+  }
+
+  function uniqueById(values, resolve, limit) {
+    const out = [], seen = new Set();
+    if (!Array.isArray(values)) return out;
+    for (const value of values) {
+      const item = resolve(value);
+      const id = item && typeof item.id === "string" ? item.id : "";
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      out.push(item);
+      if (out.length >= limit) break;
+    }
+    return out;
+  }
+
   function buildJob(assets, strategies, opts) {
+    opts = opts || {};
+    assets = uniqueById(assets, resolveAsset, 256);
+    if (Array.isArray(opts.kinds)) assets = assets.filter((a) => opts.kinds.includes(a.kind));
+    strategies = uniqueById(strategies, resolveStrategy, 128);
     // Pre-build series for each asset, return as plain array of objects.
-    const seriesByAsset = {};
+    const seriesByAsset = Object.create(null);
+    const days = boundedDays(opts.days);
+    const rawSeed = numberValue(opts.seed);
+    const seed = rawSeed != null ? rawSeed : 7;
     for (const a of assets) {
-      const o = Object.assign({}, opts, { cachedBars: undefined });
-      const s = FEED.syntheticSeries(a, (opts.days || 2) * 24 * 60, { seed: (opts.seed || 7) + a.id.length });
+      const s = FEED.syntheticSeries(a, days * 24 * 60, { seed });
       seriesByAsset[a.id] = s;
     }
     const jobs = [];
@@ -36,22 +95,33 @@
   }
 
   function runChunk(seriesByAsset, jobs, opts) {
+    opts = opts || {};
     const out = [];
+    const days = boundedDays(opts.days);
+    const rawHorizon = numberValue(opts.horizon);
+    const horizon = rawHorizon != null ? Math.max(1, Math.min(1440, Math.floor(rawHorizon))) : 3;
+    const rawMinConf = numberValue(opts.minConf);
+    const minConf = rawMinConf != null ? Math.max(0, Math.min(100, rawMinConf)) : 0;
+    const rawMinBars = numberValue(opts.minBars);
+    const minBars = rawMinBars != null ? Math.max(40, Math.min(2000, Math.floor(rawMinBars))) : 200;
+    if (!seriesByAsset || typeof seriesByAsset !== "object" || !Array.isArray(jobs)) return out;
     for (const j of jobs) {
-      const a = j.asset;
-      const s = j.strategy;
+      const a = j && j.asset;
+      const s = j && j.strategy;
+      if (!a || typeof a.id !== "string" || !s || typeof s.id !== "string") continue;
       const series = seriesByAsset[a.id];
+      if (!Array.isArray(series)) continue;
       const res = ENG.backtest(series, {
         strategy: s.id,
-        horizon: opts.horizon || 3,
-        minConf: opts.minConf || 0,
-        minBars: opts.minBars || 200,
+        horizon,
+        minConf,
+        minBars,
       });
       out.push({
         asset: a.id, name: a.name, kind: a.kind,
         strategy: s.id, strategyLabel: s.label,
-        horizon: opts.horizon || 3, days: opts.days || 2,
-        wins: res.wins, losses: res.losses, total: res.total,
+        horizon, days,
+        wins: res.wins, losses: res.losses, draws: res.draws || 0, total: res.total,
         winrate: res.winrate, payoff: res.payoff, pnl: res.pnl,
         maxDrawdown: res.maxDrawdown, maxWinStreak: res.maxWinStreak, maxLossStreak: res.maxLossStreak,
         byRegime: res.byRegime, calibration: res.calibration,
@@ -62,37 +132,37 @@
 
   /* Node: worker_threads pool */
   function runNode(opts) {
+    opts = opts || {};
     return new Promise((resolve, reject) => {
       let threads;
       try { threads = require("worker_threads"); } catch (e) { threads = null; }
       if (!threads) {
         // Fallback: single-threaded
-        const { seriesByAsset, jobs } = buildJob(
-          (opts.assets || ASSETS.list()).filter((a) => !opts.kinds || opts.kinds.includes(a.kind)),
-          opts.strategies || root.CYBER_STRATEGIES.list(),
-          opts
-        );
-        return resolve(runChunk(seriesByAsset, jobs, opts));
+        const fallbackAssets = Array.isArray(opts.assets) ? opts.assets : ASSETS.list();
+        const fallbackStrategies = Array.isArray(opts.strategies) ? opts.strategies : STRATEGIES.list();
+        const { seriesByAsset, jobs } = buildJob(fallbackAssets, fallbackStrategies, opts);
+        const fallbackResults = runChunk(seriesByAsset, jobs, opts);
+        return resolve({ results: fallbackResults, count: fallbackResults.length });
       }
       const numCpus = (require("os").cpus() || []).length || 4;
       // Cap at 4 workers to avoid heavy contention on shared series build
       // and to keep the postMessage fan-in bounded.
       const poolSize = Math.max(1, Math.min(numCpus, 4));
-      const assets = (opts.assets || ASSETS.list()).filter((a) => !opts.kinds || opts.kinds.includes(a.kind));
-      const strategies = opts.strategies || root.CYBER_STRATEGIES.list();
+      const assets = uniqueById(Array.isArray(opts.assets) ? opts.assets : ASSETS.list(),
+        resolveAsset, 256)
+        .filter((a) => !Array.isArray(opts.kinds) || opts.kinds.includes(a.kind));
+      const strategies = uniqueById(Array.isArray(opts.strategies) ? opts.strategies : STRATEGIES.list(),
+        resolveStrategy, 128);
 
-      // Build jobs (small payload: just asset id + strategy id).
-      const jobs = [];
-      for (const a of assets) {
-        for (const st of strategies) {
-          jobs.push({ aid: a.id, sid: st.id });
-        }
-      }
-
-      // Split jobs into N chunks
+      // Keep every strategy for an asset in the same worker. The old
+      // per-job round-robin made up to four workers regenerate the identical
+      // asset series, multiplying historic-run CPU and allocation cost.
       const chunks = [];
       for (let i = 0; i < poolSize; i++) chunks.push([]);
-      jobs.forEach((j, i) => chunks[i % poolSize].push(j));
+      assets.forEach((asset, assetIndex) => {
+        const chunk = chunks[assetIndex % poolSize];
+        for (const strategy of strategies) chunk.push({ aid: asset.id, sid: strategy.id });
+      });
 
       // Send only: jobs, libDir, opts. Workers rebuild series themselves.
       const workerSrc = `
@@ -114,30 +184,28 @@
         const opts = workerData.opts;
         const out = [];
         try {
-          const seriesByAid = {};
-          const aMeta = {};
+          let currentAid = '', currentSeries = null, currentMeta = null;
           for (const j of jobs) {
-            if (seriesByAid[j.aid]) continue;
-            const a = ASSETS.get(j.aid);
-            if (!a) continue;
-            const series = FEED.syntheticSeries(a, (opts.days || 2) * 24 * 60, { seed: (opts.seed || 7) + a.id.length });
-            seriesByAid[j.aid] = series;
-            aMeta[j.aid] = { name: a.name, kind: a.kind };
-          }
-          for (const j of jobs) {
-            const series = seriesByAid[j.aid];
-            if (!series) continue;
-            const res = ENG.backtest(series, {
-              strategy: j.sid,
+            if (currentAid !== j.aid) {
+              const a = ASSETS.get(j.aid);
+              currentAid = j.aid;
+              currentSeries = a
+                ? FEED.syntheticSeries(a, (opts.days || 2) * 24 * 60, { seed: opts.seed }) : null;
+              currentMeta = a ? { name: a.name, kind: a.kind } : null;
+            }
+            const strategy = sb.self.CYBER_STRATEGIES.get(j.sid);
+            if (!currentSeries || !currentMeta || !strategy) continue;
+            const res = ENG.backtest(currentSeries, {
+              strategy: strategy.id,
               horizon: opts.horizon || 3,
               minConf: opts.minConf || 0,
-              minBars: opts.minBars || 120,
+              minBars: opts.minBars != null ? opts.minBars : 200,
             });
             out.push({
-              asset: j.aid, name: aMeta[j.aid].name, kind: aMeta[j.aid].kind,
-              strategy: j.sid, strategyLabel: j.sid,
+              asset: j.aid, name: currentMeta.name, kind: currentMeta.kind,
+              strategy: strategy.id, strategyLabel: strategy.label,
               horizon: opts.horizon || 3, days: opts.days || 2,
-              wins: res.wins, losses: res.losses, total: res.total,
+              wins: res.wins, losses: res.losses, draws: res.draws || 0, total: res.total,
               winrate: res.winrate, payoff: res.payoff, pnl: res.pnl,
               maxDrawdown: res.maxDrawdown, maxWinStreak: res.maxWinStreak, maxLossStreak: res.maxLossStreak,
               byRegime: res.byRegime, calibration: res.calibration,
@@ -153,76 +221,178 @@
       // Node __dirname (if this module is loaded directly), then cwd.
       let libDir = opts.libDir;
       if (!libDir) {
-        try { libDir = path.resolve(__dirname); } catch (e) {}
+        try { libDir = require("path").resolve(__dirname); } catch (e) {}
       }
       if (!libDir) libDir = process.cwd();
       libDir = libDir.replace(/\\/g, "/");
-      let msgDone = 0;
+      const activeChunks = chunks.filter((c) => c.length > 0);
+      if (!activeChunks.length) return resolve({ results: [], count: 0 });
+      let reportDone = 0;
       let exitDone = 0;
+      let resolved = false;
       const all = [];
       const errors = [];
+      const rawHorizon = numberValue(opts.horizon), rawMinConf = numberValue(opts.minConf), rawMinBars = numberValue(opts.minBars);
+      const rawSeed = numberValue(opts.seed);
+      const workerOpts = {
+        days: boundedDays(opts.days),
+        seed: rawSeed != null ? rawSeed : 7,
+        horizon: rawHorizon != null ? Math.max(1, Math.min(1440, Math.floor(rawHorizon))) : 3,
+        minConf: rawMinConf != null ? Math.max(0, Math.min(100, rawMinConf)) : 0,
+        minBars: rawMinBars != null ? Math.max(40, Math.min(2000, Math.floor(rawMinBars))) : 200,
+      };
       function maybeFinish() {
-        // Resolve when all workers have sent a message AND exited.
-        if (msgDone >= poolSize && exitDone >= poolSize) {
-          if (all.length === 0 && errors.length) {
-            return resolve({ results: [], count: 0, error: errors.join("; ") });
-          }
-          all.sort((x, y) => (y[opts.sortBy || "winrate"] || 0) - (x[opts.sortBy || "winrate"] || 0));
-          resolve({ results: all, count: all.length });
+        if (resolved || reportDone < activeChunks.length || exitDone < activeChunks.length) return;
+        resolved = true;
+        if (all.length === 0 && errors.length) {
+          return resolve({ results: [], count: 0, error: errors.join("; ") });
         }
+        sortResults(all, opts.sortBy);
+        resolve({ results: all, count: all.length, errors: errors.length ? errors.slice() : undefined });
       }
-      for (let i = 0; i < poolSize; i++) {
-        if (!chunks[i].length) { msgDone++; exitDone++; continue; }
-        const w = new threads.Worker(workerSrc, {
-          eval: true,
-          workerData: { jobs: chunks[i], opts, libDir },
-        });
+      for (let i = 0; i < activeChunks.length; i++) {
+        let reported = false;
+        let exited = false;
+        let w;
+        try {
+          w = new threads.Worker(workerSrc, {
+            eval: true,
+            workerData: { jobs: activeChunks[i], opts: workerOpts, libDir },
+          });
+        } catch (e) {
+          errors.push(String(e && e.message || e));
+          reportDone++; exitDone++;
+          maybeFinish();
+          continue;
+        }
         w.on("message", (m) => {
-          if (m && m.ok) {
+          if (reported) return;
+          reported = true;
+          if (m && m.ok && Array.isArray(m.results)) {
             for (const r of m.results) all.push(r);
           } else if (m && m.error) {
             errors.push(m.error);
+          } else {
+            errors.push("worker returned an invalid response");
           }
-          msgDone++; maybeFinish();
+          reportDone++; maybeFinish();
         });
-        w.on("error", (e) => { errors.push(String(e && e.message || e)); msgDone++; maybeFinish(); });
+        w.on("error", (e) => {
+          errors.push(String(e && e.message || e));
+          if (!reported) { reported = true; reportDone++; }
+          maybeFinish();
+        });
         w.on("exit", (code) => {
+          if (exited) return;
+          exited = true;
           if (code !== 0) errors.push("worker exited " + code);
+          if (!reported) { reported = true; reportDone++; }
           exitDone++; maybeFinish();
         });
-      }
-      if (poolSize === 0 || chunks.every((c) => c.length === 0)) {
-        return resolve({ results: [], count: 0 });
       }
     });
   }
 
-  /* Browser: simple chunked async */
-  function runBrowser(opts) {
+  /* Browser fallback: simple chunked async on the current thread. */
+  function runBrowserChunked(opts) {
+    opts = opts || {};
     return new Promise((resolve) => {
-      const assets = (opts.assets || ASSETS.list()).filter((a) => !opts.kinds || opts.kinds.includes(a.kind));
-      const strategies = opts.strategies || root.CYBER_STRATEGIES.list();
-      const { seriesByAsset, jobs } = buildJob(assets, strategies, opts);
+      const assets = uniqueById(Array.isArray(opts.assets) ? opts.assets : ASSETS.list(),
+        resolveAsset, 256)
+        .filter((a) => !Array.isArray(opts.kinds) || opts.kinds.includes(a.kind));
+      const strategies = uniqueById(Array.isArray(opts.strategies) ? opts.strategies : STRATEGIES.list(),
+        resolveStrategy, 128);
+      const jobs = [];
+      for (const asset of assets) for (const strategy of strategies) jobs.push({ asset, strategy });
       const out = [];
-      let i = 0;
+      const days = boundedDays(opts.days);
+      let i = 0, seriesAsset = "", series = null;
       function step() {
-        // Run a chunk of 2 jobs per tick to balance progress vs overhead.
-        const slice = jobs.slice(i, i + 2);
-        i += slice.length;
-        for (const r of runChunk(seriesByAsset, slice, opts)) out.push(r);
-        if (opts.onProgress) opts.onProgress({ i, total: jobs.length });
-        if (i < jobs.length) {
-          setTimeout(step, 0);
-        } else {
-          out.sort((x, y) => (y[opts.sortBy || "winrate"] || 0) - (x[opts.sortBy || "winrate"] || 0));
+        // Generate only one asset's candles at a time. The former eager map
+        // allocated every asset × every day up front (hundreds of MB for the
+        // 31-day UI option) and froze or killed the dashboard before job one.
+        const job = jobs[i];
+        if (!job) {
+          sortResults(out, opts.sortBy);
           resolve({ results: out, count: out.length });
+          return;
         }
+        if (seriesAsset !== job.asset.id) {
+          seriesAsset = job.asset.id;
+          series = FEED.syntheticSeries(job.asset, Math.round(days * 24 * 60), { seed: opts.seed });
+        }
+        for (const result of runChunk({ [job.asset.id]: series }, [job], opts)) out.push(result);
+        i++;
+        try { if (typeof opts.onProgress === "function") opts.onProgress({ i, total: jobs.length }); } catch (_) {}
+        // One job per task keeps controls/painting responsive even at 31 days.
+        setTimeout(step, 0);
       }
       step();
     });
   }
 
+  function runBrowser(opts) {
+    opts = opts || {};
+    const runtime = root.chrome && root.chrome.runtime;
+    if (typeof root.Worker !== "function" || !runtime || typeof runtime.getURL !== "function") {
+      return runBrowserChunked(opts);
+    }
+    const assets = uniqueById(Array.isArray(opts.assets) ? opts.assets : ASSETS.list(),
+      resolveAsset, 256)
+      .filter((a) => !Array.isArray(opts.kinds) || opts.kinds.includes(a.kind));
+    const strategies = uniqueById(Array.isArray(opts.strategies) ? opts.strategies : STRATEGIES.list(),
+      resolveStrategy, 128);
+    const rawSeed = numberValue(opts.seed);
+    const payload = {
+      assets: assets.map((a) => a.id),
+      strategies: strategies.map((s) => s.id),
+      days: boundedDays(opts.days),
+      seed: rawSeed != null ? rawSeed : 7,
+      horizon: opts.horizon,
+      minConf: opts.minConf,
+      minBars: opts.minBars,
+      sortBy: opts.sortBy,
+    };
+    return new Promise((resolve) => {
+      let worker = null, finished = false;
+      function fallback() {
+        if (finished) return;
+        finished = true;
+        try { if (worker) worker.terminate(); } catch (_) {}
+        runBrowserChunked(opts).then(resolve);
+      }
+      try {
+        worker = new root.Worker(runtime.getURL("src/historic-worker.js"));
+      } catch (_) {
+        fallback(); return;
+      }
+      worker.onmessage = (event) => {
+        const message = event && event.data;
+        if (!message || typeof message !== "object" || finished) return;
+        if (message.type === "error") { fallback(); return; }
+        if (message.type === "progress") {
+          try {
+            if (typeof opts.onProgress === "function") opts.onProgress({
+              i: numberValue(message.i) || 0,
+              total: numberValue(message.total) || assets.length * strategies.length,
+            });
+          } catch (_) {}
+          return;
+        }
+        if (message.type !== "done" || !message.result || !Array.isArray(message.result.results)) return;
+        finished = true;
+        try { worker.terminate(); } catch (_) {}
+        sortResults(message.result.results, opts.sortBy);
+        resolve({ results: message.result.results, count: message.result.results.length });
+      };
+      worker.onerror = fallback;
+      worker.onmessageerror = fallback;
+      try { worker.postMessage(payload); } catch (_) { fallback(); }
+    });
+  }
+
   function run(opts) {
+    opts = opts || {};
     // Detect Node by checking for `process.versions.node` AND for `require`.
     // Both must be present to use worker_threads.
     const isNode = (function () {
@@ -235,5 +405,5 @@
     return runBrowser(opts);
   }
 
-  root.CYBER_WORKERS = { run, runNode, runBrowser, buildJob, runChunk };
+  root.CYBER_WORKERS = { run, runNode, runBrowser, runBrowserChunked, buildJob, runChunk };
 })(typeof self !== "undefined" ? self : globalThis);

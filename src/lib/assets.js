@@ -31,6 +31,12 @@
     return annPct / 100 / 602;
   }
 
+  function numberValue(value) {
+    if (value == null || typeof value === "boolean" ||
+        (typeof value === "string" && !value.trim())) return NaN;
+    try { return Number(value); } catch (_) { return NaN; }
+  }
+
   /* ============================================================
    * Compact source data (symbol, display name, broker id | null)
    * ============================================================ */
@@ -418,29 +424,83 @@
   }
 
   var ASSETS = buildEntries();
+  var BY_ID = Object.create(null);
+  for (var bi = 0; bi < ASSETS.length; bi++) BY_ID[ASSETS[bi].id] = ASSETS[bi];
 
-  // Build alias index for fast lookup.
+  // Build alias index for fast lookup. The sorted key list is cached because
+  // DOM detection runs repeatedly and sorting hundreds of aliases per node
+  // caused avoidable main-thread stalls.
   var ALIAS = Object.create(null);
+  var ALIAS_KEYS = null;
+  function indexAlias(alias, id) {
+    var key = String(alias || "").trim().toUpperCase();
+    if (!key || !BY_ID[id]) return false;
+    var priorId = ALIAS[key];
+    if (priorId && priorId !== id) {
+      // Prefer the catalog entry with a confirmed broker id. For example,
+      // DOGUSD_otc is Quotex's confirmed Dogecoin symbol; the legacy
+      // DOGEUSD_otc alias must not silently shadow it in text detection.
+      var prior = BY_ID[priorId], candidate = BY_ID[id];
+      if (prior && prior.brokerId) return false;
+      if (!(candidate && candidate.brokerId)) return false;
+    }
+    ALIAS[key] = id;
+    return true;
+  }
+
   for (var a = 0; a < ASSETS.length; a++) {
     var it = ASSETS[a];
-    ALIAS[it.id.toUpperCase()] = it.id;
-    ALIAS[it.name.toUpperCase()] = it.id;
-    for (var ai = 0; ai < it.aliases.length; ai++) {
-      var al = String(it.aliases[ai] || "").toUpperCase();
-      if (al) ALIAS[al] = it.id;
+    indexAlias(it.id, it.id);
+    indexAlias(it.name, it.id);
+    for (var ai = 0; ai < it.aliases.length; ai++) indexAlias(it.aliases[ai], it.id);
+  }
+
+  function aliasKeys() {
+    if (!ALIAS_KEYS) {
+      ALIAS_KEYS = Object.keys(ALIAS).sort(function (a, b) { return b.length - a.length; });
     }
+    return ALIAS_KEYS;
+  }
+
+  function addAlias(alias, id) {
+    var k = String(alias || "").trim().toUpperCase();
+    if (!k || k.length > 128 || !BY_ID[id]) return false;
+    var changed = indexAlias(k, id);
+    if (changed) ALIAS_KEYS = null;
+    return changed;
+  }
+
+  // Substring matching must honor symbol/word boundaries. Without this,
+  // one-letter stock aliases such as C, T and V matched almost every page.
+  function containsAlias(text, alias) {
+    var pos = 0;
+    var firstAlpha = /^[A-Z0-9]/.test(alias);
+    var lastAlpha = /[A-Z0-9]$/.test(alias);
+    while ((pos = text.indexOf(alias, pos)) !== -1) {
+      var before = pos > 0 ? text.charAt(pos - 1) : "";
+      var afterAt = pos + alias.length;
+      var after = afterAt < text.length ? text.charAt(afterAt) : "";
+      var startOk = !firstAlpha || !before || !/[A-Z0-9]/.test(before);
+      var endOk = !lastAlpha || !after || !/[A-Z0-9]/.test(after);
+      if (startOk && endOk) return true;
+      pos += Math.max(1, alias.length);
+    }
+    return false;
   }
   // Pull in live-detected Quotex assets registered by the adapter at runtime.
   // (See CYBER_QUOTEX in src/lib/quotex.js — the page hook calls
   //  CYBER_ASSETS.registerQuotexAsset(...) when the broker instruments/list
   //  payload arrives. We expose the same API here for symmetry.)
   var RUNTIME_ALIASES = Object.create(null);
+  var runtimeAssetCount = 0;
+  var MAX_RUNTIME_ASSETS = 500;
 
   function normalizeSymbol(s) {
-    if (!s) return "";
+    if (typeof s !== "string" && typeof s !== "number") return "";
     // Broker convention (A11ksa/Quotex): base uppercase, OTC suffix lowercase,
     // e.g. EURUSD_otc. ALIAS keys stay uppercase for case-insensitive lookup.
-    return String(s).trim().toUpperCase().replace(/_OTC/g, "_otc");
+    var symbol = String(s).trim().toUpperCase().replace(/_OTC/g, "_otc");
+    return symbol.length <= 32 && /^[A-Z0-9][A-Z0-9._-]*$/i.test(symbol) ? symbol : "";
   }
 
   function inferKindOld(sym) {
@@ -463,12 +523,38 @@
     return out;
   }
 
+  function cleanTimeframes(values) {
+    if (!Array.isArray(values)) return [];
+    var seen = Object.create(null), out = [];
+    for (var i = 0; i < values.length && out.length < 64; i++) {
+      var n = numberValue(values[i] && typeof values[i] === "object"
+        ? (values[i].time != null ? values[i].time : values[i].value) : values[i]);
+      if (!Number.isFinite(n)) continue;
+      n = Math.floor(n);
+      if (n <= 0 || n > 86400) continue;
+      if (!seen[n]) { seen[n] = true; out.push(n); }
+    }
+    return out.sort(function (a, b) { return a - b; });
+  }
+
+  function brokerBoolean(value, fallback) {
+    if (value == null) return fallback;
+    if (value === true || value === 1) return true;
+    if (value === false || value === 0) return false;
+    var text = String(value).trim().toLowerCase();
+    if (text === "true" || text === "1" || text === "open" || text === "active") return true;
+    if (text === "false" || text === "0" || text === "closed" || text === "inactive") return false;
+    return fallback;
+  }
+
   function registerQuotexAsset(q) {
-    if (!q || !q.symbol) return null;
+    if (!q || typeof q !== "object" || !q.symbol) return null;
     var sym = normalizeSymbol(q.symbol);
-    if (!sym) return null;
-    var existing = ALIAS[sym.toUpperCase()] ? get(sym) : null;
+    if (!sym || sym.length < 2) return null;
+    var isOtc = /_otc$/i.test(sym) || brokerBoolean(q.isOtc, false);
+    var existing = ALIAS[sym.toUpperCase()] ? getInternal(sym) : null;
     if (!existing) {
+      if (runtimeAssetCount >= MAX_RUNTIME_ASSETS) return null;
       // Synthesize a minimal asset entry for any detected symbol so the
       // engine has *something* to anchor on. Synthetic seed parameters come
       // from the kind/otc hints when available.
@@ -478,52 +564,71 @@
         : type === "commodity" ? "commodity"
         : type === "stock" || type === "stocks" ? "stock"
         : type === "index" || type === "indices" ? "index"
-        : (q.isOtc ? (inferKind(sym) === "otc" ? "otc" : inferKind(sym)) : inferKind(sym));
+        : (isOtc ? (inferKind(sym) === "otc" ? "otc" : inferKind(sym)) : inferKind(sym));
       var prof = profileFor(sym, kind);
       var humans = humanAliases(sym);
       // Prefer a human-friendly display name (EUR/USD OTC) over the raw symbol.
-      var name = q.name || humans.find(function (h) { return / OTC|\(OTC\)/.test(h) && h !== sym; }) || humans[1] || sym;
+      var name = String(q.name || humans.find(function (h) { return / OTC|\(OTC\)/.test(h) && h !== sym; }) || humans[1] || sym)
+        .replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim().slice(0, 96) || sym;
       var aliases = [];
       aliases.push(sym);
-      if (name) aliases.push(String(name));
+      if (name) aliases.push(name);
       for (var al = 0; al < humans.length; al++) aliases.push(humans[al]);
-      for (var qa = 0; qa < (q.aliases || []).length; qa++) aliases.push(String(q.aliases[qa]));
-      ASSETS.push({
+      var suppliedAliases = Array.isArray(q.aliases) ? q.aliases : [];
+      for (var qa = 0; qa < suppliedAliases.length && qa < 32; qa++) aliases.push(String(suppliedAliases[qa]).slice(0, 96));
+      var cleanAliases = [], aliasSeen = Object.create(null);
+      for (var ca = 0; ca < aliases.length && cleanAliases.length < 16; ca++) {
+        var cleanAlias = String(aliases[ca] || "").replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim().slice(0, 96);
+        var aliasKey = cleanAlias.toUpperCase();
+        if (cleanAlias && !aliasSeen[aliasKey]) { aliasSeen[aliasKey] = true; cleanAliases.push(cleanAlias); }
+      }
+      var rawBasePrice = numberValue(q.basePrice);
+      var rawBrokerId = numberValue(q.id);
+      var rawPayout = numberValue(q.payout);
+      var timeframes = cleanTimeframes(q.timeframes);
+      var runtimeAsset = {
         id: sym,
         name: name,
         kind: kind,
-        basePrice: q.basePrice || prof.basePrice,
+        basePrice: Number.isFinite(rawBasePrice) && rawBasePrice > 0 && rawBasePrice <= 1e100 ? rawBasePrice : prof.basePrice,
         pipSize: prof.pipSize,
         decimals: prof.decimals,
         vol: prof.vol,
         drift: 0,
         jumpRate: prof.jumpRate,
         session: prof.session,
-        aliases: aliases,
-        brokerId: q.id || 0,
-        payout: q.payout || 0,
-        isOpen: q.isOpen !== false,
-        timeframes: q.timeframes || [60, 120, 180, 300, 600, 900, 1800, 3600],
-      });
-      for (var ra = 0; ra < aliases.length; ra++) {
-        var k = String(aliases[ra]).replace(/_OTC/g, "_otc").toUpperCase();
-        if (k) ALIAS[k] = sym;
+        aliases: cleanAliases,
+        brokerId: Number.isSafeInteger(rawBrokerId) && rawBrokerId > 0 && rawBrokerId <= 1000000000 ? rawBrokerId : 0,
+        payout: Number.isFinite(rawPayout) ? Math.max(0, Math.min(100, rawPayout)) : 0,
+        isOpen: brokerBoolean(q.isOpen, true),
+        timeframes: timeframes.length ? timeframes : [60, 120, 180, 300, 600, 900, 1800, 3600],
+      };
+      runtimeAssetCount++;
+      ASSETS.push(runtimeAsset);
+      BY_ID[sym] = runtimeAsset;
+      for (var ra = 0; ra < runtimeAsset.aliases.length; ra++) {
+        var k = String(runtimeAsset.aliases[ra]).replace(/_OTC/g, "_otc").toUpperCase();
+        if (k) addAlias(k, sym);
       }
       RUNTIME_ALIASES[sym] = sym;
     } else {
       // Update metadata (payout / open state / timeframes / id) on re-list.
-      var a = get(sym);
+      var a = getInternal(sym);
       if (a) {
-        if (q.payout) a.payout = q.payout;
-        if (q.isOpen != null) a.isOpen = q.isOpen !== false;
-        if (q.id) a.brokerId = q.id;
+        var updatedPayout = numberValue(q.payout);
+        if (q.payout != null && Number.isFinite(updatedPayout)) a.payout = Math.max(0, Math.min(100, updatedPayout));
+        if (q.isOpen != null) a.isOpen = brokerBoolean(q.isOpen, a.isOpen !== false);
+        var updatedId = numberValue(q.id);
+        if (Number.isSafeInteger(updatedId) && updatedId > 0 && updatedId <= 1000000000) a.brokerId = updatedId;
         if (q.name && q.name !== a.name && a.id === sym) {
           // keep display name in sync with the broker's own label once known
-          a.name = String(q.name);
-          var extra = String(q.name).toUpperCase();
-          if (extra && !ALIAS[extra]) ALIAS[extra] = sym;
+          var updatedName = String(q.name).replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim().slice(0, 96);
+          if (updatedName) a.name = updatedName;
+          var extra = a.name.toUpperCase();
+          if (extra && !ALIAS[extra]) addAlias(extra, sym);
         }
-        if (Array.isArray(q.timeframes) && q.timeframes.length) a.timeframes = q.timeframes.slice();
+        var updatedTimeframes = cleanTimeframes(q.timeframes);
+        if (updatedTimeframes.length) a.timeframes = updatedTimeframes;
       }
     }
     return get(sym);
@@ -545,18 +650,30 @@
     // wire symbols never carry a slash; "EUR/USD" is a human display name).
     // Synthesize it as its own entry — never let "EURUSD_otc" collapse into
     // the base "EURUSD" alias, and keep "EURUSD" intact for plain inputs.
-    if (/^[A-Za-z0-9_]{3,20}$/.test(sym)) {
+    if (/^[A-Za-z0-9_]{3,20}$/.test(sym) &&
+        (/_otc$/i.test(sym) || symbolToKind(sym) || /^[A-Z]{6}$/.test(sym) || /^OTC\d+$/i.test(sym))) {
       return registerQuotexAsset({ symbol: sym, isOtc: /_otc$/i.test(sym), type: null });
     }
     return detect(raw);
   }
 
-  function get(id) {
+  function getInternal(id) {
     if (!id) return null;
     var k = String(id).toUpperCase();
     var canonical = ALIAS[k];
-    if (!canonical) return null;
-    return ASSETS.find(function (a) { return a.id === canonical; }) || null;
+    return canonical ? (BY_ID[canonical] || null) : null;
+  }
+
+  function cloneAsset(asset) {
+    if (!asset) return null;
+    var copy = Object.assign({}, asset);
+    copy.aliases = Array.isArray(asset.aliases) ? asset.aliases.slice() : [];
+    copy.timeframes = Array.isArray(asset.timeframes) ? asset.timeframes.slice() : [];
+    return copy;
+  }
+
+  function get(id) {
+    return cloneAsset(getInternal(id));
   }
 
   function detect(text) {
@@ -572,11 +689,14 @@
     // OTC asset and never let "EUR/USD" swallow "EUR/USD OTC"; when the text
     // has no OTC marker, skip OTC-only aliases so "EURUSD" never resolves to
     // "EURUSD-OTC".
-    var keys = Object.keys(ALIAS).sort(function (a, b) { return b.length - a.length; });
+    var keys = aliasKeys();
     var fallback = null;
     for (var ki = 0; ki < keys.length; ki++) {
       var k = keys[ki];
-      if (!t.includes(k)) continue;
+      // Very short ticker aliases are only trustworthy as the complete label
+      // or when the surrounding text explicitly identifies an OTC asset.
+      if (k.length <= 2 && t.trim() !== k && !wantOtc) continue;
+      if (!containsAlias(t, k)) continue;
       var keyOtc = /(OTC|\(OT\)|_OTC)/.test(k);
       if (wantOtc) {
         if (keyOtc) return get(k);
@@ -596,16 +716,23 @@
   }
 
   function list() {
-    return ASSETS.slice();
+    return ASSETS.map(cloneAsset);
   }
 
   function byKind(kind) {
-    return ASSETS.filter(function (a) { return a.kind === kind; });
+    return ASSETS.filter(function (a) { return a.kind === kind; }).map(cloneAsset);
   }
 
   function runtimeAliases() {
     return Object.assign({}, RUNTIME_ALIASES);
   }
 
-  root.CYBER_ASSETS = { list: list, get: get, detect: detect, byKind: byKind, ALIAS: ALIAS, registerQuotexAsset: registerQuotexAsset, ensureRegistered: ensureRegistered, runtimeAliases: runtimeAliases, normalizeSymbol: normalizeSymbol, inferKind: inferKind, humanAliases: humanAliases };
+  root.CYBER_ASSETS = {
+    list: list, get: get, detect: detect, byKind: byKind,
+    // Expose a diagnostic snapshot, never the mutable internal alias index.
+    ALIAS: Object.assign({}, ALIAS),
+    registerQuotexAsset: registerQuotexAsset, ensureRegistered: ensureRegistered,
+    runtimeAliases: runtimeAliases, normalizeSymbol: normalizeSymbol,
+    inferKind: inferKind, humanAliases: humanAliases,
+  };
 })(typeof self !== "undefined" ? self : globalThis);

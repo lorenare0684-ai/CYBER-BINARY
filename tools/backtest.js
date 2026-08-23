@@ -20,11 +20,11 @@ function seeded(seed) {
   };
 }
 
-function series(n, seed, regime) {
+function series(n, seed, regime, startTime) {
   const rnd = seeded(seed);
   const out = [];
   let p = 1.085;
-  let t = Date.UTC(2024, 0, 1);
+  let t = Number.isFinite(startTime) ? startTime : Date.UTC(2024, 0, 1);
   for (let i = 0; i < n; i++) {
     const trend =
       regime === "up" ? 0.00008 : regime === "down" ? -0.00008 : 0;
@@ -45,7 +45,9 @@ function run() {
     { name: "trend-up", data: series(4000, 7, "up") },
     { name: "trend-down", data: series(4000, 11, "down") },
     { name: "range", data: series(4000, 19, "flat") },
-    { name: "mixed", data: series(2000, 3, "up").concat(series(2000, 5, "down")) },
+    { name: "mixed", data: series(2000, 3, "up").concat(
+      series(2000, 5, "down", Date.UTC(2024, 0, 1) + 2000 * 60000)
+    ) },
   ];
 
   let tw = 0;

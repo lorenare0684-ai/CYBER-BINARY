@@ -14,6 +14,24 @@
 
   const ASSETS = (root.CYBER_ASSETS && root.CYBER_ASSETS) || null;
 
+  function numberValue(value) {
+    if (value == null || typeof value === "boolean" ||
+        (typeof value === "string" && !value.trim())) return null;
+    try {
+      const n = Number(value);
+      return Number.isFinite(n) ? n : null;
+    } catch (_) { return null; }
+  }
+
+  function assetSeed(value, base) {
+    const numericBase = numberValue(base);
+    let hash = ((numericBase == null ? 0 : numericBase) >>> 0) || 2166136261;
+    let text = "";
+    try { text = String(value == null ? "" : value); } catch (_) {}
+    for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 16777619) >>> 0;
+    return hash || 1;
+  }
+
   function seeded(seed) {
     let s = (seed >>> 0) || 1;
     return function () {
@@ -23,19 +41,35 @@
   }
 
   function createFeed(opts) {
-    const tf = (opts && opts.tfMs) || 60000;
-    const max = (opts && opts.max) || 600;
+    const requestedTf = numberValue(opts && opts.tfMs);
+    const requestedMax = numberValue(opts && opts.max);
+    const tf = requestedTf != null && requestedTf >= 100 && requestedTf <= 86400000
+      ? Math.floor(requestedTf) : 60000;
+    const max = requestedMax != null && requestedMax >= 2
+      ? Math.min(100000, Math.floor(requestedMax)) : 600;
     let candles = [];       // sorted CLOSED bars only (oldest → newest)
     let current = null;     // in-progress bar
     let last = null;
     const volProfile = (opts && opts.volProfile) || null;
 
+    function timestampMs(value) {
+      let n = numberValue(value);
+      if (n == null) return null;
+      while (Math.abs(n) >= 1e14) n /= 1000;
+      if (Math.abs(n) < 1e11) n *= 1000;
+      n = Math.floor(n);
+      return Number.isSafeInteger(n) && n >= 0 ? n : null;
+    }
+
     function bucket(ts) {
       return Math.floor(ts / tf) * tf;
     }
 
-    function cap() {
-      if (candles.length > max) candles = candles.slice(-max);
+    function cap(reserveCurrent) {
+      const reserve = reserveCurrent == null ? (current ? 1 : 0) : (reserveCurrent ? 1 : 0);
+      const limit = Math.max(0, max - reserve);
+      if (candles.length > limit) candles = candles.slice(-limit || candles.length);
+      if (limit === 0) candles = [];
     }
 
     function pushClosed(c) {
@@ -48,15 +82,21 @@
     }
 
     function normalizeCandle(c) {
-      if (!c || !Number.isFinite(Number(c.time))) return null;
-      const time = Number(c.time) > 1e12 ? Math.floor(Number(c.time)) : Math.floor(Number(c.time) * 1000);
-      const open = Number(c.open);
-      const close = Number(c.close);
-      if (!Number.isFinite(open) || !Number.isFinite(close)) return null;
-      let high = Number.isFinite(Number(c.high)) ? Number(c.high) : Math.max(open, close);
-      let low = Number.isFinite(Number(c.low)) ? Number(c.low) : Math.min(open, close);
-      if (high < low) { const tmp = high; high = low; low = tmp; }
-      const volume = Number.isFinite(Number(c.volume)) ? Number(c.volume) : 0;
+      if (!c || typeof c !== "object") return null;
+      const time = timestampMs(c.time);
+      const open = numberValue(c.open);
+      const close = numberValue(c.close);
+      if (!Number.isSafeInteger(time) || time < 0 || open == null || close == null ||
+          open <= 0 || close <= 0 || open > 1e15 || close > 1e15) return null;
+      const candidateHigh = numberValue(c.high);
+      const candidateLow = numberValue(c.low);
+      const rawHigh = candidateHigh == null ? Math.max(open, close) : candidateHigh;
+      const rawLow = candidateLow == null ? Math.min(open, close) : candidateLow;
+      if (rawHigh <= 0 || rawLow <= 0 || rawHigh > 1e15 || rawLow > 1e15) return null;
+      const high = Math.max(rawHigh, rawLow, open, close);
+      const low = Math.min(rawHigh, rawLow, open, close);
+      const rawVolume = numberValue(c.volume);
+      const volume = rawVolume != null && rawVolume >= 0 ? Math.min(Number.MAX_VALUE, rawVolume) : 0;
       return { time, open, high, low, close, volume };
     }
 
@@ -67,7 +107,8 @@
      * just closed so pending signals can be settled.
      */
     function mergeCandles(list) {
-      if (!Array.isArray(list) || !list.length) return { closed: null, current, last };
+      if (!Array.isArray(list) || !list.length) return { closed: null, closedBars: [], current, last };
+      const priorLatestTime = current ? current.time : (candles.length ? candles[candles.length - 1].time : null);
       const map = Object.create(null);
       for (let i = 0; i < candles.length; i++) map[candles[i].time] = candles[i];
       if (current) map[current.time] = current;
@@ -76,40 +117,47 @@
         if (n) map[n.time] = n;
       }
       const keys = Object.keys(map).map(Number).sort(function (a, b) { return a - b; });
-      if (!keys.length) return { closed: null, current, last };
+      if (!keys.length) return { closed: null, closedBars: [], current, last };
       const all = [];
       for (let i = 0; i < keys.length; i++) all.push(map[keys[i]]);
       const prevCurrentTime = current ? current.time : null;
-      candles = all.slice(0, -1);
-      cap();
+      const allClosed = all.slice(0, -1);
+      const closedBars = priorLatestTime == null ? [] : allClosed.filter((bar) => bar.time >= priorLatestTime);
+      candles = allClosed;
+      cap(true);
       current = Object.assign({}, all[all.length - 1]);
       last = current.close;
-      const closed = prevCurrentTime != null && prevCurrentTime !== current.time ? map[prevCurrentTime] : null;
-      return { closed, current, last };
+      const closed = closedBars.length ? closedBars[closedBars.length - 1]
+        : (prevCurrentTime != null && prevCurrentTime !== current.time ? map[prevCurrentTime] : null);
+      return { closed, closedBars, current, last };
     }
 
     function ingest(price, ts) {
-      if (!Number.isFinite(price) || price <= 0) return null;
+      price = numberValue(price);
+      if (price == null || price <= 0 || price > 1e15) return null;
+      const parsedTickTime = ts != null ? numberValue(ts) : Date.now();
+      const tickTime = parsedTickTime == null ? NaN : parsedTickTime;
+      if (!Number.isSafeInteger(tickTime) || tickTime < 0) return null;
+      const t = bucket(tickTime);
+      // Reject replays before updating `last`. When forceClose() has moved the
+      // live bar into `candles`, there is temporarily no `current`; a tick for
+      // that same or an older bucket must still not recreate/overwrite it.
+      const newestClosedTime = candles.length ? candles[candles.length - 1].time : null;
+      if ((current && t < current.time) || (!current && newestClosedTime != null && t <= newestClosedTime)) return null;
       last = price;
-      const t = bucket(ts || Date.now());
-      // v2.3.2: a tick whose bucket is OLDER than the in-progress bar would
-      // overwrite `current` with a bar older than the last closed bar and
-      // corrupt series ordering (unsorted input → garbage indicators).
-      // Such ticks are stale replays — drop them.
-      if (current && t < current.time) return null;
       let closed = null;
       if (!current || current.time !== t) {
         if (current) {
           pushClosed(current);
           closed = current;
         }
-        current = { time: t, open: price, high: price, low: price, close: price };
+        current = { time: t, open: price, high: price, low: price, close: price, volume: 0 };
       } else {
         current.high = Math.max(current.high, price);
         current.low = Math.min(current.low, price);
         current.close = price;
       }
-      return { closed, current, last };
+      return { closed, closedBars: closed ? [closed] : [], current, last };
     }
 
     function series() {
@@ -121,7 +169,10 @@
     function seedHistory(n, startPrice) {
       candles = [];
       current = null;
-      let p = startPrice || 1.0854;
+      const requestedCount = numberValue(n);
+      n = Math.max(0, Math.min(Math.max(0, max - 1), Math.floor(requestedCount == null ? 0 : requestedCount)));
+      const requestedStart = numberValue(startPrice);
+      let p = requestedStart != null && requestedStart > 0 && requestedStart <= 1e15 ? requestedStart : 1.0854;
       let t = bucket(Date.now()) - n * tf;
       for (let i = 0; i < n; i++) {
         const drift = (Math.sin(i / 18) + (Math.random() - 0.48)) * 0.00035;
@@ -186,12 +237,15 @@
     /** Close the current bar if it is stale (bucket older than `ts`). */
     function forceClose(ts) {
       if (!current) return null;
-      const t = bucket(ts || Date.now());
+      const parsedCloseTime = ts != null ? numberValue(ts) : Date.now();
+      const closeTime = parsedCloseTime == null ? NaN : parsedCloseTime;
+      if (!Number.isSafeInteger(closeTime) || closeTime < 0) return null;
+      const t = bucket(closeTime);
       if (current.time >= t) return null;
       const closed = current;
-      pushClosed(closed);
       current = null;
-      return { closed, current, last };
+      pushClosed(closed);
+      return { closed, closedBars: [closed], current, last };
     }
 
     /**
@@ -201,10 +255,13 @@
      * `mergeCandles` inserts the actual history.
      */
     function pruneBefore(ts) {
-      if (ts == null) return 0;
+      const parsedCutoff = numberValue(ts);
+      const cutoff = parsedCutoff == null ? NaN : parsedCutoff;
+      if (!Number.isSafeInteger(cutoff) || cutoff < 0) return 0;
       const before = candles.length;
-      candles = candles.filter((c) => c.time >= ts);
-      if (current && current.time < ts) current = null;
+      candles = candles.filter((c) => c.time >= cutoff);
+      if (current && current.time < cutoff) current = null;
+      last = current ? current.close : (candles.length ? candles[candles.length - 1].close : null);
       return before - candles.length;
     }
 
@@ -212,6 +269,7 @@
       ingest, ingestCandle, mergeCandles, series, seedHistory, setSeries,
       replaceCandles, forceClose, pruneBefore,
       lastPrice: () => last,
+      hasCurrent: () => !!current,
       reset: () => { candles = []; current = null; last = null; },
       size: () => candles.length + (current ? 1 : 0),
     };
@@ -224,12 +282,29 @@
    */
   function syntheticSeries(asset, minutes, opts) {
     const a = (ASSETS && ASSETS.get(asset)) || asset || { basePrice: 1.0, vol: 0.0001, drift: 0, jumpRate: 0.005, decimals: 5 };
-    const seed = (opts && opts.seed) || 7;
-    const regimePeriod = (opts && opts.regimePeriod) || Math.max(120, Math.floor(minutes / 6));
+    const requestedMinutes = numberValue(minutes);
+    minutes = Math.max(0, Math.min(1000000, Math.floor(requestedMinutes == null ? 0 : requestedMinutes)));
+    const requestedSeed = numberValue(opts && opts.seed);
+    const seed = assetSeed(a && a.id ? a.id : asset, requestedSeed != null ? requestedSeed : 7);
+    const requestedRegime = numberValue(opts && opts.regimePeriod);
+    const regimePeriod = requestedRegime != null && requestedRegime > 0
+      ? Math.floor(requestedRegime) : Math.max(120, Math.floor(minutes / 6));
     const rnd = seeded(seed);
     const out = [];
-    let p = a.basePrice;
-    let t = (opts && opts.startTime) || Date.UTC(2024, 0, 1, 0, 0, 0);
+    const rawBase = numberValue(a.basePrice), volatility = numberValue(a.vol);
+    const driftBase = numberValue(a.drift), jumpRate = numberValue(a.jumpRate);
+    const base = rawBase != null && rawBase > 0 ? Math.min(1e12, rawBase) : 1;
+    const safeVol = volatility != null && volatility >= 0 ? Math.min(1, volatility) : 0.0001;
+    const safeDrift = driftBase != null ? Math.max(-1, Math.min(1, driftBase)) : 0;
+    let p = base;
+    const requestedStart = opts && opts.startTime != null ? numberValue(opts.startTime) : Date.UTC(2024, 0, 1, 0, 0, 0);
+    let t = requestedStart == null ? Date.UTC(2024, 0, 1, 0, 0, 0) : requestedStart;
+    while (Math.abs(t) >= 1e14) t /= 1000;
+    if (Math.abs(t) < 1e11) t *= 1000;
+    t = Math.floor(t);
+    if (!Number.isSafeInteger(t) || t < 0 || t > Number.MAX_SAFE_INTEGER - minutes * 60000) {
+      t = Date.UTC(2024, 0, 1, 0, 0, 0);
+    }
     let regimeIdx = 0;
     let barsInRegime = 0;
     const regimeList = ["trending", "ranging", "choppy", "trending-down"];
@@ -245,17 +320,19 @@
       let trend = 0;
       let volMult = 1;
       let meanRevPull = 0;
-      if (regime === "trending") { trend = a.vol * 0.6; volMult = 1.0; }
-      else if (regime === "trending-down") { trend = -a.vol * 0.6; volMult = 1.0; }
-      else if (regime === "ranging") { meanRevPull = (a.basePrice - p) / p * 0.04; volMult = 0.6; }
-      else if (regime === "choppy") { trend = (rnd() - 0.5) * a.vol * 0.2; volMult = 1.6; }
+      const vol = safeVol;
+      if (regime === "trending") { trend = vol * 0.6; volMult = 1.0; }
+      else if (regime === "trending-down") { trend = -vol * 0.6; volMult = 1.0; }
+      else if (regime === "ranging") { meanRevPull = (base - p) / p * 0.04; volMult = 0.6; }
+      else if (regime === "choppy") { trend = (rnd() - 0.5) * vol * 0.2; volMult = 1.6; }
 
-      const shock = (rnd() - 0.5) * 2 * a.vol * volMult;
-      const jump = rnd() < (a.jumpRate || 0) ? (rnd() - 0.5) * a.vol * 8 : 0;
-      const drift = (a.drift || 0) + trend + meanRevPull;
-      const next = Math.max(0.01, p * (1 + drift + shock + jump));
+      const shock = (rnd() - 0.5) * 2 * vol * volMult;
+      const jump = rnd() < (jumpRate != null ? Math.max(0, Math.min(1, jumpRate)) : 0) ? (rnd() - 0.5) * vol * 8 : 0;
+      const drift = safeDrift + trend + meanRevPull;
+      const rawNext = p * (1 + drift + shock + jump);
+      const next = Number.isFinite(rawNext) ? Math.max(0.01, Math.min(1e15, rawNext)) : p;
 
-      const range = Math.abs(next - p) + a.vol * p * 0.5;
+      const range = Math.abs(next - p) + safeVol * p * 0.5;
       const h = Math.max(p, next) + rnd() * range * 0.4;
       const l = Math.min(p, next) - rnd() * range * 0.4;
       out.push({
@@ -264,6 +341,7 @@
         high: h,
         low: Math.max(0.01, l),
         close: next,
+        volume: Math.max(1, Math.round(100 + rnd() * 900 + Math.abs(jump) * 100000)),
         regime,
       });
       p = next;
@@ -278,5 +356,5 @@
     return Math.max(0.2, price + dir * step);
   }
 
-  root.CYBER_FEED = { createFeed, syntheticSeries, demoTick, seeded };
+  root.CYBER_FEED = { createFeed, syntheticSeries, demoTick, seeded, assetSeed };
 })(typeof self !== "undefined" ? self : globalThis);

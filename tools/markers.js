@@ -71,8 +71,25 @@ function storeTests() {
 
   // invalid inputs rejected
   check("NaN time rejected", store.add({ asset: "A", time: NaN, price: 1, dir: "CALL" }) === false);
+  check("unsafe time rejected", store.add({ asset: "A", time: Number.MAX_VALUE, price: 1, dir: "CALL" }) === false);
+  check("missing asset rejected", store.add({ time: t, price: 1, dir: "CALL" }) === false);
   check("missing dir rejected", store.add({ asset: "A", time: t, price: 1 }) === false);
   check("non-finite price rejected", store.add({ asset: "A", time: t, price: Infinity, dir: "PUT" }) === false);
+  let symbolSafe = true;
+  try {
+    symbolSafe = store.add({ asset: "A", time: Symbol("time"), price: 1, dir: "CALL" }) === false &&
+      store.add({ asset: "A", time: t, price: Symbol("price"), dir: "CALL" }) === false &&
+      M.toNative([{ time: Symbol("time"), dir: "CALL" }]).length === 0;
+  } catch (_) { symbolSafe = false; }
+  check("symbol-valued marker fields fail closed without throwing", symbolSafe);
+  const isolated = store.list("EURUSD_otc");
+  isolated[0].price = 999;
+  isolated[0].time = 1;
+  check("list results cannot mutate stored marker anchors",
+    store.list("EURUSD_otc")[0].price === 1.0854 && store.list("EURUSD_otc")[0].time === t);
+  const fractionalBudget = M.createStore({ max: 0.5 });
+  check("fractional marker budget cannot truncate every marker",
+    fractionalBudget.add({ asset: "A", time: t, price: 1, dir: "CALL" }) && fractionalBudget.count() === 1);
 
   // history seeding
   const store2 = M.createStore({});
@@ -98,6 +115,9 @@ function storeTests() {
   check("toNative sorts ascending", native[0].time < native[1].time);
   const capped = M.toNative(Array.from({ length: 10 }, (_, i) => ({ time: t + i * 60000, price: 1, dir: i % 2 ? "PUT" : "CALL" })), { cap: 3 });
   check("toNative caps list", capped.length === 3 && capped[0].time === Math.floor((t + 7 * 60000) / 1000), JSON.stringify(capped));
+  const micro = M.toNative([{ time: t * 1000, price: 1, dir: "CALL" }]);
+  check("toNative normalizes microsecond timestamps", micro.length === 1 && micro[0].time === Math.floor(t / 1000));
+  check("fractional native cap falls back safely", M.toNative([{ time: t, dir: "CALL" }], { cap: 0.5 }).length === 1);
 }
 
 // ---------- Part 3: page-hook rendering ----------
@@ -207,7 +227,7 @@ function hookTests() {
   check("chart captured via LightweightCharts trap", HK.hasChart());
 
   // 2) markers message from content → native render (chartB.setMarkers throws → overlay)
-  msgListener({ data: { source: "CYBER_BINARY_CONTENT", kind: "markers", payload: { asset: "EURUSD_otc", markers: [{ time: t0, price: 1.085, dir: "CALL" }], bars: [] } } });
+  msgListener({ source: sandbox.window, data: { source: "CYBER_BINARY_CONTENT", kind: "markers", payload: { asset: "EURUSD_otc", markers: [{ time: t0, price: 1.085, dir: "CALL" }], bars: [] } } });
   check("setMarkers failure falls back to overlay mode", HK.mode() === "overlay", HK.mode());
   check("overlay canvas element created", created.some((el) => el.tagName === "canvas"));
 
@@ -253,6 +273,7 @@ function hookTests() {
     check("fiber scan discovers chart + series", hk.hasChart());
     // send markers through the content protocol
     msgListener2({
+      source: sandbox2.window,
       data: { source: "CYBER_BINARY_CONTENT", kind: "markers", payload: {
         asset: "EURUSD_otc",
         markers: [
@@ -271,6 +292,7 @@ function hookTests() {
     // re-send same payload → same normalized list (idempotent, never repaints)
     const before = JSON.stringify(last);
     msgListener2({
+      source: sandbox2.window,
       data: { source: "CYBER_BINARY_CONTENT", kind: "markers", payload: {
         asset: "EURUSD_otc",
         markers: [

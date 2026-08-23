@@ -135,6 +135,13 @@ h2 {
 .hero[data-dir="WAIT"] .dir { color: var(--muted); }
 
 .reason { margin-top: 6px; color: var(--muted); font-size: 12px; }
+.signal-timing {
+  margin-top: 8px;
+  color: #b9c8e6;
+  font-size: 10px;
+  line-height: 1.55;
+  font-variant-numeric: tabular-nums;
+}
 .asset-row {
   margin-top: 12px;
   display: flex;

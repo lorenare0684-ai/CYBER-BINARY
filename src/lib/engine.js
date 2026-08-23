@@ -39,24 +39,90 @@
     hurst: 1, williams: 1, cci: 1, donchianBreak: 2,
   };
 
+  function numberValue(value) {
+    if (value == null || typeof value === "boolean" ||
+        (typeof value === "string" && !value.trim())) return null;
+    try {
+      const n = Number(value);
+      return Number.isFinite(n) ? n : null;
+    } catch (_) { return null; }
+  }
+
   function extract(candles) {
     const o = [], h = [], l = [], c = [], t = [];
     for (let i = 0; i < candles.length; i++) {
       const x = candles[i];
-      o.push(x.open); h.push(x.high); l.push(x.low); c.push(x.close); t.push(x.time);
+      o.push(numberValue(x.open)); h.push(numberValue(x.high)); l.push(numberValue(x.low)); c.push(numberValue(x.close)); t.push(numberValue(x.time));
     }
     return { o, h, l, c, t };
   }
 
-  function resolveStrategy(opts) {
-    let params = Object.assign({}, DEFAULTS);
-    let weights = Object.assign({}, DEFAULT_WEIGHTS);
-    if (opts && opts.strategy && STRAT && STRAT[opts.strategy]) {
-      params = Object.assign(params, STRAT[opts.strategy].params);
-      weights = Object.assign(weights, STRAT[opts.strategy].weights || {});
+  const PARAM_LIMITS = {
+    rsiPeriod: [2, 500, 1], rsiBuy: [0, 100, 0], rsiSell: [0, 100, 0],
+    emaFast: [1, 500, 1], emaSlow: [2, 500, 1],
+    macdFast: [1, 500, 1], macdSlow: [2, 500, 1], macdSignal: [1, 500, 1],
+    stochK: [1, 500, 1], stochD: [1, 500, 1], stochOs: [0, 100, 0], stochOb: [0, 100, 0],
+    bbPeriod: [2, 500, 1], bbMult: [0.01, 100, 0], atrPeriod: [1, 500, 1],
+    minAtrPct: [0, 1, 0], minScore: [0, 1000, 0], lookback: [0, 100, 1],
+    adxPeriod: [1, 500, 1], adxMin: [0, 100, 0], superPeriod: [1, 500, 1],
+    superMult: [0.01, 100, 0], psarStep: [0.000001, 1, 0], psarMax: [0.000001, 1, 0],
+    hurstPeriod: [4, 2000, 1], momPeriod: [1, 2000, 1],
+    mtfFast: [1, 1440, 1], mtfMid: [1, 1440, 1], minBars: [40, 2000, 1],
+  };
+
+  function hasOwn(object, key) {
+    return !!object && Object.prototype.hasOwnProperty.call(object, key);
+  }
+
+  function applyParams(target, source) {
+    if (!source || typeof source !== "object") return;
+    for (const key of Object.keys(PARAM_LIMITS)) {
+      if (!hasOwn(source, key)) continue;
+      const value = numberValue(source[key]);
+      if (value == null) continue;
+      const limit = PARAM_LIMITS[key];
+      const bounded = Math.max(limit[0], Math.min(limit[1], value));
+      target[key] = limit[2] ? Math.floor(bounded) : bounded;
     }
-    if (opts && opts.params) params = Object.assign(params, opts.params);
-    if (opts && opts.weights) weights = Object.assign(weights, opts.weights);
+    if (hasOwn(source, "lean") && typeof source.lean === "boolean") target.lean = source.lean;
+  }
+
+  function applyWeights(target, source) {
+    if (!source || typeof source !== "object") return;
+    for (const key of Object.keys(DEFAULT_WEIGHTS)) {
+      if (!hasOwn(source, key)) continue;
+      const value = numberValue(source[key]);
+      if (value != null) target[key] = Math.max(0, Math.min(100, value));
+    }
+  }
+
+  function resolveStrategy(opts) {
+    const params = Object.assign({}, DEFAULTS);
+    const weights = Object.assign({}, DEFAULT_WEIGHTS);
+    const strategyId = opts && typeof opts.strategy === "string" ? opts.strategy : "";
+    const preset = STRAT && hasOwn(STRAT, strategyId) ? STRAT[strategyId] : null;
+    if (preset) {
+      applyParams(params, preset.params);
+      applyWeights(weights, preset.weights);
+    }
+    // Support both the documented nested overrides and the historic top-level
+    // grid-search form, while ignoring unknown/prototype properties.
+    applyParams(params, opts);
+    applyParams(params, opts && opts.params);
+    applyWeights(weights, opts && opts.weights);
+    if (params.rsiBuy > params.rsiSell) {
+      params.rsiBuy = DEFAULTS.rsiBuy; params.rsiSell = DEFAULTS.rsiSell;
+    }
+    if (params.stochOs > params.stochOb) {
+      params.stochOs = DEFAULTS.stochOs; params.stochOb = DEFAULTS.stochOb;
+    }
+    if (params.emaFast >= params.emaSlow) {
+      params.emaFast = DEFAULTS.emaFast; params.emaSlow = DEFAULTS.emaSlow;
+    }
+    if (params.macdFast >= params.macdSlow) {
+      params.macdFast = DEFAULTS.macdFast; params.macdSlow = DEFAULTS.macdSlow;
+    }
+    if (params.psarMax < params.psarStep) params.psarMax = params.psarStep;
     return { params, weights };
   }
 
@@ -80,7 +146,7 @@
 
   function analyze(candles, opts) {
     const { params: cfg, weights } = resolveStrategy(opts);
-    if (!candles || candles.length < 40) {
+    if (!Array.isArray(candles) || candles.length < 40) {
       return { ready: false, reason: "Need at least 40 candles", votes: [], regime: "unknown" };
     }
     // We only need a tail of the series for the indicators to be valid.
@@ -90,6 +156,23 @@
     const minNeeded = Math.max(40, cfg.hurstPeriod + 50, cfg.stochK * 4, cfg.adxPeriod * 2, fallback);
     const startIdx = Math.max(0, candles.length - minNeeded);
     const window = candles.slice(startIdx);
+    const hasInputTimes = window.some((bar) => bar && bar.time != null);
+    let priorInputTime = null;
+    for (let wi = 0; wi < window.length; wi++) {
+      const bar = window[wi] || {};
+      const open = numberValue(bar.open), high = numberValue(bar.high);
+      const low = numberValue(bar.low), close = numberValue(bar.close);
+      const suppliedTime = bar.time == null ? null : numberValue(bar.time);
+      if (open == null || high == null || low == null || close == null ||
+          open <= 0 || high <= 0 || low <= 0 || close <= 0 ||
+          high < Math.max(open, low, close) || low > Math.min(open, high, close) ||
+          (hasInputTimes && bar.time == null) ||
+          (bar.time != null && (suppliedTime == null || suppliedTime < 0 ||
+            (priorInputTime != null && suppliedTime <= priorInputTime)))) {
+        return { ready: false, reason: "Invalid candle data", votes: [], regime: "unknown" };
+      }
+      if (suppliedTime != null) priorInputTime = suppliedTime;
+    }
     const { h, l, c } = extract(window);
     const i = c.length - 1;
     const prev = i - 1;
@@ -121,7 +204,7 @@
       bb.mid[i], atr[i], adxR.adx[i], psar[i], superR.st[i],
     ];
     if (!lean) need.push(donch && donch.upper[i], williams && williams[i], cci && cci[i]);
-    if (need.some((v) => v == null)) {
+    if (need.some((v) => v == null || numberValue(v) == null)) {
       return { ready: false, reason: "Warming indicators", votes: [], regime: "unknown" };
     }
 
@@ -137,6 +220,7 @@
           bbUpper: bb.upper[i], bbLower: bb.lower[i], atr: atr[i], adx: adxR.adx[i],
           plusDI: adxR.plus[i], minusDI: adxR.minus[i], supertrend: superR.st[i],
           superTrend: superR.trend[i], psar: psar[i], mtfBias: 0, mtfChecked: 0,
+          callScore: 0, putScore: 0, requiredScore: numberValue(cfg.minScore) || DEFAULTS.minScore,
         },
       };
     }
@@ -180,7 +264,10 @@
     else if (c[i] < emaS[i] && emaF[i] < emaS[i]) votes.push({ name: "EMA trend", dir: "PUT", w: weights.emaTrend });
 
     // Fresh EMA cross
-    for (let k = 0; k < cfg.lookback; k++) {
+    const rawLookback = numberValue(cfg.lookback);
+    const safeLookback = rawLookback != null
+      ? Math.max(0, Math.min(100, Math.floor(rawLookback))) : DEFAULTS.lookback;
+    for (let k = 0; k < safeLookback; k++) {
       const a = i - k, b = a - 1;
       if (b < 0 || emaF[a] == null || emaS[a] == null) continue;
       if (emaF[b] <= emaS[b] && emaF[a] > emaS[a]) {
@@ -271,23 +358,31 @@
         votes.push({ name: "Donch↓", dir: "PUT", w: weights.donchianBreak });
     }
 
+    // Disabled/invalid strategy weights must not appear as reasons or poison
+    // totals with NaN/negative values.
+    for (let vi = votes.length - 1; vi >= 0; vi--) {
+      const weight = numberValue(votes[vi].w);
+      if (weight == null || weight <= 0) votes.splice(vi, 1);
+      else votes[vi].w = weight;
+    }
     let call = 0, put = 0;
     for (const v of votes) {
       if (v.dir === "CALL") call += v.w;
-      else put += v.w;
+      else if (v.dir === "PUT") put += v.w;
     }
 
-    // Regime veto: in mean-reverting markets, refuse trend votes; in trending, allow them.
     const regime = detectRegime(i, rsi, emaF, emaS, adxR.adx, atr, c, hurst);
-    if (regime === "choppy" && cfg.minScore >= 4) {
-      // require higher confidence in chop
-    }
+    const rawMinScore = numberValue(cfg.minScore);
+    const baseMinScore = rawMinScore != null ? Math.max(0, rawMinScore) : DEFAULTS.minScore;
+    // Choppy conditions need two additional independent weight points. The
+    // old block documented this veto but did nothing.
+    const requiredScore = baseMinScore + (regime === "choppy" ? 2 : 0);
 
     let direction = "WAIT";
     let score = 0;
-    if (call >= cfg.minScore && call > put + 1) {
+    if (call >= requiredScore && call > put + 1) {
       direction = "CALL"; score = call;
-    } else if (put >= cfg.minScore && put > call + 1) {
+    } else if (put >= requiredScore && put > call + 1) {
       direction = "PUT"; score = put;
     }
 
@@ -338,8 +433,153 @@
         hurst: hurst ? hurst[i] : null,
         mtfBias,
         mtfChecked,
+        callScore: call,
+        putScore: put,
+        requiredScore,
       },
     };
+  }
+
+  function createEmaTracker(period) {
+    const rawPeriod = numberValue(period);
+    const p = Math.max(1, Math.floor(rawPeriod == null ? 1 : rawPeriod));
+    return { period: p, count: 0, sum: 0, value: null, k: 2 / (p + 1) };
+  }
+
+  function previewEma(tracker, value) {
+    if (tracker.count + 1 < tracker.period) return null;
+    if (tracker.count + 1 === tracker.period) return (tracker.sum + value) / tracker.period;
+    return value * tracker.k + tracker.value * (1 - tracker.k);
+  }
+
+  function commitEma(tracker, value) {
+    if (tracker.count < tracker.period) {
+      tracker.sum += value;
+      tracker.count++;
+      if (tracker.count === tracker.period) tracker.value = tracker.sum / tracker.period;
+    } else {
+      tracker.count++;
+      tracker.value = value * tracker.k + tracker.value * (1 - tracker.k);
+    }
+  }
+
+  // Exact no-lookahead EMA trend of the currently forming higher-timeframe
+  // candle. Completed groups are committed once; each 1m close previews the
+  // current group's close without leaking its future final value.
+  function mtfTrendSeries(candles, closes, minutes) {
+    const out = new Array(closes.length).fill(null);
+    const fast = createEmaTracker(8), slow = createEmaTracker(21);
+    const rawMinutes = numberValue(minutes);
+    const ms = Math.max(1, Math.floor(rawMinutes == null ? 1 : rawMinutes)) * 60000;
+    let bucket = null, priorClose = null, completed = 0;
+    for (let i = 0; i < closes.length; i++) {
+      let time = numberValue(candles[i] && candles[i].time);
+      if (time == null) time = i * 60000;
+      else {
+        while (Math.abs(time) >= 1e14) time /= 1000;
+        if (Math.abs(time) < 1e11) time *= 1000;
+      }
+      const nextBucket = Math.floor(time / ms);
+      if (bucket != null && nextBucket !== bucket && priorClose != null) {
+        commitEma(fast, priorClose);
+        commitEma(slow, priorClose);
+        completed++;
+      }
+      bucket = nextBucket;
+      priorClose = closes[i];
+      const ef = previewEma(fast, closes[i]);
+      const es = previewEma(slow, closes[i]);
+      if (completed + 1 >= 30 && ef != null && es != null) {
+        out[i] = closes[i] > ef && ef > es ? 1 : (closes[i] < ef && ef < es ? -1 : 0);
+      }
+    }
+    return out;
+  }
+
+  function prepareLeanSeries(candles, cfg) {
+    const { h, l, c } = extract(candles);
+    return {
+      h, l, c,
+      rsi: TA.rsi(c, cfg.rsiPeriod),
+      emaF: TA.ema(c, cfg.emaFast),
+      emaS: TA.ema(c, cfg.emaSlow),
+      macd: TA.macd(c, cfg.macdFast, cfg.macdSlow, cfg.macdSignal),
+      st: TA.stochastic(h, l, c, cfg.stochK, cfg.stochD),
+      bb: TA.bollinger(c, cfg.bbPeriod, cfg.bbMult),
+      atr: TA.atr(h, l, c, cfg.atrPeriod),
+      adxR: TA.adx(h, l, c, cfg.adxPeriod),
+      psar: TA.psar(h, l, { step: cfg.psarStep, max: cfg.psarMax }),
+      superR: TA.supertrend(h, l, c, cfg.superPeriod, cfg.superMult),
+      mtfFast: mtfTrendSeries(candles, c, cfg.mtfFast),
+      mtfMid: mtfTrendSeries(candles, c, cfg.mtfMid),
+    };
+  }
+
+  function evaluateLeanAt(p, i, cfg, weights) {
+    const prev = i - 1;
+    const need = [p.rsi[i], p.emaF[i], p.emaS[i], p.macd.hist[i], p.st.k[i], p.st.d[i],
+      p.bb.mid[i], p.atr[i], p.adxR.adx[i], p.psar[i], p.superR.st[i]];
+    if (need.some((v) => v == null || numberValue(v) == null) || !Number.isFinite(p.c[i]) || p.c[i] <= 0) {
+      return { ready: false, direction: "WAIT", confidence: 0, score: 0, regime: "unknown" };
+    }
+    const regime = detectRegime(i, p.rsi, p.emaF, p.emaS, p.adxR.adx, p.atr, p.c, null);
+    if (p.atr[i] / p.c[i] < cfg.minAtrPct) {
+      return { ready: true, direction: "WAIT", confidence: 0, score: 0, regime };
+    }
+    const votes = [];
+    if (p.c[i] > p.emaS[i] && p.emaF[i] > p.emaS[i]) votes.push({ dir: "CALL", w: weights.emaTrend });
+    else if (p.c[i] < p.emaS[i] && p.emaF[i] < p.emaS[i]) votes.push({ dir: "PUT", w: weights.emaTrend });
+    const rawLookback = numberValue(cfg.lookback);
+    const lookback = Math.max(0, Math.min(100, Math.floor(rawLookback == null ? 0 : rawLookback)));
+    for (let k = 0; k < lookback; k++) {
+      const a = i - k, b = a - 1;
+      if (b < 0 || p.emaF[a] == null || p.emaS[a] == null) continue;
+      if (p.emaF[b] <= p.emaS[b] && p.emaF[a] > p.emaS[a]) { votes.push({ dir: "CALL", w: weights.emaCross }); break; }
+      if (p.emaF[b] >= p.emaS[b] && p.emaF[a] < p.emaS[a]) { votes.push({ dir: "PUT", w: weights.emaCross }); break; }
+    }
+    if (p.rsi[i] < cfg.rsiBuy && p.rsi[i] > 22 && p.c[i] > p.emaS[i]) votes.push({ dir: "CALL", w: weights.rsiPull });
+    if (p.rsi[i] > cfg.rsiSell && p.rsi[i] < 78 && p.c[i] < p.emaS[i]) votes.push({ dir: "PUT", w: weights.rsiPull });
+    if (prev >= 0 && p.macd.hist[prev] != null) {
+      if (p.macd.hist[i] > 0 && p.macd.hist[i] > p.macd.hist[prev]) votes.push({ dir: "CALL", w: weights.macd });
+      if (p.macd.hist[i] < 0 && p.macd.hist[i] < p.macd.hist[prev]) votes.push({ dir: "PUT", w: weights.macd });
+    }
+    if (prev >= 0 && p.st.k[prev] != null && p.st.d[prev] != null) {
+      if (p.st.k[prev] < cfg.stochOs && p.st.k[i] > p.st.d[i] && p.st.k[i] < 50) votes.push({ dir: "CALL", w: weights.stoch });
+      if (p.st.k[prev] > cfg.stochOb && p.st.k[i] < p.st.d[i] && p.st.k[i] > 50) votes.push({ dir: "PUT", w: weights.stoch });
+    }
+    if (p.c[i] <= p.bb.lower[i] && p.c[i] > p.emaS[i]) votes.push({ dir: "CALL", w: weights.bb });
+    if (p.c[i] >= p.bb.upper[i] && p.c[i] < p.emaS[i]) votes.push({ dir: "PUT", w: weights.bb });
+    if (p.adxR.adx[i] >= cfg.adxMin) {
+      if (p.adxR.plus[i] > p.adxR.minus[i] && p.c[i] > p.emaS[i]) votes.push({ dir: "CALL", w: weights.adxTrend });
+      if (p.adxR.minus[i] > p.adxR.plus[i] && p.c[i] < p.emaS[i]) votes.push({ dir: "PUT", w: weights.adxTrend });
+    }
+    if (p.superR.trend[i] === 1) votes.push({ dir: "CALL", w: weights.supertrend });
+    else if (p.superR.trend[i] === -1) votes.push({ dir: "PUT", w: weights.supertrend });
+    if (p.c[i] > p.psar[i]) votes.push({ dir: "CALL", w: weights.psar });
+    else votes.push({ dir: "PUT", w: weights.psar });
+    let mtfBias = 0, mtfChecked = 0;
+    if (p.mtfFast[i] != null) { mtfBias += p.mtfFast[i]; mtfChecked++; }
+    if (p.mtfMid[i] != null) { mtfBias += p.mtfMid[i]; mtfChecked++; }
+    if (mtfChecked && mtfBias > 0) votes.push({ dir: "CALL", w: weights.mtfAlign });
+    else if (mtfChecked && mtfBias < 0) votes.push({ dir: "PUT", w: weights.mtfAlign });
+    let call = 0, put = 0;
+    for (const vote of votes) {
+      const weight = numberValue(vote.w);
+      if (weight == null || weight <= 0) continue;
+      if (vote.dir === "CALL") call += weight; else put += weight;
+    }
+    const rawMin = numberValue(cfg.minScore);
+    const baseMin = rawMin != null ? Math.max(0, rawMin) : DEFAULTS.minScore;
+    const required = baseMin + (regime === "choppy" ? 2 : 0);
+    let direction = "WAIT", score = 0;
+    if (call >= required && call > put + 1) { direction = "CALL"; score = call; }
+    else if (put >= required && put > call + 1) { direction = "PUT"; score = put; }
+    let confidence = 0;
+    if (direction !== "WAIT") {
+      const probs = TA.softmaxProbs(call, put);
+      confidence = Math.max(1, Math.min(99, Math.round((direction === "CALL" ? probs.call : probs.put) * 100)));
+    }
+    return { ready: true, direction, confidence, score, regime };
   }
 
   /**
@@ -347,42 +587,88 @@
    * + per-regime breakdown + equity curve.
    */
   function backtest(candles, opts) {
-    const cfg = Object.assign(
-      {},
-      DEFAULTS,
-      opts && opts.strategy && STRAT ? STRAT[opts.strategy].params : {},
-      opts || {}
-    );
-    const horizon = cfg.horizon || 3;
-    const minConf = cfg.minConf || 0;
-    const warmup = cfg.warmup || 50;
-    // Each iteration only needs the last ~minBars bars. Maintain a rolling
-    // window of `minBars` bars to avoid re-slicing the full series every step.
-    const minBars = cfg.minBars || 200;
-    const tailLen = Math.max(minBars, warmup + 1);
+    const empty = {
+      wins: 0, losses: 0, draws: 0, total: 0, decisions: 0, winrate: 0, payoff: 0,
+      pnl: 0, maxDrawdown: 0, maxWinStreak: 0, maxLossStreak: 0,
+      byRegime: {}, calibration: [], equity: [], trades: [],
+    };
+    if (!Array.isArray(candles) || candles.length < 40) return empty;
+    for (let i = 0; i < candles.length; i++) {
+      const b = candles[i] || {};
+      const values = [numberValue(b.open), numberValue(b.high), numberValue(b.low), numberValue(b.close)];
+      if (values.some((value) => value == null || value <= 0) ||
+          values[1] < Math.max(values[0], values[2], values[3]) ||
+          values[2] > Math.min(values[0], values[1], values[3])) return empty;
+    }
+    const resolved = resolveStrategy(opts);
+    const cfg = Object.assign({}, resolved.params);
+    const rawHorizon = hasOwn(opts, "horizon") ? numberValue(opts.horizon) : null;
+    const horizon = rawHorizon != null ? Math.max(1, Math.min(1440, Math.floor(rawHorizon))) : 3;
+    const rawMinConf = hasOwn(opts, "minConf") ? numberValue(opts.minConf) : null;
+    const minConf = rawMinConf != null ? Math.max(0, Math.min(100, rawMinConf)) : 0;
+    const rawWarmup = hasOwn(opts, "warmup") ? numberValue(opts.warmup) : null;
+    const warmup = rawWarmup != null ? Math.max(40, Math.min(candles.length - 1, Math.floor(rawWarmup))) : 50;
+    const lean = !(opts && opts.lean === false);
+    const prepared = lean ? prepareLeanSeries(candles, cfg) : null;
+    const rawMinBars = numberValue(cfg.minBars);
+    const nonLeanTail = Math.max(200, Math.min(2000, Math.floor(rawMinBars == null ? 200 : rawMinBars)));
+    const reducedTime = (value) => {
+      let n = numberValue(value);
+      if (n == null) return null;
+      while (Math.abs(n) >= 1e14) n /= 1000;
+      return n;
+    };
+    const firstRawTime = reducedTime(candles[0].time);
+    const secondRawTime = candles.length > 1 ? reducedTime(candles[1].time) : null;
+    const rawSpacing = firstRawTime != null && secondRawTime != null ? Math.abs(secondRawTime - firstRawTime) : 0;
+    const timeScale = firstRawTime != null && Math.abs(firstRawTime) >= 1e11 ? 1
+      : (firstRawTime != null && Math.abs(firstRawTime) >= 1e9 ? 1000 : (rawSpacing >= 1000 ? 1 : 1000));
+    const candleTimeMs = (value) => {
+      const n = reducedTime(value);
+      const ms = n == null ? NaN : Math.floor(n * timeScale);
+      return Number.isSafeInteger(ms) && ms >= 0 ? ms : null;
+    };
+    let priorTime = null;
+    for (let i = 0; i < candles.length; i++) {
+      const normalizedTime = candleTimeMs(candles[i].time);
+      if (normalizedTime == null || (priorTime != null && normalizedTime <= priorTime)) return empty;
+      priorTime = normalizedTime;
+    }
+    const firstTime = candleTimeMs(candles[0].time);
+    const secondTime = candles.length > 1 ? candleTimeMs(candles[1].time) : null;
+    const rawTf = firstTime != null && secondTime != null ? secondTime - firstTime : 60000;
+    const tfMs = Number.isFinite(rawTf) && rawTf > 0 ? Math.min(86400000, rawTf) : 60000;
 
-    let wins = 0, losses = 0;
+    let wins = 0, losses = 0, draws = 0;
     const trades = [];
     const equity = [];
     let pnl = 0;
 
     for (let i = warmup; i < candles.length - horizon; i++) {
-      const from = Math.max(0, i + 1 - tailLen);
-      const slice = candles.slice(from, i + 1);
-      const sig = analyze(slice, Object.assign({}, opts, { minBars: tailLen, lean: opts && opts.lean }));
+      const sig = prepared
+        ? evaluateLeanAt(prepared, i, cfg, resolved.weights)
+        : analyze(candles.slice(Math.max(0, i + 1 - nonLeanTail), i + 1), Object.assign({}, opts, { lean: false }));
       if (!sig.ready || sig.direction === "WAIT") continue;
       if (sig.confidence < minConf) continue;
-      const entry = candles[i].close;
-      const exit = candles[i + horizon].close;
-      const won =
-        (sig.direction === "CALL" && exit > entry) ||
-        (sig.direction === "PUT" && exit < entry);
-      if (won) wins++; else losses++;
-      pnl += won ? 1 : -1;
+      // Validation accepts broker numeric strings, so lifecycle comparisons and
+      // exported prices must use their numeric values. Strictly comparing raw
+      // strings (for example "1.0" vs "1.00") fabricated a loss instead of a draw.
+      const entry = numberValue(candles[i].close);
+      const exit = numberValue(candles[i + horizon].close);
+      const draw = exit === entry;
+      const won = !draw &&
+        ((sig.direction === "CALL" && exit > entry) ||
+        (sig.direction === "PUT" && exit < entry));
+      if (draw) draws++; else if (won) wins++; else losses++;
+      const tradePnl = draw ? 0 : (won ? 1 : -1);
+      pnl += tradePnl;
       trades.push({
         i, dir: sig.direction, score: sig.score, confidence: sig.confidence,
-        regime: sig.regime, won, entry, exit,
-        pnl: won ? 1 : -1,
+        regime: sig.regime, won, draw, entry, exit,
+        entryTime: candleTimeMs(candles[i].time) != null ? candleTimeMs(candles[i].time) + tfMs : null,
+        expiryTime: candleTimeMs(candles[i + horizon].time) != null ? candleTimeMs(candles[i + horizon].time) + tfMs : null,
+        exitTime: candleTimeMs(candles[i + horizon].time) != null ? candleTimeMs(candles[i + horizon].time) + tfMs : null,
+        pnl: tradePnl,
       });
       equity.push({ i, pnl, equity: pnl });
     }
@@ -395,19 +681,23 @@
     const byRegime = {};
     for (const t of trades) {
       const r = t.regime || "unknown";
-      if (!byRegime[r]) byRegime[r] = { wins: 0, losses: 0 };
-      if (t.won) byRegime[r].wins++; else byRegime[r].losses++;
+      if (!byRegime[r]) byRegime[r] = { wins: 0, losses: 0, draws: 0 };
+      if (t.draw) byRegime[r].draws++;
+      else if (t.won) byRegime[r].wins++;
+      else byRegime[r].losses++;
     }
     for (const r of Object.keys(byRegime)) {
-      const t = byRegime[r].wins + byRegime[r].losses;
-      byRegime[r].total = t;
-      byRegime[r].winrate = t ? (byRegime[r].wins / t) * 100 : 0;
+      const resolved = byRegime[r].wins + byRegime[r].losses;
+      byRegime[r].total = resolved + byRegime[r].draws;
+      byRegime[r].winrate = resolved ? (byRegime[r].wins / resolved) * 100 : 0;
     }
 
     // Streaks
     let maxWinStreak = 0, maxLossStreak = 0, curW = 0, curL = 0;
     for (const t of trades) {
-      if (t.won) { curW++; curL = 0; } else { curL++; curW = 0; }
+      if (t.draw) { curW = 0; curL = 0; }
+      else if (t.won) { curW++; curL = 0; }
+      else { curL++; curW = 0; }
       if (curW > maxWinStreak) maxWinStreak = curW;
       if (curL > maxLossStreak) maxLossStreak = curL;
     }
@@ -423,7 +713,10 @@
     // Confidence calibration: bucket by confidence
     const calibBuckets = {};
     for (const t of trades) {
-      const b = Math.min(90, Math.floor(t.confidence / 10) * 10);
+      if (t.draw) continue;
+      const rawConfidence = numberValue(t.confidence);
+      const conf = rawConfidence != null ? Math.max(0, Math.min(100, rawConfidence)) : 0;
+      const b = Math.min(90, Math.floor(conf / 10) * 10);
       if (!calibBuckets[b]) calibBuckets[b] = { wins: 0, losses: 0 };
       if (t.won) calibBuckets[b].wins++; else calibBuckets[b].losses++;
     }
@@ -441,7 +734,7 @@
     }
 
     return {
-      wins, losses, total, winrate, payoff,
+      wins, losses, draws, total, decisions: total + draws, winrate, payoff,
       pnl, maxDrawdown: maxDD, maxWinStreak, maxLossStreak,
       byRegime, calibration, equity, trades,
     };
@@ -452,9 +745,16 @@
    * evaluate on second. Helps detect overfitting.
    */
   function walkForward(candles, opts) {
-    const folds = (opts && opts.folds) || 5;
-    const total = candles.length;
-    if (total < 200) return { error: "need at least 200 candles" };
+    const total = Array.isArray(candles) ? candles.length : 0;
+    // Each fold is split in half and backtest needs a warmup plus an expiry
+    // horizon. Folds below 200 bars produced two <=50-bar halves and silently
+    // returned all-zero "validation" results.
+    if (total < 400) return { error: "need at least 400 candles" };
+    const requestedFolds = numberValue(opts && opts.folds);
+    const maxUsefulFolds = Math.max(2, Math.min(20, Math.floor(total / 200)));
+    const folds = requestedFolds != null
+      ? Math.max(2, Math.min(maxUsefulFolds, Math.floor(requestedFolds)))
+      : Math.min(5, maxUsefulFolds);
     const foldSize = Math.floor(total / folds);
     const out = [];
     for (let f = 0; f < folds; f++) {

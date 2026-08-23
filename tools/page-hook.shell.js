@@ -21,6 +21,7 @@
  *     node tools/build-hook.js
  */
 (function () {
+  try { if (window.top && window.top !== window.self) return; } catch (_) { return; }
   if (window.__CYBER_WS_HOOK__) return;
   window.__CYBER_WS_HOOK__ = true;
 
@@ -38,16 +39,27 @@
   }
 
   var live = {
-    candles: {},      // asset@period -> latest candles array
-    ticks: {},        // asset -> last tick { price, time }
+    candles: Object.create(null), // asset@period -> latest candles array
+    ticks: Object.create(null),   // asset -> last tick { price, time }
     instruments: [],  // broker-discovered instruments
     balance: null,
     orders: [],       // rolling list of recent orders (last 50)
     status: { state: "idle", url: null },
     assetIdMap: {},   // broker numeric id -> symbol
-    lastWsSymbol: null, // most recent asset seen on the socket (in or out)
+    lastWsSymbol: null, // authoritative main-chart symbol (legacy snapshot field)
+    lastWsPeriod: 60,
+    activeChart: null,  // {symbol, period, source, at}; never derived from quote fan-out
   };
 
+  var internalSubscriptionSend = false;
+  var candleKeyOrder = [];
+  var tickKeyOrder = [];
+  var backgroundTickAt = Object.create(null);
+  var lastBackgroundEmitAt = 0;
+  var seenOrderKeys = Object.create(null);
+  var seenOrderOrder = [];
+  var seenPlacementIds = Object.create(null);
+  var seenPlacementOrder = [];
   var handle = {
     native: null,
     wrapper: null,
@@ -56,7 +68,27 @@
     pending: function () { return handle.router ? handle.router.pending() : null; },
   };
 
-  var router = Q.createRouter({
+  function selectActiveChart(hit, source) {
+    if (!hit || !hit.symbol) return false;
+    live.lastWsSymbol = hit.symbol;
+    if (hit.period) live.lastWsPeriod = hit.period;
+    live.activeChart = {
+      symbol: hit.symbol,
+      period: hit.period || live.lastWsPeriod || 60,
+      source: source || hit.event || "socket",
+      at: Date.now(),
+    };
+    emit("asset", {
+      symbol: live.activeChart.symbol,
+      period: live.activeChart.period,
+      raw: live.activeChart.source,
+      event: hit.event || null,
+      main: true,
+    });
+    return true;
+  }
+
+  var routerHandlers = {
     onStatus: function (s) {
       live.status = s || live.status;
       emit("quotex_status", s || {});
@@ -64,50 +96,79 @@
     onCandle: function (msg) {
       if (!msg || !msg.asset) return;
       var key = msg.asset + "@" + (msg.period || 60);
-      live.candles[key] = msg.candles || [];
-      // Incoming history payloads name their asset — another reliable
-      // active-asset signal (covers builds that never stream quotes/stream).
-      live.lastWsSymbol = msg.asset;
-      emit("asset", { symbol: msg.asset, raw: "ws_candle" });
-      emit("candle", { asset: msg.asset, period: msg.period, candles: msg.candles });
+      live.candles[key] = Array.isArray(msg.candles) ? msg.candles.slice(-400) : [];
+      var oldKeyAt = candleKeyOrder.indexOf(key);
+      if (oldKeyAt >= 0) candleKeyOrder.splice(oldKeyAt, 1);
+      candleKeyOrder.push(key);
+      while (candleKeyOrder.length > 12) delete live.candles[candleKeyOrder.shift()];
+      // History is low-frequency and remains available per asset/timeframe;
+      // it never changes activeChart.
+      emit("candle", { asset: msg.asset, period: msg.period, candles: live.candles[key] });
     },
     onTick: function (q) {
       if (!q || !q.symbol) return;
+      if (!Object.prototype.hasOwnProperty.call(live.ticks, q.symbol)) tickKeyOrder.push(q.symbol);
       live.ticks[q.symbol] = q;
-      emit("tick", { price: q.price, symbol: q.symbol, time: q.time, raw: "ws" });
-      // Also emit an `asset` message so content.js keeps the active asset up-to-date.
-      emit("asset", { symbol: q.symbol, raw: "ws" });
+      while (tickKeyOrder.length > 500) {
+        var oldSymbol = tickKeyOrder.shift();
+        delete live.ticks[oldSymbol];
+        delete backgroundTickAt[oldSymbol];
+      }
+      // Quote streams can contain hundreds of subscribed instruments. Keep
+      // bounded latest values for snapshots, but rate-limit background bridges
+      // globally so they cannot dominate the selected chart's UI updates.
+      var main = !!(live.activeChart &&
+        Q.normalizeSymbol(live.activeChart.symbol) === Q.normalizeSymbol(q.symbol));
+      var now = Date.now();
+      var allowBackground = !main && now - lastBackgroundEmitAt >= 1000 &&
+        now - (backgroundTickAt[q.symbol] || 0) >= 30000;
+      if (main || allowBackground) {
+        if (allowBackground) { backgroundTickAt[q.symbol] = now; lastBackgroundEmitAt = now; }
+        emit("tick", {
+          price: q.price, symbol: q.symbol, time: q.time, raw: "ws", main: main,
+        });
+      }
     },
     onInstruments: function (list) {
-      live.instruments = list || [];
-      live.assetIdMap = {};
-      for (var i = 0; i < (list || []).length; i++) {
-        var it = list[i];
-        if (it && it.symbol) live.assetIdMap[it.id] = it.symbol;
+      live.instruments = Array.isArray(list) ? list.slice(0, 2000) : [];
+      live.assetIdMap = Object.create(null);
+      for (var i = 0; i < live.instruments.length; i++) {
+        var it = live.instruments[i];
+        if (it && it.symbol && it.id) live.assetIdMap[it.id] = it.symbol;
       }
       // Learn broker ids so numeric tick rows ([id, ts, price]) resolve.
-      try { if (Q.rememberIds) Q.rememberIds(list); } catch (_) {}
-      emit("instruments", list || []);
+      try { if (Q.rememberIds) Q.rememberIds(live.instruments); } catch (_) {}
+      emit("instruments", live.instruments);
     },
-    onAsset: function (symbol) {
-      // Active-asset hint from OUTGOING frames (the web client tells the
-      // server which asset it charts — the most reliable detector of all).
-      if (!symbol) return;
-      live.lastWsSymbol = symbol;
-      emit("asset", { symbol: symbol, raw: "ws_out" });
+    onAsset: function (symbol, hit) {
+      // Generic follow events are only an initial candidate. Explicit
+      // instruments/update and orders/open events are selected in send().
+      if (!symbol || live.activeChart) return;
+      selectActiveChart(hit || { symbol: symbol, period: 60 }, "ws_candidate");
     },
     onBalance: function (b) {
       live.balance = b;
       emit("balance", b);
     },
     onOrder: function (e) {
-      if (!e) return;
+      if (!e || typeof e !== "object") return;
+      var data = e.data && typeof e.data === "object" ? e.data : {};
+      var identity = data.id || data.requestId || "";
+      var at = data.openTime || data.closeTime || "";
+      var key = String(e.kind || "") + ":" + String(identity) + ":" + String(at);
+      if (key !== "::" && seenOrderKeys[key]) return;
+      if (key !== "::") {
+        seenOrderKeys[key] = true;
+        seenOrderOrder.push(key);
+        while (seenOrderOrder.length > 500) delete seenOrderKeys[seenOrderOrder.shift()];
+      }
       live.orders.unshift(e);
       if (live.orders.length > 50) live.orders.length = 50;
       emit("order", e);
     },
     onFrame: function (label, payload, frame) {
-      // Reserved for debugging — keep the last 20 frames for the dashboard.
+      // Do not allocate/debug-log high-frequency quote or candle events.
+      if (label === "tick" || label === "candles") return;
       try {
         if (!window.__cyber_frames) window.__cyber_frames = [];
         window.__cyber_frames.unshift({
@@ -118,7 +179,8 @@
         if (window.__cyber_frames.length > 20) window.__cyber_frames.length = 20;
       } catch (_) {}
     },
-  });
+  };
+  var router = Q.createRouter(routerHandlers);
   handle.router = router;
 
   /* ====================================================================
@@ -140,7 +202,8 @@
    *      that never expose the library globally).
    * ==================================================================== */
   var MARKERS = (function () {
-    var chart = null;        // lightweight-charts IChartApi
+    var chart = null;        // selected (largest visible) lightweight-charts IChartApi
+    var chartContainer = null;
     var series = null;       // main price series (the one that accepts setMarkers)
     var nativeList = [];     // last normalized native marker list
     var lastPayload = null;  // raw { asset, markers, bars } from content
@@ -179,10 +242,24 @@
       return null;
     }
 
-    function captureChart(c) {
+    function containerArea(el) {
+      try {
+        var r = el && el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+        return r && r.width > 0 && r.height > 0 ? r.width * r.height : 0;
+      } catch (_) { return 0; }
+    }
+
+    function captureChart(c, container) {
       if (!isChartLike(c)) return false;
       if (chart === c) return true;
+      // Multiple-chart mode creates several valid chart APIs. The main price
+      // chart is the largest visible container; do not let a later mini chart
+      // replace it merely because it was discovered last.
+      var nextArea = containerArea(container);
+      var currentArea = containerArea(chartContainer);
+      if (chart && currentArea > 0 && (nextArea === 0 || nextArea < currentArea)) return true;
       chart = c;
+      chartContainer = container || chartContainer;
       series = findExistingSeries(c);
       // Wrap series adders so a re-created main series (asset / timeframe
       // switch) is captured too. Candlestick/bar adders REPLACE the marker
@@ -212,11 +289,14 @@
     /** Raw markers -> lightweight-charts setMarkers() format. */
     function normalize(list) {
       var byTime = Object.create(null);
-      var arr = Array.isArray(list) ? list : [];
+      var arr = Array.isArray(list) ? list.slice(-MAX) : [];
       for (var i = 0; i < arr.length; i++) {
         var m = arr[i];
-        if (!m || m.time == null || !isFinite(m.time)) continue;
-        var sec = Math.floor(Number(m.time) / 1000);
+        var time = Number(m && m.time);
+        if (!m || (m.dir !== "CALL" && m.dir !== "PUT") || !Number.isFinite(time) || time <= 0) continue;
+        while (time >= 1e14) time /= 1000;
+        var sec = Math.floor(time >= 1e11 ? time / 1000 : time);
+        if (!Number.isSafeInteger(sec) || sec <= 0) continue;
         var put = m.dir === "PUT";
         byTime[sec] = {
           time: sec,
@@ -236,8 +316,15 @@
     }
 
     function applyMarkers(payload) {
-      lastPayload = payload || null;
-      nativeList = normalize(lastPayload && lastPayload.markers);
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) payload = null;
+      lastPayload = payload ? {
+        asset: typeof payload.asset === "string" ? payload.asset.slice(0, 64) : "",
+        markers: Array.isArray(payload.markers) ? payload.markers.slice(-MAX) : [],
+        bars: Array.isArray(payload.bars) ? payload.bars.slice(-400) : [],
+      } : null;
+      var chartMismatch = !!(lastPayload && lastPayload.asset && live.activeChart && live.activeChart.symbol &&
+        Q.normalizeSymbol(lastPayload.asset) !== Q.normalizeSymbol(live.activeChart.symbol));
+      nativeList = chartMismatch ? [] : normalize(lastPayload && lastPayload.markers);
       // The platform may have recreated the main series (asset/timeframe
       // switch) since the last markers message — re-resolve it if needed.
       if (!series && chart) series = findExistingSeries(chart);
@@ -260,6 +347,7 @@
         mode = "native";
         hideOverlay();
       } catch (_) {
+        mode = "overlay";
         drawOverlay();
       }
     }
@@ -267,19 +355,22 @@
     /* ---------- overlay fallback ---------- */
     function findChartCanvas() {
       var all = document.querySelectorAll("canvas");
+      var best = null, bestArea = 0;
       for (var i = 0; i < all.length; i++) {
         try {
           var r = all[i].getBoundingClientRect();
-          if (r && r.width > 240 && r.height > 140) return all[i];
+          var area = r && r.width > 240 && r.height > 140 ? r.width * r.height : 0;
+          if (area > bestArea) { best = all[i]; bestArea = area; }
         } catch (_) {}
       }
-      return null;
+      return best;
     }
 
     function ensureOverlay() {
-      if (overlay && overlay.el && overlay.el.isConnected) return overlay;
-      overlay = null;
       var target = findChartCanvas();
+      if (overlay && overlay.el && overlay.el.isConnected && overlay.target === target) return overlay;
+      if (overlay) hideOverlay();
+      overlay = null;
       if (!target || !document.body) return null;
       var el = document.createElement("div");
       el.style.cssText = "position:fixed;pointer-events:none;z-index:2147483000;";
@@ -320,9 +411,11 @@
       ov.el.style.top = rect.top + "px";
       ov.el.style.width = rect.width + "px";
       ov.el.style.height = rect.height + "px";
-      var dpr = window.devicePixelRatio || 1;
-      ov.canvas.width = Math.floor(rect.width * dpr);
-      ov.canvas.height = Math.floor(rect.height * dpr);
+      var rawDpr = Number(window.devicePixelRatio);
+      var dpr = Number.isFinite(rawDpr) ? Math.max(1, Math.min(2, rawDpr)) : 1;
+      var pixelW = Math.floor(rect.width * dpr), pixelH = Math.floor(rect.height * dpr);
+      if (ov.canvas.width !== pixelW) ov.canvas.width = pixelW;
+      if (ov.canvas.height !== pixelH) ov.canvas.height = pixelH;
       var ctx = ov.ctx;
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, rect.width, rect.height);
@@ -344,10 +437,15 @@
       var W = rect.width, H = rect.height;
       for (var k = 0; k < markers.length; k++) {
         var m = markers[k];
-        if (!m || m.time == null || m.price == null) continue;
-        if (m.time < t0 || m.time > t1) continue;
-        var x = ((m.time - t0) / (t1 - t0)) * W;
-        var y = H - ((m.price - lo) / (hi - lo)) * H;
+        var markerTime = Number(m && m.time), markerPrice = Number(m && m.price);
+        if (!m || (m.dir !== "CALL" && m.dir !== "PUT") || !Number.isFinite(markerTime) ||
+            !Number.isFinite(markerPrice) || markerPrice <= 0) continue;
+        while (markerTime >= 1e14) markerTime /= 1000;
+        if (markerTime < 1e11) markerTime *= 1000;
+        if (markerTime < t0 || markerTime > t1) continue;
+        var x = ((markerTime - t0) / (t1 - t0)) * W;
+        var y = H - ((markerPrice - lo) / (hi - lo)) * H;
+        if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
         drawArrow(ctx, x, y, m.dir === "PUT");
       }
     }
@@ -371,42 +469,47 @@
 
     /* ---------- chart discovery ---------- */
     var scanTimer = null;
+    var inspectBudget = 0;
+    var inspectSeen = null;
     function scheduleScan() {
       if (scanTimer) return;
       var tries = 0;
       scanTimer = setInterval(function () {
         tries++;
-        try {
-          if (hasChart() || scanOnce()) { clearInterval(scanTimer); scanTimer = null; return; }
-        } catch (_) {}
-        if (tries > 30) { clearInterval(scanTimer); scanTimer = null; }
+        try { scanOnce(); } catch (_) {}
+        // Keep scanning briefly after the first capture: multi-chart layouts
+        // often mount mini charts first and the large main chart later.
+        if (tries > 12) { clearInterval(scanTimer); scanTimer = null; }
       }, 2000);
     }
 
     function scanOnce() {
+      var found = false;
+      inspectBudget = 1600;
+      inspectSeen = typeof WeakSet !== "undefined" ? new WeakSet() : null;
       // a) lightweight-charts web component
       try {
         var els = document.querySelectorAll("lightweight-chart");
         for (var i = 0; i < els.length; i++) {
-          if (els[i] && els[i].chart && captureChart(els[i].chart)) return true;
+          if (els[i] && els[i].chart && captureChart(els[i].chart, els[i])) found = true;
         }
       } catch (_) {}
       // b) React fiber scan on chart containers (bundled lightweight-charts)
       try {
         var containers = document.querySelectorAll("[class*='tv-lightweight-charts'], [class*='chart']");
-        for (var c = 0; c < containers.length; c++) {
+        for (var c = 0; c < containers.length && c < 80; c++) {
           var inst = fiberScan(containers[c]);
-          if (inst && captureChart(inst)) return true;
+          if (inst && captureChart(inst, containers[c])) found = true;
         }
       } catch (_) {}
       // c) common window handles
       try {
         var cands = [window.chart, window.qxChart, window.quotexChart, window.tradeChart, window.activeChart];
         for (var j = 0; j < cands.length; j++) {
-          if (captureChart(cands[j])) return true;
+          if (captureChart(cands[j])) found = true;
         }
       } catch (_) {}
-      return false;
+      return found;
     }
 
     function fiberScan(el) {
@@ -436,8 +539,12 @@
     }
 
     function inspectObj(obj, depth) {
-      if (!obj || typeof obj !== "object" || depth > 7) return null;
+      if (!obj || typeof obj !== "object" || depth > 7 || inspectBudget-- <= 0) return null;
       try {
+        if (inspectSeen) {
+          if (inspectSeen.has(obj)) return null;
+          inspectSeen.add(obj);
+        }
         if (isChartLike(obj)) return obj;
         // React hook list / linked structures
         var probe = obj;
@@ -474,8 +581,9 @@
           if (v && typeof v.createChart === "function" && !v.__cyberWrapped) {
             var origCreate = v.createChart;
             v.createChart = function () {
+              var container = arguments[0];
               var c = origCreate.apply(this, arguments);
-              try { captureChart(c); } catch (_) {}
+              try { captureChart(c, container); } catch (_) {}
               return c;
             };
             try { v.__cyberWrapped = true; } catch (_) {}
@@ -485,8 +593,9 @@
       if (_lwc && typeof _lwc.createChart === "function" && !_lwc.__cyberWrapped) {
         var origCreate2 = _lwc.createChart;
         _lwc.createChart = function () {
+          var container = arguments[0];
           var c = origCreate2.apply(this, arguments);
-          try { captureChart(c); } catch (_) {}
+          try { captureChart(c, container); } catch (_) {}
           return c;
         };
         try { _lwc.__cyberWrapped = true; } catch (_) {}
@@ -519,9 +628,19 @@
       candles: live.candles,
       assetIdMap: live.assetIdMap,
       lastWsSymbol: live.lastWsSymbol,
+      lastWsPeriod: live.lastWsPeriod,
+      activeChart: live.activeChart,
       socket: !!handle.lastWs,
       frames: (window.__cyber_frames || []).slice(0, 12),
     };
+  }
+
+  function isBrokerSocketUrl(url) {
+    try {
+      var parsed = new URL(String(url || ""), location.href);
+      return (parsed.protocol === "ws:" || parsed.protocol === "wss:") &&
+        Q.isQuotexHost(parsed.hostname) && /\/socket\.io(?:\/|$)/i.test(parsed.pathname);
+    } catch (_) { return false; }
   }
 
   // Install the WebSocket wrapper *synchronously*. Handles text, Blob and
@@ -532,8 +651,13 @@
     handle.native = Native;
     function Wrapped(url, protocols) {
       var ws = protocols !== undefined ? new Native(url, protocols) : new Native(url);
-      handle.lastWs = ws;
-      try { emit("open", { url: url || "" }); } catch (_) {}
+      var brokerSocket = isBrokerSocketUrl(url);
+      // Binary attachment headers are socket-local. A dedicated router per
+      // WebSocket prevents interleaved sockets from stealing each other's
+      // pending header/event context.
+      var socketRouter = Q.createRouter(routerHandlers);
+      if (brokerSocket) { handle.lastWs = ws; handle.router = socketRouter; }
+      if (brokerSocket) try { emit("open", { url: url || "" }); } catch (_) {}
       // --- outgoing-frame sniffing: the client's own requests tell us the
       // active asset. This is what makes auto-detection work even when the
       // DOM uses hashed class names or ticks arrive with numeric ids. ---
@@ -551,20 +675,33 @@
           }
           var hit = s ? Q.sniffOutgoing(s) : null;
           if (hit && hit.symbol) {
-            live.lastWsSymbol = hit.symbol;
-            emit("asset", { symbol: hit.symbol, raw: "ws_out", event: hit.event });
+            brokerSocket = true;
+            handle.lastWs = ws;
+            handle.router = socketRouter;
+          }
+          if (hit && hit.symbol && !internalSubscriptionSend) {
+            if (hit.main) selectActiveChart(hit, "ws_out");
+            else if (hit.candidate && !live.activeChart) selectActiveChart(hit, "ws_candidate");
+            else if (live.activeChart && hit.symbol === live.activeChart.symbol && hit.period &&
+                /history\/list\/v2|chart_notification\/get|loadHistoryPeriod/.test(hit.event || "")) {
+              // Same selected symbol: learn the visible chart timeframe without
+              // allowing another asset's background history to become main.
+              selectActiveChart(hit, "ws_period");
+            }
           }
         } catch (_) {}
         return nativeSend(data);
       };
       ws.addEventListener("open", function () {
-        try { emit("quotex_status", { state: "open", url: url || "" }); } catch (_) {}
+        if (brokerSocket && handle.lastWs === ws) try { emit("quotex_status", { state: "open", url: url || "" }); } catch (_) {}
       });
       ws.addEventListener("close", function () {
-        try { emit("quotex_status", { state: "closed", url: url || "" }); } catch (_) {}
+        var wasCurrent = handle.lastWs === ws;
+        if (wasCurrent) handle.lastWs = null;
+        if (brokerSocket && wasCurrent) try { emit("quotex_status", { state: "closed", url: url || "" }); } catch (_) {}
       });
       ws.addEventListener("message", function (ev) {
-        try { router.feedRaw(ev.data); } catch (_) {}
+        if (brokerSocket && handle.lastWs === ws) try { socketRouter.feedRaw(ev.data); } catch (_) {}
       });
       return ws;
     }
@@ -573,6 +710,7 @@
     Wrapped.OPEN = Native.OPEN;
     Wrapped.CLOSING = Native.CLOSING;
     Wrapped.CLOSED = Native.CLOSED;
+    try { Object.setPrototypeOf(Wrapped, Native); } catch (_) {}
     handle.wrapper = Wrapped;
     window.WebSocket = Wrapped;
   }
@@ -607,18 +745,31 @@
   //                     page's own socket (mirrors the web client's frames).
   //   - place_ws      → send a real `orders/open` frame on the page socket.
   window.addEventListener("message", function (ev) {
-    if (!ev.data || ev.data.source !== "CYBER_BINARY_CONTENT") return;
+    if (ev.source !== window || !ev.data || ev.data.source !== "CYBER_BINARY_CONTENT") return;
     if (ev.data.kind === "sync_request") {
       emit("snapshot", snapshot());
     } else if (ev.data.kind === "subscribe") {
       var sub = ev.data.payload || {};
-      var r = Q.subscribeHistory(handle.lastWs, sub.asset, sub.period);
+      internalSubscriptionSend = true;
+      var r;
+      try { r = Q.subscribeHistory(handle.lastWs, sub.asset, sub.period); }
+      finally { internalSubscriptionSend = false; }
       emit("subscribe_result", { ok: !!(r && r.ok), payload: r || {} });
     } else if (ev.data.kind === "place_ws") {
-      var args = ev.data.payload || {};
-      var reqId = args.requestId;
-      var res = Q.placeTradeWs(handle.lastWs, args);
-      res = res || { ok: false, error: "no result" };
+      var args = ev.data.payload && typeof ev.data.payload === "object" ? ev.data.payload : {};
+      var reqId = args.requestId != null ? String(args.requestId).slice(0, 128) : "";
+      var res;
+      if (!reqId) {
+        res = { ok: false, confirmed: false, error: "request id required" };
+      } else if (seenPlacementIds[reqId]) {
+        res = { ok: false, confirmed: false, sent: true, error: "duplicate placement request" };
+      } else {
+        seenPlacementIds[reqId] = true;
+        seenPlacementOrder.push(reqId);
+        while (seenPlacementOrder.length > 500) delete seenPlacementIds[seenPlacementOrder.shift()];
+        res = Q.placeTradeWs(handle.lastWs, args);
+      }
+      res = res || { ok: false, confirmed: false, error: "no result" };
       res.requestId = reqId;
       emit("ws_result", res);
     } else if (ev.data.kind === "markers") {

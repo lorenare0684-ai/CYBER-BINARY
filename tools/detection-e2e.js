@@ -6,13 +6,13 @@
  *   page-hook (MAIN world)  →  window.postMessage  →  content.js router
  *
  * Verifies:
- *   1. An `asset` message (from outgoing-frame sniffing) switches the active
+ *   1. An explicit authoritative-main `asset` message switches the active
  *      asset immediately, including `_otc` symbols.
  *   2. A `tick` message ingests price data into the correct feed.
  *   3. An `instruments` message registers every broker asset (catalog grows
  *      to the full live list).
- *   4. A `snapshot` replay with `lastWsSymbol` restores detection on late
- *      attaches.
+ *   4. A `snapshot` replay with `activeChart` restores detection on late
+ *      attaches without treating an unrelated last quote as authoritative.
  *   5. DOM text-scan detection matches "EUR/USD OTC" from hashed-class DOM.
  */
 const fs = require("fs");
@@ -24,7 +24,11 @@ const root = path.join(__dirname, "..");
 // setInterval; we capture the callback instead of letting it fire on its own.
 const intervalFns = [];
 const postedMessages = [];
-const sandbox = { self: {}, console, globalThis: null, location: { hostname: "qxbroker.com", pathname: "/trade", href: "https://qxbroker.com/en/trade?type=demo", host: "qxbroker.com", title: "Quotex" }, navigator: { userAgent: "node" }, Event: function () {}, Notification: undefined, setTimeout: (fn) => 0, clearInterval: () => {}, setInterval: (fn) => { intervalFns.push(fn); return intervalFns.length; }, postMessage: (m) => { postedMessages.push(m); } };
+const RealDate = Date;
+let fakeNow = Date.now();
+class FakeDate extends RealDate {}
+FakeDate.now = () => fakeNow;
+const sandbox = { self: {}, console, Date: FakeDate, globalThis: null, location: { hostname: "qxbroker.com", pathname: "/trade", href: "https://qxbroker.com/en/trade?type=demo", host: "qxbroker.com", title: "Quotex" }, navigator: { userAgent: "node" }, Event: function () {}, Notification: undefined, setTimeout: (fn) => 0, clearInterval: () => {}, setInterval: (fn) => { intervalFns.push(fn); return intervalFns.length; }, postMessage: (m) => { postedMessages.push(m); } };
 sandbox.globalThis = sandbox.self;
 sandbox.window = sandbox.self;
 sandbox.__contentMsgListeners = [];
@@ -76,7 +80,7 @@ const chromeStub = {
   runtime: {
     id: "test-ext",
     getURL: (p) => "chrome-extension://test/" + p,
-    sendMessage: (m) => { sent.push(m); return Promise.resolve({ ok: true }); },
+    sendMessage: (m) => { sent.push(m); return Promise.resolve({ ok: true, primary: true }); },
     onMessage: { addListener: (fn) => { onMsg = fn; } },
     lastError: null,
   },
@@ -105,7 +109,7 @@ function check(name, cond, extra) {
 }
 
 function hookMsg(kind, payload) {
-  const ev = { data: { source: "CYBER_BINARY_HOOK", kind: kind, payload: payload } };
+  const ev = { source: sandbox.window, data: { source: "CYBER_BINARY_HOOK", kind: kind, payload: payload } };
   const fns = sandbox.__contentMsgListeners || [];
   for (const fn of fns) fn(ev);
 }
@@ -114,7 +118,8 @@ function lastState() {
   return states.length ? states[states.length - 1].payload : null;
 }
 function forceTick() {
-  // content.js's pollTimer callback = the first captured interval fn
+  // Advance past content.js's state-push throttle, then run its poll callback.
+  fakeNow += 1000;
   for (const fn of intervalFns) { try { fn(); } catch (_) {} }
 }
 
@@ -138,17 +143,56 @@ const state0 = lastState();
 check("state payload carries markers for the dashboard chart",
   state0 && Array.isArray(state0.markers), state0 && String(state0.markers));
 
-// 1. outgoing-sniff asset message
-hookMsg("asset", { symbol: "EURUSD_otc", raw: "ws_out" });
+// 1. explicit authoritative main-chart message
+hookMsg("asset", { symbol: "EURUSD_otc", period: 60, raw: "ws_out", main: true });
 forceTick();
 const state1 = lastState();
 check("active asset is EURUSD_otc", state1 && state1.payload ? state1.payload.assetId : state1.assetId === "EURUSD_otc", state1 && state1.assetId);
 
 // 2. tick ingest
-hookMsg("tick", { price: 1.0855, symbol: "EURUSD_otc", time: Date.now(), raw: "ws" });
+hookMsg("tick", { price: 1.0855, symbol: "EURUSD_otc", time: fakeNow, raw: "ws" });
 forceTick();
 const state2 = lastState();
 check("tick price ingested", state2 && state2.price === 1.0855, state2 && String(state2.price));
+
+// A replay from an older bucket must not overwrite the cached/displayed main
+// price, and a silent socket must stop being advertised as a live WS source.
+hookMsg("tick", { price: 9.999, symbol: "EURUSD_otc", time: fakeNow - 120000, raw: "ws" });
+forceTick();
+check("stale main tick cannot overwrite displayed price", lastState() && lastState().price === 1.0855,
+  lastState() && String(lastState().price));
+fakeNow += 16000;
+forceTick();
+check("silent WS source expires instead of staying live forever", lastState() && lastState().source === "dom",
+  lastState() && lastState().source);
+
+// 2b. Multi-chart fan-out: background chart ticks/candles must not steal the
+// main identity or price. Only an explicit {main:true} asset event can switch.
+hookMsg("tick", { price: 203.25, symbol: "XAUUSD_otc", time: fakeNow, raw: "ws", main: false });
+hookMsg("candle", {
+  asset: "GBPUSD", period: 60,
+  candles: [{ time: fakeNow - 60000, open: 1.25, high: 1.26, low: 1.24, close: 1.255 }],
+});
+forceTick();
+const multiState = lastState();
+check("background chart data does not replace main asset",
+  multiState && multiState.assetId === "EURUSD_otc", multiState && multiState.assetId);
+check("background chart tick does not replace main price",
+  multiState && multiState.price === 1.0855, multiState && String(multiState.price));
+hookMsg("asset", { symbol: "XAUUSD_otc", period: 300, raw: "ws_out", main: true });
+hookMsg("tick", { price: 203.5, symbol: "XAUUSD_otc", time: fakeNow, raw: "ws", main: true });
+forceTick();
+const switchedState = lastState();
+check("explicit main-chart event switches asset",
+  switchedState && switchedState.assetId === "XAUUSD_otc", switchedState && switchedState.assetId);
+check("explicit main-chart period is retained",
+  switchedState && switchedState.quotex && switchedState.quotex.activePeriod === 300,
+  switchedState && switchedState.quotex && switchedState.quotex.activePeriod);
+
+// Restore EUR/USD OTC for the catalog checks below.
+hookMsg("asset", { symbol: "EURUSD_otc", period: 60, raw: "ws_out", main: true });
+hookMsg("tick", { price: 1.0855, symbol: "EURUSD_otc", time: fakeNow, raw: "ws", main: true });
+forceTick();
 
 // 3. instruments registration
 const before = A.list().length;
@@ -162,7 +206,8 @@ const after = A.list().length;
 check("instruments register into catalog", after === before + 1, before + " -> " + after);
 check("ZZZUSD_otc registered", A.get("ZZZUSD_otc") && A.get("ZZZUSD_otc").brokerId === 999);
 
-// 4. snapshot replay with lastWsSymbol
+// 4. snapshot replay with an explicit active chart. `lastWsSymbol` points at
+// an unrelated subscription and must not override it.
 hookMsg("snapshot", {
   status: { state: "authenticated" },
   instruments: [],
@@ -171,11 +216,12 @@ hookMsg("snapshot", {
   ticks: {},
   candles: {},
   assetIdMap: {},
-  lastWsSymbol: "XAUUSD_otc",
+  activeChart: { symbol: "XAUUSD_otc", period: 300 },
+  lastWsSymbol: "GBPUSD",
 });
 forceTick();
 const state4 = lastState();
-check("snapshot lastWsSymbol drives active asset", state4 && state4.assetId === "XAUUSD_otc", state4 && state4.assetId);
+check("snapshot activeChart drives active asset", state4 && state4.assetId === "XAUUSD_otc", state4 && state4.assetId);
 
 // 5. DOM text-scan: hidden hashed classes, but text "EUR/USD OTC" visible
 //    Simulate: remove ws symbol so detection falls back to DOM, then tick.
