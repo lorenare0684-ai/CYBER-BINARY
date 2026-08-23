@@ -104,9 +104,18 @@ const sandbox = {
 };
 sandbox.globalThis = sandbox;
 sandbox.window = sandbox;
+// Notification stub: records constructions and permission requests so the
+// auto.js notifyDesktop() regression can be observed. Toggling .permission
+// between tests exercises each branch of notifyDesktop.
+const notifyLog = { created: [], requested: 0 };
+sandbox.Notification = function Notification(title, opts) {
+  notifyLog.created.push({ title: title, opts: opts });
+};
+sandbox.Notification.permission = "default";
+sandbox.Notification.requestPermission = function () { notifyLog.requested++; };
 vm.createContext(sandbox);
 
-for (const f of ["indicators.js", "assets.js", "strategy.js", "feed.js", "engine.js", "storage.js", "backtest.js", "quotex.js"]) {
+for (const f of ["indicators.js", "assets.js", "strategy.js", "feed.js", "engine.js", "storage.js", "backtest.js", "quotex.js", "auto.js"]) {
   vm.runInContext(fs.readFileSync(path.join(root, "src/lib", f), "utf8"), sandbox);
 }
 
@@ -119,6 +128,7 @@ function check(name, cond, extra) {
 const STORE = sandbox.self.CYBER_STORE;
 const Q = sandbox.self.CYBER_QUOTEX;
 const FEED = sandbox.self.CYBER_FEED;
+const AUTO = sandbox.self.CYBER_AUTO;
 const KEY = "cyberBinaryV2";
 
 // ---------- 1. storage save/load race ----------
@@ -391,6 +401,63 @@ async function resetScopeTest() {
   check("history-only reset clears stats", afterStats.wins === 0 && afterStats.losses === 0 && afterStats.history.length === 0);
 }
 
+// ---------- 7. auto.js notifyDesktop out-of-scope assetLabel ----------
+// Regression: notifyDesktop() built its body with `${assetLabel}`, a local
+// that only exists inside handleSignal(). The ReferenceError fired while
+// evaluating the body argument — BEFORE `new Notification` ran — so granted
+// desktop alerts never appeared. The surrounding try/catch swallowed it.
+function notifyDesktopTest() {
+  const N = sandbox.Notification;
+  notifyLog.created.length = 0;
+  notifyLog.requested = 0;
+  N.permission = "granted";
+
+  let threw = null;
+  try {
+    AUTO.notifyDesktop({ direction: "CALL", asset: "EURUSD_otc", confidence: 80, reason: "trend" });
+  } catch (e) { threw = e && e.message; }
+  check("notifyDesktop does not throw", threw === null, "err=" + threw);
+  check("notifyDesktop constructs a Notification when permitted",
+    notifyLog.created.length === 1, "created=" + notifyLog.created.length);
+  const n = notifyLog.created[0];
+  const nBody = n && n.opts && n.opts.body;
+  check("notification title carries direction", n && /CALL/.test(n.title), n && n.title);
+  check("notification body includes asset label and confidence",
+    /EURUSD_otc/.test(nBody) && /80/.test(nBody), nBody);
+
+  // default permission → requests permission, constructs nothing
+  notifyLog.created.length = 0;
+  N.permission = "default";
+  AUTO.notifyDesktop({ direction: "PUT", asset: "GBPUSD", confidence: 55 });
+  check("notifyDesktop requests permission when undecided",
+    notifyLog.requested === 1 && notifyLog.created.length === 0,
+    "requested=" + notifyLog.requested + " created=" + notifyLog.created.length);
+
+  // denied permission → silent no-op
+  notifyLog.created.length = 0; notifyLog.requested = 0;
+  N.permission = "denied";
+  AUTO.notifyDesktop({ direction: "CALL", asset: "EURUSD_otc", confidence: 90 });
+  check("notifyDesktop is a no-op when permission denied",
+    notifyLog.created.length === 0 && notifyLog.requested === 0);
+
+  // malformed/missing fields never throw
+  let safe = true;
+  try {
+    AUTO.notifyDesktop(null);
+    AUTO.notifyDesktop({});
+    AUTO.notifyDesktop({ direction: "CALL", confidence: 70 });
+  } catch (_) { safe = false; }
+  check("notifyDesktop tolerates malformed/missing signal fields", safe);
+
+  // label is sanitized: control chars stripped, length capped
+  notifyLog.created.length = 0;
+  N.permission = "granted";
+  AUTO.notifyDesktop({ direction: "CALL", asset: "EUR\nUSD_otc " + "X".repeat(200), confidence: 70 });
+  const body = notifyLog.created[0] && notifyLog.created[0].opts && notifyLog.created[0].opts.body;
+  check("notifyDesktop sanitizes the asset label (no control chars, capped length)",
+    notifyLog.created.length === 1 && !/[\u0000-\u001f]/.test(body) && body.length <= 200, body);
+}
+
 async function main() {
   await raceTest();
   await dailyResetTest();
@@ -400,6 +467,7 @@ async function main() {
   await candleMatchingTest();
   await resetScopeTest();
   await storageSanitizeTest();
+  notifyDesktopTest();
   console.log(failed ? "\n" + failed + " FAILURE(S)" : "\nall bug-audit tests pass");
   process.exit(failed ? 1 : 0);
 }
