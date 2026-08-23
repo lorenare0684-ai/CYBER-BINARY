@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "CYBER BINARY — Quotex Signal Lab",
+  "name": "CYBER BINARY — Quotex Trading Automation",
   "version": "2.4.0",
-  "description": "v2.4.0: responsive live UI, authoritative main-chart detection, confirmed trade execution with anti-spam safety, correct broker candles, and complete entry/expiry/exit details. Educational only - not financial advice.",
+  "description": "v2.4.0: live Quotex signals and explicitly armed, broker-confirmed automated execution with anti-spam safety, authoritative chart detection, proper candles, and complete trade lifecycle details.",
   "permissions": [
     "storage",
     "windows",

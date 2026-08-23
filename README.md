@@ -1,8 +1,8 @@
-# CYBER BINARY — Quotex Signal Lab v2.4
+# CYBER BINARY — Quotex Trading Automation v2.4
 
 Chrome extension (Manifest V3) that attaches to a Quotex / QX Broker chart, builds 1-minute candles from the live quote, and scores **CALL / PUT / WAIT** from a multi-indicator, multi-timeframe confluence engine. The Quotex adapter decodes the platform's WebSocket traffic and drives the engine with real candles/ticks/balance.
 
-> Educational market analysis only. Not a broker. Not financial advice. Binary options have a built-in payout edge against the trader — nothing here is a profit guarantee.
+> Live signal analysis and explicitly armed automated execution for Quotex. This third-party tool can place real trades. Binary options are high risk, losses can quickly outweigh returns, and no result or profit is guaranteed.
 
 The completed 500-instance v2.4.0 hardening ledger and final regression evidence are in [`AUDIT-500.md`](AUDIT-500.md).
 
@@ -178,6 +178,6 @@ The historic backtest uses the **same generator** at longer windows (1–14 days
 
 Quotex does not expose a public candle API. v2.1 reads the platform's own WebSocket frames (Socket.IO v3, engine.io v3) for the live candle/quote/balance/instrument list. The exact event names and payload shapes are reverse-engineered from open-source clients (A11ksa/API-Quotex, ericpedra/quotexapi) and may need defensive fallbacks if the broker updates the protocol. The decoder logs unmatched frames under a `frame` callback so the dashboard can surface them; the `lib/quotex.js` module is small and standalone so updates are safe.
 
-Auto execution prefers a real `orders/open` frame on the page's own authenticated socket and waits for the broker's order-open response before counting it. If the socket is unavailable, the DOM fallback proceeds only when it can set both stake and expiry and verify a real CALL/PUT action button; it then also waits for broker confirmation. A frame that was sent but not confirmed is never retried as a click, preventing duplicate orders. Both paths are gated by the safety limits above. Always confirm on the chart before you act. The extension never reads, stores, or transmits your SSID; it only uses traffic the page already sends on its own socket.
+Auto execution prefers a real `orders/open` frame on the page's own authenticated socket and waits for the broker's order-open response before counting it. If the socket is unavailable, the DOM fallback proceeds only when it can set both stake and expiry and verify a real CALL/PUT action button; it then also waits for broker confirmation. A frame that was sent but not confirmed is never retried as a click, preventing duplicate orders. Both paths are gated by the safety limits above. Monitor the selected chart and account state whenever automation is armed. The extension never reads, stores, or transmits your SSID; it only uses traffic the page already sends on its own socket.
 
-**Disclaimer.** Educational market analysis only. Not a broker. Not financial advice. Binary options have a built-in payout edge against the trader (most brokers require >50% to break even on the headline payout). Nothing here is a profit guarantee. The auto-trade modes are off by default and require explicit arming.
+**Live-trading notice.** This is a third-party Quotex signal and automation client. Explicitly armed click mode can place real orders. Binary options have a built-in payout edge against the trader (most brokers require more than 50% wins to break even), so no signal, backtest, or automation result is a profit guarantee. Automation remains off and disarmed by default.

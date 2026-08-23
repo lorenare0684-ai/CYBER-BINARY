@@ -6,7 +6,7 @@
  *   - tools/page-hook.shell.js (MAIN-world WebSocket hook shell)
  *
  * Rebuild after any change to either source file.
- * Generated: 2026-08-23T05:25:11.351Z
+ * Generated: 2026-08-23T05:34:33.486Z
  */
 /* ====================================================================
  * Inlined CYBER_QUOTEX adapter (src/lib/quotex.js).
@@ -41,10 +41,10 @@
  *     balance / orders / status) that the page-hook can rebroadcast
  *     to the content script via `window.postMessage`.
  *
- * Educational only. No SSID is ever read from the page or sent by the
- * extension. To place a real trade without a DOM click we need the
- * session token, and we only get that by inspecting what the page
- * itself sends over its own socket — never by prompting the user.
+ * Live execution adapter. No SSID is ever read from the page, stored, or
+ * transmitted by the extension. Real orders use the page's own already-
+ * authenticated socket (or the strictly verified DOM controls) and require
+ * explicit arming in the isolated extension controller.
  *
  * Pure functions, no module-level state except the catalog.
  */
