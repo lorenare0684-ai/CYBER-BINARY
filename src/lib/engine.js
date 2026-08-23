@@ -304,9 +304,11 @@
         votes.push({ name: "Stoch", dir: "PUT", w: weights.stoch });
     }
 
-    // Bollinger with trend agreement
-    if (c[i] <= bb.lower[i] && c[i] > emaS[i]) votes.push({ name: "BB", dir: "CALL", w: weights.bb });
-    if (c[i] >= bb.upper[i] && c[i] < emaS[i]) votes.push({ name: "BB", dir: "PUT", w: weights.bb });
+    // Bollinger with trend agreement or band bounce
+    if ((c[i] <= bb.lower[i]) || (prev >= 0 && l[prev] <= bb.lower[prev] && c[i] > bb.lower[i]) || (c[i] <= bb.mid[i] && c[i] > emaS[i] && emaF[i] > emaS[i]))
+      votes.push({ name: "BB", dir: "CALL", w: weights.bb });
+    if ((c[i] >= bb.upper[i]) || (prev >= 0 && h[prev] >= bb.upper[prev] && c[i] < bb.upper[i]) || (c[i] >= bb.mid[i] && c[i] < emaS[i] && emaF[i] < emaS[i]))
+      votes.push({ name: "BB", dir: "PUT", w: weights.bb });
 
     // ADX trend strength: only agree with strong trends
     if (adxR.adx[i] >= cfg.adxMin) {
@@ -340,23 +342,23 @@
         votes.push({ name: "Hurst", dir: "PUT", w: weights.hurst });
     }
 
-    // Williams %R extremes (mean-revertive) — only if non-lean
+    // Williams %R extremes
     if (williams != null && williams[i] != null) {
-      if (williams[i] < -80 && rsi[i] < 40) votes.push({ name: "Will%R", dir: "CALL", w: weights.williams });
-      if (williams[i] > -20 && rsi[i] > 60) votes.push({ name: "Will%R", dir: "PUT", w: weights.williams });
+      if (williams[i] < -80) votes.push({ name: "Will%R", dir: "CALL", w: weights.williams });
+      if (williams[i] > -20) votes.push({ name: "Will%R", dir: "PUT", w: weights.williams });
     }
 
-    // CCI extremes — only if non-lean
+    // CCI extremes
     if (cci != null && cci[i] != null) {
-      if (cci[i] < -150) votes.push({ name: "CCI", dir: "CALL", w: weights.cci });
-      if (cci[i] > 150) votes.push({ name: "CCI", dir: "PUT", w: weights.cci });
+      if (cci[i] < -100) votes.push({ name: "CCI", dir: "CALL", w: weights.cci });
+      if (cci[i] > 100) votes.push({ name: "CCI", dir: "PUT", w: weights.cci });
     }
 
-    // Donchian breakout — only if non-lean
-    if (donch != null && donch.upper != null && donch.upper[i] != null) {
-      if (c[i] > donch.upper[i - 1])
+    // Donchian breakout
+    if (donch != null && donch.upper != null && donch.upper[i] != null && prev >= 0 && donch.upper[prev] != null) {
+      if (c[i] >= donch.upper[prev] || h[i] >= donch.upper[prev])
         votes.push({ name: "Donch↑", dir: "CALL", w: weights.donchianBreak });
-      if (c[i] < donch.lower[i - 1])
+      if (c[i] <= donch.lower[prev] || l[i] <= donch.lower[prev])
         votes.push({ name: "Donch↓", dir: "PUT", w: weights.donchianBreak });
     }
 
@@ -519,6 +521,10 @@
       adxR: TA.adx(h, l, c, cfg.adxPeriod),
       psar: TA.psar(h, l, { step: cfg.psarStep, max: cfg.psarMax }),
       superR: TA.supertrend(h, l, c, cfg.superPeriod, cfg.superMult),
+      donch: TA.donchian(h, l, 20),
+      williams: TA.williamsR(h, l, c, 14),
+      cci: TA.cci(h, l, c, 20),
+      hurst: TA.hurst(c, cfg.hurstPeriod),
       mtfFast: mtfTrendSeries(candles, c, cfg.mtfFast),
       mtfMid: mtfTrendSeries(candles, c, cfg.mtfMid),
     };
@@ -531,7 +537,7 @@
     if (need.some((v) => v == null || numberValue(v) == null) || !Number.isFinite(p.c[i]) || p.c[i] <= 0) {
       return { ready: false, direction: "WAIT", confidence: 0, score: 0, regime: "unknown" };
     }
-    const regime = detectRegime(i, p.rsi, p.emaF, p.emaS, p.adxR.adx, p.atr, p.c, null);
+    const regime = detectRegime(i, p.rsi, p.emaF, p.emaS, p.adxR.adx, p.atr, p.c, p.hurst);
     if (p.atr[i] / p.c[i] < cfg.minAtrPct) {
       return { ready: true, direction: "WAIT", confidence: 0, score: 0, regime };
     }
@@ -556,8 +562,10 @@
       if (p.st.k[prev] < cfg.stochOs && p.st.k[i] > p.st.d[i] && p.st.k[i] < 50) votes.push({ dir: "CALL", w: weights.stoch });
       if (p.st.k[prev] > cfg.stochOb && p.st.k[i] < p.st.d[i] && p.st.k[i] > 50) votes.push({ dir: "PUT", w: weights.stoch });
     }
-    if (p.c[i] <= p.bb.lower[i] && p.c[i] > p.emaS[i]) votes.push({ dir: "CALL", w: weights.bb });
-    if (p.c[i] >= p.bb.upper[i] && p.c[i] < p.emaS[i]) votes.push({ dir: "PUT", w: weights.bb });
+    if ((p.c[i] <= p.bb.lower[i]) || (prev >= 0 && p.l[prev] <= p.bb.lower[prev] && p.c[i] > p.bb.lower[i]) || (p.c[i] <= p.bb.mid[i] && p.c[i] > p.emaS[i] && p.emaF[i] > p.emaS[i]))
+      votes.push({ dir: "CALL", w: weights.bb });
+    if ((p.c[i] >= p.bb.upper[i]) || (prev >= 0 && p.h[prev] >= p.bb.upper[prev] && p.c[i] < p.bb.upper[i]) || (p.c[i] >= p.bb.mid[i] && p.c[i] < p.emaS[i] && p.emaF[i] < p.emaS[i]))
+      votes.push({ dir: "PUT", w: weights.bb });
     if (p.adxR.adx[i] >= cfg.adxMin) {
       if (p.adxR.plus[i] > p.adxR.minus[i] && p.c[i] > p.emaS[i]) votes.push({ dir: "CALL", w: weights.adxTrend });
       if (p.adxR.minus[i] > p.adxR.plus[i] && p.c[i] < p.emaS[i]) votes.push({ dir: "PUT", w: weights.adxTrend });
@@ -571,6 +579,22 @@
     if (p.mtfMid[i] != null) { mtfBias += p.mtfMid[i]; mtfChecked++; }
     if (mtfChecked && mtfBias > 0) votes.push({ dir: "CALL", w: weights.mtfAlign });
     else if (mtfChecked && mtfBias < 0) votes.push({ dir: "PUT", w: weights.mtfAlign });
+    if (p.hurst && p.hurst[i] != null && p.hurst[i] > 0.55) {
+      if ((p.emaF[i] - p.emaS[i]) > 0) votes.push({ dir: "CALL", w: weights.hurst });
+      else if ((p.emaF[i] - p.emaS[i]) < 0) votes.push({ dir: "PUT", w: weights.hurst });
+    }
+    if (p.williams && p.williams[i] != null) {
+      if (p.williams[i] < -80) votes.push({ dir: "CALL", w: weights.williams });
+      if (p.williams[i] > -20) votes.push({ dir: "PUT", w: weights.williams });
+    }
+    if (p.cci && p.cci[i] != null) {
+      if (p.cci[i] < -100) votes.push({ dir: "CALL", w: weights.cci });
+      if (p.cci[i] > 100) votes.push({ dir: "PUT", w: weights.cci });
+    }
+    if (p.donch && p.donch.upper != null && p.donch.upper[i] != null && prev >= 0 && p.donch.upper[prev] != null) {
+      if (p.c[i] >= p.donch.upper[prev] || p.h[i] >= p.donch.upper[prev]) votes.push({ dir: "CALL", w: weights.donchianBreak });
+      if (p.c[i] <= p.donch.lower[prev] || p.l[i] <= p.donch.lower[prev]) votes.push({ dir: "PUT", w: weights.donchianBreak });
+    }
     let call = 0, put = 0;
     for (const vote of votes) {
       const weight = numberValue(vote.w);

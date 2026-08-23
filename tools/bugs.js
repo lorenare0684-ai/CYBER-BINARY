@@ -333,6 +333,52 @@ async function storageSanitizeTest() {
   check("exported defaults cannot mutate internal reset defaults", (await STORE.getSettings()).strategy === "confluence");
 }
 
+async function candleMatchingTest() {
+  // 1. Bare array of candle rows without asset/period metadata in payload
+  const bareArray = [[1700000000, 1.1945, 1.1948, 1.1942, 1.1946, 100]];
+  const parsedBare = Q.parseCandles(bareArray, "EURUSD_otc", 60);
+  check("bare candle array parsed with fallback context",
+    parsedBare && parsedBare.asset === "EURUSD_otc" && parsedBare.period === 60 && parsedBare.raw.length === 1);
+
+  // 2. Wrapped history object without top-level asset field
+  const historyObj = { history: [[1700000000, 1.1945, 1.1948, 1.1942, 1.1946, 100]] };
+  const parsedHist = Q.parseCandles(historyObj, "EURUSD_otc", 60);
+  check("history payload parsed with fallback context",
+    parsedHist && parsedHist.asset === "EURUSD_otc" && parsedHist.period === 60 && parsedHist.raw.length === 1);
+
+  // 3. Candles object without top-level asset field
+  const candlesObj = { candles: [[1700000000, 1.1945, 1.1948, 1.1942, 1.1946, 100]] };
+  const parsedCandles = Q.parseCandles(candlesObj, "EURUSD_otc", 60);
+  check("candles wrapper parsed with fallback context",
+    parsedCandles && parsedCandles.asset === "EURUSD_otc" && parsedCandles.period === 60);
+
+  // 4. Quotex tuple vs Standard OHLC tuple vs Object candle normalization
+  const qTupleNorm = Q.normalizeCandles({ raw: [[1700000000, 1.1945, 1.1948, 1.1950, 1.1940, 100]] });
+  const ohlcTupleNorm = Q.normalizeCandles({ raw: [[1700000000, 1.1945, 1.1950, 1.1940, 1.1948, 100]] });
+  const objNorm = Q.normalizeCandles({ raw: [{ time: 1700000000, open: 1.1945, high: 1.1950, low: 1.1940, close: 1.1948, volume: 100 }] });
+
+  check("Quotex tuple normalized correctly",
+    qTupleNorm.length === 1 && qTupleNorm[0].open === 1.1945 && qTupleNorm[0].close === 1.1948 &&
+    qTupleNorm[0].high === 1.1950 && qTupleNorm[0].low === 1.1940);
+  check("Standard OHLC tuple normalized correctly",
+    ohlcTupleNorm.length === 1 && ohlcTupleNorm[0].open === 1.1945 && ohlcTupleNorm[0].close === 1.1948 &&
+    ohlcTupleNorm[0].high === 1.1950 && ohlcTupleNorm[0].low === 1.1940);
+  check("Object candle normalized correctly",
+    objNorm.length === 1 && objNorm[0].open === 1.1945 && objNorm[0].close === 1.1948 &&
+    objNorm[0].high === 1.1950 && objNorm[0].low === 1.1940);
+
+  // 5. Router emitCandles propagation with fallback asset
+  let routerCandles = null;
+  const testRouter = Q.createRouter({
+    onCandle: (c) => { routerCandles = c; },
+  });
+  testRouter.dispatch({ type: "sio", event: "instruments/follow", payload: "EURUSD_otc" });
+  testRouter.dispatch({ type: "bin", payload: { history: [[1700000000, 1.1945, 1.1948, 1.1950, 1.1940, 100]] } });
+  check("router emits candles with current asset when payload is headerless/omits asset",
+    routerCandles && routerCandles.asset === "EURUSD_otc" && routerCandles.candles.length === 1 &&
+    routerCandles.candles[0].close === 1.1948);
+}
+
 async function resetScopeTest() {
   await STORE.setAutomation({ tradesToday: 7 });
   const before = await STORE.getSettings();
@@ -351,6 +397,7 @@ async function main() {
   asStringTest();
   feedTest();
   calibrationTest();
+  await candleMatchingTest();
   await resetScopeTest();
   await storageSanitizeTest();
   console.log(failed ? "\n" + failed + " FAILURE(S)" : "\nall bug-audit tests pass");

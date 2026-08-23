@@ -53,6 +53,10 @@
   const lastVirtualBarByAsset = Object.create(null);
   const lastAutoBarByAsset = Object.create(null);
   let activeAsset = "EURUSD";
+  let lastWsPrice = null;
+  let lastWsTickAt = 0;
+  let lastWsSymbol = null;       // authoritative MAIN chart symbol only
+  let lastWsPeriod = 60;         // authoritative MAIN chart timeframe
   let activeFeed = createFeedFor(activeAsset);
   let autoController = null;
   let currentStrategy = "confluence";
@@ -60,10 +64,6 @@
   let attached = false;
   let dashOpened = false;
   let pollTimer = null;
-  let lastWsPrice = null;
-  let lastWsTickAt = 0;
-  let lastWsSymbol = null;       // authoritative MAIN chart symbol only
-  let lastWsPeriod = 60;         // authoritative MAIN chart timeframe
   let manualAsset = null; // set by dashboard selection; null = auto-detect
   let isPrimaryContext = false;  // only the selected Quotex browser tab may auto-trade
   let primaryEpoch = 0;          // invalidates placement work across leadership changes
@@ -119,11 +119,11 @@
     feeds[assetId] = f;
     const a = ASSETS.get(assetId) || ASSETS.ensureRegistered(assetId) ||
       { id: assetId, basePrice: 1.0, vol: 0.0001, jumpRate: 0.005, decimals: 5 };
-    // Synthetic bars are display/warm-up data only. Keep their timestamps
-    // adjacent to the live session (rather than January 2024) so the first
-    // tick cannot create a multi-year discontinuity. Auto execution remains
-    // disabled until a genuine broker 1m history batch is ready.
-    f.setSeries(self.CYBER_FEED.syntheticSeries(a, 120, {
+    const chart = chartHistory[assetId] && (chartHistory[assetId][lastWsPeriod] || chartHistory[assetId][60]);
+    const lastChartBar = chart && Array.isArray(chart.candles) && chart.candles.length ? chart.candles[chart.candles.length - 1] : null;
+    const basePrice = (assetId === activeAsset && lastWsPrice) || (lastChartBar && lastChartBar.close) || lastDomPriceByAsset[assetId] || a.basePrice || 1.0;
+    const profile = Object.assign({}, a, { basePrice });
+    f.setSeries(self.CYBER_FEED.syntheticSeries(profile, 120, {
       startTime: Math.floor(Date.now() / TF_MS) * TF_MS - 120 * TF_MS,
     }));
     return f;
@@ -138,6 +138,7 @@
     cachedAnalysisKey = "";
     lastHudFingerprint = "";
     lastStateFingerprint = "";
+    ensureHistorySubscription(ASSETS.get(activeAsset) || ASSETS.ensureRegistered(activeAsset));
     return true;
   }
 
@@ -664,7 +665,6 @@
     const det = typeof asset === "string" && asset.length <= 80 ? ASSETS.ensureRegistered(asset) : null;
     if (!det) return;
     const id = det.id;
-    if (id !== activeAsset && !pendingByAsset[id]) return;
     const feed = createFeedFor(id);
     const rawPeriod = Number(period);
     const safePeriod = Number.isFinite(rawPeriod) && rawPeriod > 0 ? Math.min(86400, Math.floor(rawPeriod)) : 60;
@@ -699,7 +699,7 @@
     // The engine runs on 1m bars; accept 60s history directly and build 1m
     // from ticks for everything else (the chart shows the broker timeframe).
     const useForEngine = safePeriod === 60;
-    if (useForEngine && !historySeeded[id]) {
+    if (useForEngine && (!historySeeded[id] || feed.series().length <= 120)) {
       historySeeded[id] = true;
       // First real 1m batch REPLACES the synthetic seed wholesale (never
       // merge). A 5m/15m chart batch must not mark the 1m engine as seeded.
@@ -721,7 +721,13 @@
     // other open/mini charts are retained per asset+period but NEVER select
     // the active chart.
     mergeChartCandles(id, safePeriod, real);
-    if (id === activeAsset && safePeriod === lastWsPeriod) sendMarkers();
+    if (id === activeAsset || id === lastWsSymbol || !historySeeded[activeAsset]) {
+      if (activeAsset !== id && !manualAsset) {
+        activateAsset(id);
+      }
+      if (id === activeAsset && safePeriod === lastWsPeriod) sendMarkers();
+      scheduleTickSignalRefresh();
+    }
   }
 
   function normalizeStatus(value) {
@@ -1012,7 +1018,9 @@
     const total = stats.wins + stats.losses;
     const chart = chartForActiveAsset();
     const feedSeries = activeFeed.series().slice(-220);
-    const chartSeries = chart && chart.period !== 60 ? chart.candles.slice(-220) : feedSeries;
+    const chartSeries = (chart && Array.isArray(chart.candles) && chart.candles.length)
+      ? chart.candles.slice(-220)
+      : feedSeries;
     const payload = {
       attached: true,
       primary: isPrimaryContext,
