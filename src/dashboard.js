@@ -851,6 +851,15 @@
     sig.asset = activeAsset;
     sig.assetName = (ASSETS.get(activeAsset) || {}).name || activeAsset;
     sig.strategy = activeStrategy;
+    // v2.6.6: demo mode runs on a synthetic feed — showing its engine output
+    // as a CALL/PUT signal would be false signal generation. Metrics stay
+    // visible; the direction is held at WAIT with an honest reason.
+    if (sig.direction !== "WAIT") {
+      sig.gateReason = "demo";
+      sig.direction = "WAIT";
+      sig.ready = false;
+    }
+    sig.reason = "Demo mode — synthetic feed. Open the Quotex trade tab to capture real candles and generate live signals.";
     const det = ASSETS.get(activeAsset) || {};
     lastChartCandles = series.slice();
     lastChartMeta = { timeframe: "demo" };

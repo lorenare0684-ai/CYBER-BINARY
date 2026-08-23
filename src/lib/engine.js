@@ -69,6 +69,53 @@
     return null;
   }
 
+  /**
+   * v2.6.6: live-data gate. A feed that has not been seeded with the asset's
+   * genuine broker history still contains its synthetic warm-up bars; a
+   * CALL/PUT derived from those bars is a false signal no matter how good
+   * the engine is. The live signal path must hold WAIT until this gate
+   * opens. Pure function so the contract is testable outside the browser.
+   */
+  function liveSignalGate(state) {
+    const s = state && typeof state === "object" ? state : {};
+    const realBars = Math.max(0, Math.floor(Number(s.realBars) || 0));
+    const minBars = Math.max(1, Math.floor(Number(s.minBars) || 40));
+    if (!s.historySeeded) {
+      return { allowed: false, reason: "Waiting for real candles — broker history for this asset has not arrived yet" };
+    }
+    if (realBars < minBars) {
+      return { allowed: false, reason: "Warming up on real candles — " + realBars + "/" + minBars + " bars received" };
+    }
+    return { allowed: true, reason: "" };
+  }
+
+  /**
+   * v2.6.6: candle-batch trust decision. Symbol-verified batches (the
+   * payload names its asset, or the data came from the platform chart's own
+   * series) may seed or extend the engine feed. Batches attributed by
+   * FALLBACK (payload carried no symbol and was assumed to belong to the
+   * active chart) may never seed the engine feed, and may extend it only
+   * when their price scale matches what is already there — a foreign
+   * asset's candles must never reach the signal computation.
+   */
+  function historyTrustDecision(state) {
+    const s = state && typeof state === "object" ? state : {};
+    if (s.verified === true) return { engine: true, reason: "symbol-verified batch" };
+    if (!s.historySeeded) {
+      return { engine: false, reason: "unverified batch cannot seed the engine feed (no symbol in payload)" };
+    }
+    const feedClose = Number(s.feedClose);
+    const batchClose = Number(s.batchClose);
+    const tol = Number.isFinite(Number(s.tolerance)) && Number(s.tolerance) > 0 ? Number(s.tolerance) : 0.1;
+    if (!Number.isFinite(feedClose) || feedClose <= 0 || !Number.isFinite(batchClose) || batchClose <= 0) {
+      return { engine: false, reason: "unverified batch has no comparable price scale — rejected" };
+    }
+    if (Math.abs(batchClose - feedClose) / feedClose > tol) {
+      return { engine: false, reason: "unverified batch price scale differs from asset feed — possible wrong asset, rejected" };
+    }
+    return { engine: true, reason: "unverified batch consistent with verified feed (scale match)" };
+  }
+
   function numberValue(value) {
     if (value == null || typeof value === "boolean" ||
         (typeof value === "string" && !value.trim())) return null;
@@ -1081,5 +1128,5 @@
     };
   }
 
-  root.CYBER_ENGINE = { DEFAULTS, DEFAULT_WEIGHTS, CONCRETE_STRATEGIES, analyze, backtest, walkForward, resolveStrategy };
+  root.CYBER_ENGINE = { DEFAULTS, DEFAULT_WEIGHTS, CONCRETE_STRATEGIES, analyze, backtest, walkForward, resolveStrategy, liveSignalGate, historyTrustDecision };
 })(typeof self !== "undefined" ? self : globalThis);

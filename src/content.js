@@ -46,6 +46,8 @@
   const feeds = Object.create(null);
   const historySeeded = Object.create(null);   // assetId -> first batch applied
   const realHistoryReady = Object.create(null); // assetId -> enough genuine 1m bars for execution
+  const realBarCount = Object.create(null);     // assetId -> genuine 1m bars currently in the feed
+  const ingestTrustLog = Object.create(null);   // assetId -> last console note about untrusted batches
   const historyRequestedAt = Object.create(null);
   const chartHistory = Object.create(null);    // assetId -> period -> {candles, ts}
   const lastAcceptedQuoteAt = Object.create(null);
@@ -660,7 +662,7 @@
     }, wait);
   }
 
-  function ingestLiveCandles(asset, period, candles) {
+  function ingestLiveCandles(asset, period, candles, verified) {
     if (!asset || !Array.isArray(candles) || !candles.length) return;
     const det = typeof asset === "string" && asset.length <= 80 ? ASSETS.ensureRegistered(asset) : null;
     if (!det) return;
@@ -698,7 +700,26 @@
 
     // The engine runs on 1m bars; accept 60s history directly and build 1m
     // from ticks for everything else (the chart shows the broker timeframe).
-    const useForEngine = safePeriod === 60;
+    // v2.6.6: the batch must ALSO be trusted. Symbol-verified batches (or
+    // chart-library data) may seed/extend the engine feed. Batches that were
+    // attributed to this asset by fallback can never seed it, and can extend
+    // it only when their price scale matches — candles from a different
+    // asset must never reach the signal computation.
+    const seriesForScale = feed.series();
+    const scaleRef = seriesForScale.length ? seriesForScale[seriesForScale.length - 1].close : null;
+    const trust = self.CYBER_ENGINE.historyTrustDecision({
+      verified: verified === true,
+      historySeeded: !!historySeeded[id],
+      feedClose: scaleRef,
+      batchClose: real[real.length - 1].close,
+    });
+    if (!trust.engine && safePeriod === 60) {
+      if (!ingestTrustLog[id] || Date.now() - ingestTrustLog[id] > 60000) {
+        ingestTrustLog[id] = Date.now();
+        try { console.warn("[CYBER] candle batch for " + id + " kept for display only: " + trust.reason); } catch (_) {}
+      }
+    }
+    const useForEngine = safePeriod === 60 && trust.engine;
     if (useForEngine && (!historySeeded[id] || feed.series().length <= 120)) {
       historySeeded[id] = true;
       // First real 1m batch REPLACES the synthetic seed wholesale (never
@@ -710,6 +731,7 @@
       const ev = feed.mergeCandles(real);
       settleFeedEvent(ev, id);
     }
+    if (useForEngine) realBarCount[id] = feed.series().length;
     if (useForEngine && feed.series().length >= 2) persistLiveCandles(id, true);
     if (useForEngine && feed.series().length >= 40) realHistoryReady[id] = true;
     const newestRealTime = real[real.length - 1].time;
@@ -855,6 +877,8 @@
     }
     const candlesMap = snap.candles && typeof snap.candles === "object" && !Array.isArray(snap.candles)
       ? snap.candles : {};
+    const candlesVerified = snap.candlesVerified && typeof snap.candlesVerified === "object" && !Array.isArray(snap.candlesVerified)
+      ? snap.candlesVerified : {};
     const candleKeys = Object.keys(candlesMap).slice(0, 50);
     for (const key of candleKeys) {
       const m = key.match(/^(.{1,80})@(\d{1,6})$/);
@@ -862,7 +886,7 @@
       const list = candlesMap[key];
       const period = Number(m[2]);
       if (Array.isArray(list) && list.length && period >= 1 && period <= 86400) {
-        ingestLiveCandles(m[1], period, list);
+        ingestLiveCandles(m[1], period, list, candlesVerified[key] === true);
       }
     }
   }
@@ -895,6 +919,24 @@
       sig.asset = asset ? asset.id : activeAsset;
       sig.assetName = asset ? asset.name : activeAsset;
       sig.strategy = currentStrategy;
+      // v2.6.6: live-data gate. Until the feed holds genuine broker history
+      // for THIS asset, any CALL/PUT the engine computes is derived partly
+      // from the synthetic warm-up seed — a false signal. Hold WAIT, show the
+      // honest reason, and never attach a marker for it. Trade execution and
+      // auto-trading were already blocked on realHistoryReady; this closes
+      // the display/marker path so no synthetic-derived signal is ever shown.
+      const liveGate = self.CYBER_ENGINE.liveSignalGate({
+        historySeeded: !!historySeeded[activeAsset],
+        realBars: realBarCount[activeAsset] || 0,
+      });
+      if (!liveGate.allowed) {
+        if (sig.direction !== "WAIT") {
+          sig.gateReason = "live-data";
+          sig.direction = "WAIT";
+          sig.ready = false;
+        }
+        sig.reason = liveGate.reason;
+      }
       if (closed && closed.time != null) {
         sig.time = closed.time;
         // Signals are decided at the close of this 1m bar, not its open.
@@ -1154,7 +1196,7 @@
     while (Math.abs(ts) >= 1e14) ts /= 1000;
     if (Math.abs(ts) < 1e11) ts *= 1000;
     ts = Math.floor(ts);
-    if (!Number.isSafeInteger(ts) || ts < Date.now() - 7 * 86400000 || ts > Date.now() + 60000 ||
+    if (!Number.isSafeInteger(ts) || ts < Date.now() - 7 * 86400000 || ts > Date.now() + 86400000 ||
         (typeof targetFeed.canIngest === "function" && !targetFeed.canIngest(ts))) return false;
 
     // Before genuine 1m history is available the feed contains a synthetic
@@ -1320,7 +1362,7 @@
       }
       case "candle": {
         if (p && p.asset && Array.isArray(p.candles)) {
-          ingestLiveCandles(p.asset, p.period, p.candles);
+          ingestLiveCandles(p.asset, p.period, p.candles, p.verified === true);
         }
         break;
       }

@@ -4,6 +4,16 @@ Chrome extension (Manifest V3) that attaches to a Quotex / QX Broker chart, buil
 
 > Live signal analysis and explicitly armed automated execution for Quotex. This third-party tool can place real trades. Binary options are high risk, losses can quickly outweigh returns, and no result or profit is guaranteed.
 
+## What's new in v2.6.6 — Live Signal Integrity
+
+Signals can now only ever come from the desired asset's real, verified feed:
+
+- **Live-data gate**: until the feed holds genuine broker history for the asset, any engine direction is forced to WAIT with an honest reason ("Waiting for real candles…" / "Warming up on real candles — N/40 bars"). No CALL/PUT, no chart markers, no calibration updates from the synthetic warm-up seed. Trade execution and auto-trading were already blocked; this closes the display path.
+- **Demo mode can't fake signals**: the dashboard's synthetic demo feed now shows metrics only — direction held at WAIT with a "Demo mode — synthetic feed" reason.
+- **Candle-batch trust chain**: batches whose payload names its own asset (or that come from the platform chart's own series) are symbol-verified and may seed the engine feed. Batches attributed by fallback (payload had no symbol) can never seed the engine feed and may extend it only when their price scale matches the verified feed — candles from a different asset are rejected with a console note. Quotes (always symbol-tagged) and per-asset feeds keep routing isolated per asset.
+- **Quote clock-skew tolerance** widened to match the candle filters (a 60-second forward bound was silently rejecting every quote when the broker clock ran ahead).
+- **New tool** `node tools/live-integrity.js`: 21 checks proving the contract — gate blocks synthetic-only feeds (engine computed a CALL at confidence 97 on synthetic data and the gate correctly suppressed the display), warm-up accounting, zero synthetic residue after real history, and the cross-asset trust rules (XAU-scale batch rejected from a EURUSD feed).
+
 ## What's new in v2.6.5 — Clean Candle Data + Indicator Hardening
 
 Why the dashboard candles could diverge from the Quotex chart, and what changed:
