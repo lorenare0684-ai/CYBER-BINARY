@@ -94,16 +94,18 @@
       emit("quotex_status", s || {});
     },
     onCandle: function (msg) {
-      if (!msg || !msg.asset) return;
-      var key = msg.asset + "@" + (msg.period || 60);
+      if (!msg) return;
+      var asset = msg.asset || (live.activeChart && live.activeChart.symbol) || live.lastWsSymbol || "EURUSD";
+      var period = msg.period || live.lastWsPeriod || 60;
+      var key = asset + "@" + period;
       live.candles[key] = Array.isArray(msg.candles) ? msg.candles.slice(-5000) : [];
       var oldKeyAt = candleKeyOrder.indexOf(key);
       if (oldKeyAt >= 0) candleKeyOrder.splice(oldKeyAt, 1);
       candleKeyOrder.push(key);
-      while (candleKeyOrder.length > 12) delete live.candles[candleKeyOrder.shift()];
+      while (candleKeyOrder.length > 24) delete live.candles[candleKeyOrder.shift()];
       // History is low-frequency and remains available per asset/timeframe;
       // it never changes activeChart.
-      emit("candle", { asset: msg.asset, period: msg.period, candles: live.candles[key] });
+      emit("candle", { asset: asset, period: period, candles: live.candles[key] });
     },
     onTick: function (q) {
       if (!q || !q.symbol) return;
@@ -221,7 +223,45 @@
     }
 
     function isSeriesLike(s) {
-      return !!s && typeof s === "object" && typeof s.setMarkers === "function";
+      return !!s && typeof s === "object" && (typeof s.setMarkers === "function" || typeof s.setData === "function");
+    }
+
+    function hookSeries(s) {
+      if (!s || typeof s !== "object" || s.__cyberHooked) return s;
+      s.__cyberHooked = true;
+      var origSetData = s.setData;
+      if (typeof origSetData === "function") {
+        s.setData = function (data) {
+          try {
+            if (Array.isArray(data) && data.length) {
+              var sym = (live.activeChart && live.activeChart.symbol) || live.lastWsSymbol || "EURUSD";
+              var parsed = Q.parseCandles(data, sym, live.lastWsPeriod || 60);
+              var norm = Q.normalizeCandles(parsed || { raw: data });
+              if (norm.length) {
+                var p = (parsed && parsed.period) || live.lastWsPeriod || 60;
+                routerHandlers.onCandle({ asset: sym, period: p, candles: norm });
+              }
+            }
+          } catch (_) {}
+          return origSetData.apply(this, arguments);
+        };
+      }
+      var origUpdate = s.update;
+      if (typeof origUpdate === "function") {
+        s.update = function (bar) {
+          try {
+            if (bar && typeof bar === "object") {
+              var sym2 = (live.activeChart && live.activeChart.symbol) || live.lastWsSymbol || "EURUSD";
+              var norm2 = Q.normalizeCandles({ raw: [bar] });
+              if (norm2.length) {
+                routerHandlers.onCandle({ asset: sym2, period: live.lastWsPeriod || 60, candles: norm2 });
+              }
+            }
+          } catch (_) {}
+          return origUpdate.apply(this, arguments);
+        };
+      }
+      return s;
     }
 
     function seriesRank(s) {
@@ -237,6 +277,8 @@
     function findExistingSeries(c) {
       var best = null, bestRank = -1;
       function consider(candidate) {
+        if (!candidate) return;
+        hookSeries(candidate);
         var rank = seriesRank(candidate);
         if (rank > bestRank) { best = candidate; bestRank = rank; }
       }
@@ -276,6 +318,7 @@
       chart = c;
       chartContainer = container || chartContainer;
       series = findExistingSeries(c);
+      if (series) hookSeries(series);
       // Wrap series adders so a re-created main series (asset / timeframe
       // switch) is captured too. Candlestick/bar adders REPLACE the marker
       // target (they are the price chart); overlays (line/area/…/addSeries)
@@ -288,6 +331,7 @@
         c[n] = function () {
           var s = orig.apply(this, arguments);
           if (isSeriesLike(s)) {
+            hookSeries(s);
             if (n === "addCandlestickSeries" || n === "addBarSeries") series = s;
             else if (!series) series = s;
           }

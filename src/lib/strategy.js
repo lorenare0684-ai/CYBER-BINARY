@@ -56,9 +56,9 @@
         minScore: 3, lookback: 3,
       },
       weights: {
-        emaTrend: 0, emaCross: 0, rsiPull: 2, macd: 1, stoch: 2, bb: 3,
-        adxTrend: 0, supertrend: 0, psar: 0, vwap: 1, mtfAlign: 0,
-        hurst: 0, williams: 2, cci: 2, donchianBreak: 0,
+        emaTrend: 1, emaCross: 0, rsiPull: 2, macd: 1, stoch: 2, bb: 3,
+        adxTrend: 1, supertrend: 1, psar: 0, vwap: 1, mtfAlign: 0,
+        hurst: 1, williams: 2, cci: 2, donchianBreak: 0,
       },
     },
     "breakout": {

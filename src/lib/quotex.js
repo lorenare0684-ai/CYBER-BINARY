@@ -398,7 +398,8 @@
       // ACK/binary variants frequently add one transport envelope. Inspect it
       // before shape detection so {data:[[symbol,time,price]]} is not dropped.
       var wrapped = p.tick != null ? p.tick
-        : (p.quotes != null ? p.quotes : (p.data != null ? p.data : p.result));
+        : (p.quotes != null ? p.quotes : (p.data != null ? p.data
+        : (p.result != null ? p.result : (p.history != null ? p.history : (p.candles != null ? p.candles : null)))));
       if (wrapped != null && wrapped !== p) {
         var wrappedEvent = inferEventFromPayload(wrapped, depth + 1);
         if (wrappedEvent !== "unknown") return wrappedEvent;
@@ -423,13 +424,17 @@
         // Quotex candle rows: [ts, open, close, high, low, ...]
         if (first.length >= 5 && n0 != null && n1 != null && n2 != null &&
             numberValue(first[3]) != null && numberValue(first[4]) != null) {
-          if (n0 > 1e9) return "candles"; // timestamps far in the past → history batch
+          if (n0 > 1e9 || (n1 > 0 && n2 > 0)) return "candles"; // timestamps or OHLC prices
         }
+      } else if (first && typeof first === "object" && !Array.isArray(first)) {
+        if (("open" in first || "o" in first) && ("close" in first || "c" in first)) return "candles";
+        if ("symbol" in first && "price" in first) return "quote";
       }
       return "unknown";
     }
     if (typeof p === "object") {
       if (("asset" in p || "symbol" in p) && ("history" in p || "candles" in p || "period" in p)) return "candles";
+      if ("history" in p || "candles" in p) return "candles";
       if (("instrument" in p && Array.isArray(p.instrument)) ||
           ("instruments" in p && p.instruments && (Array.isArray(p.instruments) || typeof p.instruments === "object"))) return "instruments";
       if (Array.isArray(p.tick) || Array.isArray(p.quotes)) return "quote";
@@ -593,79 +598,132 @@
     return out;
   }
 
-  function parseCandles(payload) {
-    if (!payload || typeof payload !== "object") return null;
-    var body = payload.data && !Array.isArray(payload.data) && typeof payload.data === "object"
-      ? payload.data
-      : (payload.result && !Array.isArray(payload.result) && typeof payload.result === "object" ? payload.result : payload);
-    var asset = body.asset || body.symbol || body.pair || payload.asset || payload.symbol || payload.pair || null;
-    if (asset != null && /^\d+$/.test(String(asset)) && ID_TO_SYMBOL[Number(asset)]) asset = ID_TO_SYMBOL[Number(asset)];
-    var period = body.period != null ? body.period : (body.timeframe != null ? body.timeframe : (payload.period || payload.timeframe || null));
-    var rows = body.history || body.candles || (Array.isArray(body.data) ? body.data : null) ||
-      (Array.isArray(body.result) ? body.result : null) || (Array.isArray(payload.data) ? payload.data : null) ||
-      (Array.isArray(payload.result) ? payload.result : null) || null;
-    if (!asset || period == null) {
-      // Some servers push {history:[...]} without metadata (headerless flow).
-      // Caller should know the requested asset/period; assume 60s here.
-      if (Array.isArray(rows) && rows.length) {
-        var first = rows[0];
-        if (asset && Array.isArray(first) && first.length >= 5) {
-          var inferredAsset = normalizeSymbolName(asset);
-          return inferredAsset ? { asset: inferredAsset, period: 60, raw: rows } : null;
-        }
-      }
-      return null;
+  function parseCandles(payload, fallbackAsset, fallbackPeriod) {
+    if (!payload) return null;
+    var body = payload;
+    if (typeof payload === "object" && !Array.isArray(payload)) {
+      body = payload.data && !Array.isArray(payload.data) && typeof payload.data === "object"
+        ? payload.data
+        : (payload.result && !Array.isArray(payload.result) && typeof payload.result === "object" ? payload.result : payload);
     }
+    var asset = null;
+    if (typeof body === "object" && !Array.isArray(body)) {
+      asset = body.asset || body.symbol || body.pair || body.code || null;
+    }
+    if (!asset && typeof payload === "object" && !Array.isArray(payload)) {
+      asset = payload.asset || payload.symbol || payload.pair || payload.code || null;
+    }
+    if (!asset && fallbackAsset) asset = fallbackAsset;
+
+    if (asset != null && /^\d+$/.test(String(asset)) && ID_TO_SYMBOL[Number(asset)]) asset = ID_TO_SYMBOL[Number(asset)];
+    asset = normalizeSymbolName(asset);
+
+    var period = null;
+    if (typeof body === "object" && !Array.isArray(body)) {
+      period = body.period != null ? body.period : (body.timeframe != null ? body.timeframe : (body.time != null ? body.time : null));
+    }
+    if (period == null && typeof payload === "object" && !Array.isArray(payload)) {
+      period = payload.period != null ? payload.period : (payload.timeframe != null ? payload.timeframe : (payload.time != null ? payload.time : null));
+    }
+    if (period == null && fallbackPeriod != null) period = fallbackPeriod;
+
+    var rows = null;
+    if (Array.isArray(payload)) {
+      rows = payload;
+    } else if (typeof body === "object" && body != null) {
+      if (Array.isArray(body)) rows = body;
+      else if (Array.isArray(body.history)) rows = body.history;
+      else if (Array.isArray(body.candles)) rows = body.candles;
+      else if (Array.isArray(body.data)) rows = body.data;
+      else if (Array.isArray(body.result)) rows = body.result;
+      else if (Array.isArray(body.quotes)) rows = body.quotes;
+      else if (Array.isArray(payload.history)) rows = payload.history;
+      else if (Array.isArray(payload.candles)) rows = payload.candles;
+      else if (Array.isArray(payload.data)) rows = payload.data;
+      else if (Array.isArray(payload.result)) rows = payload.result;
+      else if (Array.isArray(payload.quotes)) rows = payload.quotes;
+    }
+
+    if (!Array.isArray(rows) || !rows.length) return null;
+
     if (typeof period === "object" && period != null) {
       period = period.time != null ? period.time : (period.value != null ? period.value : 60);
     }
     period = numberValue(period);
+    if (period == null || period <= 0) {
+      if (rows.length >= 2) {
+        var t0 = numberValue(Array.isArray(rows[0]) ? rows[0][0] : (rows[0] && rows[0].time));
+        var t1 = numberValue(Array.isArray(rows[1]) ? rows[1][0] : (rows[1] && rows[1].time));
+        if (t0 != null && t1 != null) {
+          while (t0 >= 1e14) t0 /= 1000;
+          while (t1 >= 1e14) t1 /= 1000;
+          if (t0 >= 1e11) t0 /= 1000;
+          if (t1 >= 1e11) t1 /= 1000;
+          var gap = Math.abs(Math.floor(t1) - Math.floor(t0));
+          if (gap > 0 && gap <= 86400) period = gap;
+        }
+      }
+    }
     period = period != null && period > 0 ? Math.min(86400, Math.floor(period)) : 60;
-    if (!Array.isArray(rows)) rows = [];
-    asset = normalizeSymbolName(asset);
-    if (!asset) return null;
-    return { asset: asset, period: period, raw: rows };
+
+    return { asset: asset || "", period: period, raw: rows };
   }
 
   function normalizeCandles(parsed) {
-    if (!parsed || !Array.isArray(parsed.raw)) return [];
+    if (!parsed) return [];
+    var raw = Array.isArray(parsed.raw) ? parsed.raw : (Array.isArray(parsed) ? parsed : []);
+    if (!raw.length) return [];
     var byTime = Object.create(null);
-    var start = Math.max(0, parsed.raw.length - 5000);
-    for (var i = start; i < parsed.raw.length; i++) {
-      var row = parsed.raw[i];
-      if (row && !Array.isArray(row) && typeof row === "object") {
-        row = [
-          row.time != null ? row.time : (row.ts != null ? row.ts : row.timestamp),
-          row.open, row.close, row.high, row.low,
-          row.volume != null ? row.volume : row.vol,
-        ];
+    var start = Math.max(0, raw.length - 5000);
+    for (var i = start; i < raw.length; i++) {
+      var row = raw[i];
+      if (!row) continue;
+      var ts = null, o = null, c = null, hi = null, lo = null, vol = 0;
+      if (typeof row === "object" && !Array.isArray(row)) {
+        ts = row.time != null ? row.time : (row.ts != null ? row.ts : row.timestamp);
+        o = row.open != null ? row.open : row.o;
+        c = row.close != null ? row.close : (row.c != null ? row.c : row.price);
+        var rH = row.high != null ? row.high : row.h;
+        var rL = row.low != null ? row.low : row.l;
+        var rV = row.volume != null ? row.volume : (row.vol != null ? row.vol : row.v);
+        o = numberValue(o);
+        c = numberValue(c);
+        rH = numberValue(rH);
+        rL = numberValue(rL);
+        vol = numberValue(rV) || 0;
+        if (o != null && c != null) {
+          hi = Math.max(o, c);
+          lo = Math.min(o, c);
+          if (rH != null && rH > 0 && rH <= 1e100) { hi = Math.max(hi, rH); lo = Math.min(lo, rH); }
+          if (rL != null && rL > 0 && rL <= 1e100) { hi = Math.max(hi, rL); lo = Math.min(lo, rL); }
+        }
+      } else if (Array.isArray(row) && row.length >= 5) {
+        ts = row[0];
+        o = numberValue(row[1]);
+        var p2 = numberValue(row[2]);
+        var p3 = numberValue(row[3]);
+        var p4 = numberValue(row[4]);
+        if (o != null && p2 != null && p3 != null && p4 != null &&
+            o > 0 && p2 > 0 && p3 > 0 && p4 > 0) {
+          var maxP = Math.max(o, p2, p3, p4);
+          var minP = Math.min(o, p2, p3, p4);
+          if (p2 === maxP && p3 === minP && p4 !== maxP && p4 !== minP) {
+            c = p4;
+            hi = p2;
+            lo = p3;
+          } else {
+            c = p2;
+            hi = Math.max(o, c, p3, p4);
+            lo = Math.min(o, c, p3, p4);
+          }
+          if (row.length > 5 && row[5] != null) vol = numberValue(row[5]) || 0;
+        }
       }
-      if (!Array.isArray(row) || row.length < 5) continue;
-      // Quotex history rows are [ts, open, close, high, low, vol?]. The old
-      // decoder treated index 4 (low) as close, which made historical candle
-      // bodies and every close-based indicator disagree with the broker chart.
-      // Derive the wick envelope from all four prices to tolerate occasional
-      // high/low inversions while preserving the canonical close at index 2.
-      var ts = numberValue(row[0]);
-      var o = numberValue(row[1]);
-      var c = numberValue(row[2]);
-      var reportedHigh = numberValue(row[3]);
-      var reportedLow = numberValue(row[4]);
-      if (ts == null || o == null || c == null ||
-          o <= 0 || c <= 0 || o > 1e100 || c > 1e100) continue;
-      var hi = Math.max(o, c);
-      var lo = Math.min(o, c);
-      if (reportedHigh != null && reportedHigh > 0 && reportedHigh <= 1e100) {
-        hi = Math.max(hi, reportedHigh); lo = Math.min(lo, reportedHigh);
-      }
-      if (reportedLow != null && reportedLow > 0 && reportedLow <= 1e100) {
-        hi = Math.max(hi, reportedLow); lo = Math.min(lo, reportedLow);
-      }
-      var rawVol = row.length > 5 && row[5] != null ? numberValue(row[5]) : 0;
-      var vol = rawVol == null ? 0 : rawVol;
-      // Accept unix seconds, milliseconds, microseconds, or nanoseconds consistently.
+      if (ts == null || o == null || c == null || hi == null || lo == null ||
+          o <= 0 || c <= 0 || hi <= 0 || lo <= 0 ||
+          o > 1e100 || c > 1e100 || hi > 1e100 || lo > 1e100) continue;
       var tMs = toMs(ts);
-      if (!Number.isFinite(tMs) || tMs < 0) continue;
+      if (tMs == null || tMs < 946684800000 || tMs > Date.now() + 300000) continue;
       byTime[tMs] = {
         time: tMs,
         open: o, high: hi, low: lo, close: c,
@@ -1629,6 +1687,8 @@
     handlers = handlers || {};
     var pendingHeader = null; // last 451-/43N-["event"] seen
     var pendingCount = 0;     // binary attachments still expected
+    var lastAsset = null;
+    var lastPeriod = 60;
     var listeners = {
       status:    handlers.onStatus    || function () {},
       candle:    handlers.onCandle    || function () {},
@@ -1645,10 +1705,15 @@
     }
 
     function emitCandles(payload) {
-      var c = parseCandles(payload);
-      if (c) {
-        try { listeners.candle({ asset: c.asset, period: c.period, candles: normalizeCandles(c) }); } catch (_) {}
-        feed("candles", c, payload && payload.raw ? payload : null);
+      var c = parseCandles(payload, lastAsset, lastPeriod);
+      if (c && Array.isArray(c.raw) && c.raw.length) {
+        var asset = c.asset || lastAsset || "";
+        var period = c.period || lastPeriod || 60;
+        var normalized = normalizeCandles(c);
+        if (normalized.length) {
+          try { listeners.candle({ asset: asset, period: period, candles: normalized }); } catch (_) {}
+          feed("candles", { asset: asset, period: period, candles: normalized }, payload && payload.raw ? payload : null);
+        }
       }
     }
 
@@ -1662,9 +1727,12 @@
       feed("instruments", list, null);
     }
 
-    function emitAsset(symbol) {
+    function emitAsset(symbol, hit) {
       if (!symbol) return;
-      try { listeners.asset(String(symbol)); } catch (_) {}
+      var sym = normalizeSymbolName(symbol);
+      if (sym) lastAsset = sym;
+      if (hit && hit.period) lastPeriod = hit.period;
+      try { listeners.asset(String(symbol), hit); } catch (_) {}
       feed("asset", String(symbol), null);
     }
 
@@ -1674,8 +1742,10 @@
       // another subscription happened to appear first.
       var quotes = parseQuotes(payload);
       for (var qi = 0; qi < quotes.length; qi++) {
-        try { listeners.tick(quotes[qi]); } catch (_) {}
-        feed("tick", quotes[qi], null);
+        var q = quotes[qi];
+        if (q && q.symbol && !lastAsset) lastAsset = q.symbol;
+        try { listeners.tick(q); } catch (_) {}
+        feed("tick", q, null);
       }
     }
 
@@ -1786,6 +1856,10 @@
           emitTick(frame.payload);
         } else if (ev3 === "candles") {
           emitCandles(frame.payload);
+        } else if (ev3 === "asset" || frame.event === "instruments/follow" || frame.event === "instruments/update") {
+          var assetSymbol = frame.payload && typeof frame.payload === "object"
+            ? (frame.payload.asset || frame.payload.symbol) : frame.payload;
+          emitAsset(assetSymbol, typeof frame.payload === "object" ? frame.payload : null);
         } else if (ev3 === "order_opened") {
           emitOrderOpen(frame.payload);
         } else if (ev3 === "order_closed") {
