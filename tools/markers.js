@@ -285,8 +285,9 @@ function hookTests() {
     });
     check("native render via setMarkers", hk.mode() === "native" && setMarkersCalls.length >= 1, hk.mode());
     const last = setMarkersCalls[setMarkersCalls.length - 1];
-    check("setMarkers got normalized UTC-second list",
-      last.length === 2 && last[0].time === Math.floor(t0 / 1000) && last[0].shape === "arrowUp" && last[1].shape === "arrowDown",
+    check("setMarkers got timeframe-aligned UTC-second list",
+      last.length === 2 && last[0].time === Math.floor(Math.floor(t0 / 1000) / 60) * 60 &&
+      last[0].shape === "arrowUp" && last[1].shape === "arrowDown",
       JSON.stringify(last));
     check("markers sorted ascending", last[0].time < last[1].time);
     // re-send same payload → same normalized list (idempotent, never repaints)
@@ -304,6 +305,18 @@ function hookTests() {
     });
     const after = JSON.stringify(setMarkersCalls[setMarkersCalls.length - 1]);
     check("re-render is idempotent (anchors unchanged)", before === after, before + " vs " + after);
+    msgListener2({
+      source: sandbox2.window,
+      data: { source: "CYBER_BINARY_CONTENT", kind: "markers", payload: {
+        asset: "EURUSD_otc", period: 300,
+        markers: [{ time: t0 + 120000, price: 1.085, dir: "CALL" }],
+        bars: [],
+      } },
+    });
+    const fiveMinute = setMarkersCalls[setMarkersCalls.length - 1];
+    check("native marker aligns to the visible 5m Quotex candle",
+      fiveMinute.length === 1 && fiveMinute[0].time === Math.floor(Math.floor((t0 + 120000) / 1000) / 300) * 300,
+      JSON.stringify(fiveMinute));
     return hk;
   })();
   void hk2;

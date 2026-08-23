@@ -6,7 +6,7 @@
  *   - tools/page-hook.shell.js (MAIN-world WebSocket hook shell)
  *
  * Rebuild after any change to either source file.
- * Generated: 2026-08-23T06:28:54.454Z
+ * Generated: 2026-08-23T06:39:28.742Z
  */
 /* ====================================================================
  * Inlined CYBER_QUOTEX adapter (src/lib/quotex.js).
@@ -2251,10 +2251,25 @@
       return !!s && typeof s === "object" && typeof s.setMarkers === "function";
     }
 
+    function seriesRank(s) {
+      if (!s || typeof s !== "object") return -1;
+      var type = "";
+      try { type = typeof s.seriesType === "function" ? String(s.seriesType()) : ""; } catch (_) {}
+      if (/candlestick/i.test(type)) return 100;
+      if (/bar/i.test(type)) return 90;
+      if (isSeriesLike(s) && typeof s.priceToCoordinate === "function") return 40;
+      return isSeriesLike(s) ? 10 : -1;
+    }
+
     function findExistingSeries(c) {
+      var best = null, bestRank = -1;
+      function consider(candidate) {
+        var rank = seriesRank(candidate);
+        if (rank > bestRank) { best = candidate; bestRank = rank; }
+      }
       try {
         var arr = c.series();
-        if (Array.isArray(arr) && arr.length && isSeriesLike(arr[0])) return arr[0];
+        if (Array.isArray(arr)) for (var ai = 0; ai < arr.length; ai++) consider(arr[ai]);
       } catch (_) {}
       try {
         var keys = Object.keys(c);
@@ -2262,11 +2277,11 @@
         for (var i = 0; i < n; i++) {
           var v = c[keys[i]];
           if (Array.isArray(v)) {
-            for (var j = 0; j < v.length && j < 20; j++) if (isSeriesLike(v[j])) return v[j];
-          } else if (isSeriesLike(v)) return v;
+            for (var j = 0; j < v.length && j < 20; j++) consider(v[j]);
+          } else consider(v);
         }
       } catch (_) {}
-      return null;
+      return best;
     }
 
     function containerArea(el) {
@@ -2313,17 +2328,29 @@
 
     function hasChart() { return !!chart; }
 
+    function markerPeriod() {
+      var raw = Number(lastPayload && lastPayload.period);
+      return Number.isFinite(raw) && raw >= 1 && raw <= 86400 ? Math.floor(raw) : 60;
+    }
+
+    function markerSecond(value) {
+      var time = Number(value);
+      if (!Number.isFinite(time) || time <= 0) return null;
+      while (time >= 1e14) time /= 1000;
+      var sec = Math.floor(time >= 1e11 ? time / 1000 : time);
+      if (!Number.isSafeInteger(sec) || sec <= 0) return null;
+      var period = markerPeriod();
+      return Math.floor(sec / period) * period;
+    }
+
     /** Raw markers -> lightweight-charts setMarkers() format. */
     function normalize(list) {
       var byTime = Object.create(null);
       var arr = Array.isArray(list) ? list.slice(-MAX) : [];
       for (var i = 0; i < arr.length; i++) {
         var m = arr[i];
-        var time = Number(m && m.time);
-        if (!m || (m.dir !== "CALL" && m.dir !== "PUT") || !Number.isFinite(time) || time <= 0) continue;
-        while (time >= 1e14) time /= 1000;
-        var sec = Math.floor(time >= 1e11 ? time / 1000 : time);
-        if (!Number.isSafeInteger(sec) || sec <= 0) continue;
+        var sec = markerSecond(m && m.time);
+        if (!m || (m.dir !== "CALL" && m.dir !== "PUT") || sec == null) continue;
         var put = m.dir === "PUT";
         byTime[sec] = {
           time: sec,
@@ -2346,6 +2373,7 @@
       if (!payload || typeof payload !== "object" || Array.isArray(payload)) payload = null;
       lastPayload = payload ? {
         asset: typeof payload.asset === "string" ? payload.asset.slice(0, 64) : "",
+        period: Number.isFinite(Number(payload.period)) ? Math.max(1, Math.min(86400, Math.floor(Number(payload.period)))) : 60,
         markers: Array.isArray(payload.markers) ? payload.markers.slice(-MAX) : [],
         bars: Array.isArray(payload.bars) ? payload.bars.slice(-400) : [],
       } : null;
@@ -2394,7 +2422,10 @@
     }
 
     function ensureOverlay() {
-      var target = findChartCanvas();
+      // Lightweight Charts coordinates are relative to its container. Prefer
+      // that exact element over guessing the largest canvas on the page.
+      var target = chartContainer && chartContainer.isConnected && containerArea(chartContainer) > 0
+        ? chartContainer : findChartCanvas();
       if (overlay && overlay.el && overlay.el.isConnected && overlay.target === target) return overlay;
       if (overlay) hideOverlay();
       overlay = null;
@@ -2462,17 +2493,57 @@
       var pad = (hi - lo) * 0.08 || (hi * 0.001 || 0.001);
       lo -= pad; hi += pad;
       var W = rect.width, H = rect.height;
+      var timeScale = null;
+      try { timeScale = chart && typeof chart.timeScale === "function" ? chart.timeScale() : null; } catch (_) {}
+      var exactTime = !!timeScale && typeof timeScale.timeToCoordinate === "function";
+      var exactPrice = !!series && typeof series.priceToCoordinate === "function";
+      var periodMs = markerPeriod() * 1000;
       for (var k = 0; k < markers.length; k++) {
         var m = markers[k];
-        var markerTime = Number(m && m.time), markerPrice = Number(m && m.price);
-        if (!m || (m.dir !== "CALL" && m.dir !== "PUT") || !Number.isFinite(markerTime) ||
+        var markerSec = markerSecond(m && m.time);
+        var markerPrice = Number(m && m.price);
+        if (!m || (m.dir !== "CALL" && m.dir !== "PUT") || markerSec == null ||
             !Number.isFinite(markerPrice) || markerPrice <= 0) continue;
-        while (markerTime >= 1e14) markerTime /= 1000;
-        if (markerTime < 1e11) markerTime *= 1000;
-        if (markerTime < t0 || markerTime > t1) continue;
-        var x = ((markerTime - t0) / (t1 - t0)) * W;
-        var y = H - ((markerPrice - lo) / (hi - lo)) * H;
-        if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+        var markerTime = markerSec * 1000;
+        if (markerTime < t0 || markerTime > t1 + periodMs) continue;
+
+        // Find the matching broker-timeframe candle. This both avoids linear
+        // timestamp drift across gaps and gives the true high/low for vertical
+        // placement rather than drawing at the candle close.
+        var barIndex = -1;
+        for (var bi = bars.length - 1; bi >= 0; bi--) {
+          var bt = Number(bars[bi] && bars[bi].time);
+          while (bt >= 1e14) bt /= 1000;
+          if (bt < 1e11) bt *= 1000;
+          bt = Math.floor(bt / periodMs) * periodMs;
+          if (bt === markerTime) { barIndex = bi; break; }
+          if (bt < markerTime) break;
+        }
+        var matchedBar = barIndex >= 0 ? bars[barIndex] : null;
+        var anchorPrice = m.dir === "PUT" && matchedBar ? Number(matchedBar.high)
+          : (m.dir === "CALL" && matchedBar ? Number(matchedBar.low) : markerPrice);
+        if (!Number.isFinite(anchorPrice) || anchorPrice <= 0) anchorPrice = markerPrice;
+
+        var x = NaN, y = NaN;
+        if (exactTime) {
+          try {
+            var rawX = timeScale.timeToCoordinate(markerSec);
+            x = rawX == null ? NaN : Number(rawX);
+          } catch (_) {}
+          // A null/off-screen coordinate must stay hidden, not be remapped to
+          // the full cached history range.
+          if (!Number.isFinite(x)) continue;
+        } else if (barIndex >= 0) {
+          x = ((barIndex + 0.5) / bars.length) * W;
+        }
+        if (exactPrice) {
+          try {
+            var rawY = series.priceToCoordinate(anchorPrice);
+            y = rawY == null ? NaN : Number(rawY);
+          } catch (_) {}
+        }
+        if (!Number.isFinite(y)) y = H - ((anchorPrice - lo) / (hi - lo)) * H;
+        if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || x > W || y < -30 || y > H + 30) continue;
         drawArrow(ctx, x, y, m.dir === "PUT");
       }
     }

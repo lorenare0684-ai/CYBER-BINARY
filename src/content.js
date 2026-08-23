@@ -456,19 +456,25 @@
     catch (_) {}
   }
 
-  /** Push the active asset's markers (+ recent bars for the overlay
-   *  fallback) to the MAIN-world page hook, which renders them natively on
-   *  the lightweight-charts instance (or its own overlay canvas). */
+  /** Push the active asset's markers plus bars from the SAME timeframe shown
+   *  by Quotex. Sending 1m bars while the platform displayed 5m/15m made the
+   *  overlay project arrows into the wrong horizontal slots. */
   function sendMarkers() {
     if (!markerStore) return;
     try {
+      const visibleChart = chartForActiveAsset();
+      const period = visibleChart && Number.isFinite(Number(visibleChart.period))
+        ? Math.max(1, Math.floor(Number(visibleChart.period))) : 60;
+      const bars = visibleChart && Array.isArray(visibleChart.candles) && visibleChart.candles.length
+        ? visibleChart.candles : activeFeed.series();
       window.postMessage({
         source: "CYBER_BINARY_CONTENT",
         kind: "markers",
         payload: {
           asset: activeAsset,
+          period,
           markers: markerStore.list(activeAsset),
-          bars: activeFeed.series().slice(-200),
+          bars: bars.slice(-400),
         },
       }, "*");
     } catch (_) {}
@@ -689,6 +695,7 @@
     // other open/mini charts are retained per asset+period but NEVER select
     // the active chart.
     mergeChartCandles(id, safePeriod, real);
+    if (id === activeAsset && safePeriod === lastWsPeriod) sendMarkers();
   }
 
   function normalizeStatus(value) {
@@ -868,11 +875,15 @@
       cachedSignal = sig;
       cachedAnalysisKey = analysisKey;
 
-      if (markerStore && sig.ready && sig.direction !== "WAIT" && sig.time != null && closed) {
+      if (markerStore && sig.ready && sig.direction !== "WAIT" && sig.entryTime != null && closed) {
         const added = markerStore.add({
           asset: sig.asset,
-          time: sig.time,
-          price: closed.close,
+          // The decision is known at the closed bar boundary, which is the
+          // opening timestamp of the actual entry candle on Quotex. Anchoring
+          // to sig.time put live arrows one candle left of settled-history
+          // arrows, which already use entryTime.
+          time: sig.entryTime,
+          price: sig.entryPrice != null ? sig.entryPrice : closed.close,
           dir: sig.direction,
           confidence: sig.confidence,
         });
@@ -1218,6 +1229,7 @@
             lastWsPrice = null;
             lastWsTickAt = 0;
           }
+          sendMarkers();
         }
         break;
       }
