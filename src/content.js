@@ -1632,10 +1632,17 @@
     // Prefer the page's already-authenticated socket. Unlike a raw DOM click,
     // this carries the exact asset/expiry and can be correlated with the
     // broker's s_orders/open response.
-    const accountModeKnown = !!(lastBalance && typeof lastBalance.isDemo === "boolean");
-    const wsResult = accountModeKnown
-      ? await sendWsTrade({ asset, dir, stake, expirySec, optionType: args.optionType })
-      : { ok: false, confirmed: false, sent: false, error: "broker account mode is not known" };
+    const isDemo = (lastBalance && typeof lastBalance.isDemo === "boolean")
+      ? lastBalance.isDemo
+      : (QUOTEX.findAccountMode ? (QUOTEX.findAccountMode() || {}).isDemo : true);
+    const wsResult = await sendWsTrade({
+      asset,
+      dir,
+      stake,
+      expirySec,
+      optionType: args.optionType,
+      isDemo: isDemo !== false,
+    });
     if (wsResult && wsResult.ok) return wsResult;
     if (wsResult && wsResult.sent) {
       // The frame may have reached the broker; never click as a retry or we

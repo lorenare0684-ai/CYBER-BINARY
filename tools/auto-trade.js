@@ -98,7 +98,7 @@ sandbox.document = {
     // — "input" contains "put"!).
     if (/class\*='(call|up|buy)'|data-type='CALL'|data-direction='CALL'/.test(s)) return [callBtn];
     if (/class\*='(put|down|sell)'|data-type='PUT'|data-direction='PUT'/.test(s)) return [putBtn];
-    if (/expir|duration/.test(s)) return [expiryInput];
+    if (/expir|duration|time/.test(s)) return [expiryInput];
     if (/class\*='(amount|stake|sum)'|aria-label\*='(amount|stake)'|placeholder\*='(amount|stake)'|name='(amount|sum)'|testid\*='(amount|stake)'|inputmode=|type='number'/.test(s)) return [stakeInput];
     if (/panel|sidebar|deals/.test(s)) return [];
     return allEls;
@@ -177,6 +177,9 @@ const Q = sandbox.self.CYBER_QUOTEX;
 // ---------- 4. DOM placement ----------
 check("findCallButton finds green hashed button", Q.findCallButton() === callBtn);
 check("findPutButton finds red hashed button", Q.findPutButton() === putBtn);
+check("findExpirySelect discovers expiration control", Q.findExpirySelect() === expiryInput);
+const okExpiry = Q.setExpiry(60);
+check("setExpiry safely sets expiration", okExpiry && okExpiry.ok === true, "error=" + (okExpiry && okExpiry.error));
 const okStake = Q.setStake(5);
 check("setStake writes into amount input", okStake && stakeInput.value === "5", "ok=" + okStake + " value=" + stakeInput.value);
 const placed = Q.placeTradeDom({ dir: "CALL", amount: 5, expirySec: 60 });
