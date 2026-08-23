@@ -1075,7 +1075,9 @@
     const minConf = Number.isFinite(rawMinConf) ? Math.max(0, Math.min(100, rawMinConf)) : 0;
     const kind = $("bt-kinds").value;
     const kinds = kind === "all" ? null : [kind];
-    const o = { days, horizon, minConf, kinds, minBars: 150, liveOnly: true, requireLive: true };
+    // Lean backtests warm up at 50 bars. Requiring 155 cached bars here made a
+    // normal 100-bar Quotex history response look like "no data".
+    const o = { days, horizon, minConf, kinds, minBars: 50, liveOnly: true, requireLive: true };
 
     const btn = $("bt-run");
     btn.disabled = true;
@@ -1089,10 +1091,18 @@
     }
 
     const assetPool = ASSETS.list().filter((a) => !kinds || kinds.includes(a.kind)).slice(0, 256);
-    const minNeeded = Math.max(40, o.minBars + horizon + 2);
-    const loadLiveCache = Promise.all(assetPool.map((a) =>
+    const minNeeded = Math.max(40, 50 + horizon + 1);
+    // Ask the selected Quotex tab for broker history immediately instead of
+    // assuming its periodic subscription has already completed. Give the
+    // socket response/storage write a short window before reading the cache.
+    const requestFreshHistory = hasChrome
+      ? chrome.runtime.sendMessage({ type: "CYBER_REQUEST_HISTORY", limit: 5000 })
+          .catch(() => null)
+          .then(() => new Promise((resolve) => setTimeout(resolve, 1200)))
+      : Promise.resolve();
+    const loadLiveCache = requestFreshHistory.then(() => Promise.all(assetPool.map((a) =>
       STORE.getCandles(a.id).then((bars) => ({ asset: a, bars })).catch(() => ({ asset: a, bars: [] }))
-    )).then((rows) => {
+    ))).then((rows) => {
       const cachedByAsset = Object.create(null);
       const liveAssets = [];
       rows.forEach((row) => {
@@ -1103,7 +1113,7 @@
         }
       });
       if (!liveAssets.length) {
-        return { results: [], count: 0, liveOnly: true, error: "No cached Quotex live candles yet. Open Quotex, let the tick feed run for a few minutes, then retry." };
+        return { results: [], count: 0, liveOnly: true, error: "No usable Quotex candles were received. Keep the selected Quotex chart open and connected, then retry; at least " + minNeeded + " one-minute bars are required." };
       }
       o.assets = liveAssets;
       o.cachedByAsset = cachedByAsset;

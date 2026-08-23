@@ -1946,19 +1946,25 @@
      * chart opens, so nothing extra is needed to receive `quotes/stream` and
      * `history/list/v2` frames from the server. Safe to call repeatedly.
      */
-    subscribeHistory: function (ws, asset, period) {
+    subscribeHistory: function (ws, asset, period, limit) {
       if (!ws || typeof ws.send !== "function") return { ok: false, error: "no websocket handle" };
       if (ws.readyState != null && numberValue(ws.readyState) !== 1) return { ok: false, error: "websocket is not open" };
       var sym = normalizeSymbolName(asset || "");
       if (!sym) return { ok: false, error: "asset required" };
       period = numberValue(period);
       period = period != null && period > 0 ? Math.min(86400, Math.floor(period)) : 60;
+      limit = numberValue(limit);
+      limit = limit != null ? Math.max(60, Math.min(5000, Math.floor(limit))) : 5000;
       try {
         ws.send('42["tick"]');
         ws.send('42["instruments/follow","' + sym + '"]');
         ws.send('42["instruments/update",{"asset":"' + sym + '","period":' + period + '}]');
+        // chart_notification/get does not return OHLC history on every Quotex
+        // build. Request the actual history endpoint explicitly; otherwise the
+        // cache receives ticks only and can take hours to become backtestable.
+        ws.send('42["history/list/v2",{"asset":"' + sym + '","period":' + period + ',"offset":0,"limit":' + limit + '}]');
         ws.send('42["chart_notification/get",{"asset":"' + sym + '","version":"1.0.0"}]');
-        return { ok: true, asset: sym, period: period };
+        return { ok: true, asset: sym, period: period, limit: limit };
       } catch (e) {
         return { ok: false, error: String(e && e.message || e) };
       }

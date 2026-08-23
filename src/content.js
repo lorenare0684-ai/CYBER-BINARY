@@ -111,7 +111,9 @@
 
   function createFeedFor(assetId) {
     if (feeds[assetId]) return feeds[assetId];
-    const f = self.CYBER_FEED.createFeed({ tfMs: TF_MS, max: 400 });
+    // Keep enough genuine 1m history for a useful multi-day backtest. The old
+    // 400-bar cap silently discarded most of the broker's history response.
+    const f = self.CYBER_FEED.createFeed({ tfMs: TF_MS, max: 5000 });
     feeds[assetId] = f;
     const a = ASSETS.get(assetId) || ASSETS.ensureRegistered(assetId) ||
       { id: assetId, basePrice: 1.0, vol: 0.0001, jumpRate: 0.005, decimals: 5 };
@@ -1117,19 +1119,26 @@
     return true;
   }
 
-  function ensureHistorySubscription(det) {
-    if (!det || !QUOTEX || !QUOTEX.subscribeHistory) return;
+  function ensureHistorySubscription(det, force, requestedLimit) {
+    if (!det || !QUOTEX || !QUOTEX.subscribeHistory) return false;
     const id = det.id;
     const at = historyRequestedAt[id] || 0;
-    if (Date.now() - at < 30000) return; // at most one request / 30s per asset
+    // Once real history has arrived, live ticks extend the cache; do not pull a
+    // 5,000-row batch on every periodic scan. The backtest button can still
+    // force one refresh on demand.
+    if (!force && historySeeded[id]) return false;
+    if (!force && Date.now() - at < 30000) return false; // retry initial attachment at most every 30s
+    const rawLimit = Number(requestedLimit);
+    const limit = Number.isFinite(rawLimit) ? Math.max(60, Math.min(5000, Math.floor(rawLimit))) : 5000;
     historyRequestedAt[id] = Date.now();
     try {
       window.postMessage({
         source: "CYBER_BINARY_CONTENT",
         kind: "subscribe",
-        payload: { asset: id, period: 60 },
+        payload: { asset: id, period: 60, limit },
       }, "*");
-    } catch (_) {}
+      return true;
+    } catch (_) { return false; }
   }
 
   function tick() {
@@ -1612,6 +1621,12 @@
     }
     if (msg && msg.type === "CYBER_PING") {
       sendResponse({ ok: true, attached: attached, bars: activeFeed.series().length, asset: activeAsset });
+    }
+    if (msg && msg.type === "CYBER_REQUEST_HISTORY") {
+      const det = ASSETS.get(activeAsset) || ASSETS.ensureRegistered(lastWsSymbol || activeAsset);
+      const requested = ensureHistorySubscription(det, true, msg.limit);
+      sendResponse({ ok: requested, asset: det && det.id || activeAsset, requested });
+      return;
     }
     if (msg && msg.type === "CYBER_SET_STRATEGY") {
       const requested = typeof msg.strategy === "string" ? msg.strategy.trim() : "";

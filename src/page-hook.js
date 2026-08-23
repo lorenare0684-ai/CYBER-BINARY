@@ -6,7 +6,7 @@
  *   - tools/page-hook.shell.js (MAIN-world WebSocket hook shell)
  *
  * Rebuild after any change to either source file.
- * Generated: 2026-08-23T06:04:03.092Z
+ * Generated: 2026-08-23T06:26:10.480Z
  */
 /* ====================================================================
  * Inlined CYBER_QUOTEX adapter (src/lib/quotex.js).
@@ -1960,19 +1960,25 @@
      * chart opens, so nothing extra is needed to receive `quotes/stream` and
      * `history/list/v2` frames from the server. Safe to call repeatedly.
      */
-    subscribeHistory: function (ws, asset, period) {
+    subscribeHistory: function (ws, asset, period, limit) {
       if (!ws || typeof ws.send !== "function") return { ok: false, error: "no websocket handle" };
       if (ws.readyState != null && numberValue(ws.readyState) !== 1) return { ok: false, error: "websocket is not open" };
       var sym = normalizeSymbolName(asset || "");
       if (!sym) return { ok: false, error: "asset required" };
       period = numberValue(period);
       period = period != null && period > 0 ? Math.min(86400, Math.floor(period)) : 60;
+      limit = numberValue(limit);
+      limit = limit != null ? Math.max(60, Math.min(5000, Math.floor(limit))) : 5000;
       try {
         ws.send('42["tick"]');
         ws.send('42["instruments/follow","' + sym + '"]');
         ws.send('42["instruments/update",{"asset":"' + sym + '","period":' + period + '}]');
+        // chart_notification/get does not return OHLC history on every Quotex
+        // build. Request the actual history endpoint explicitly; otherwise the
+        // cache receives ticks only and can take hours to become backtestable.
+        ws.send('42["history/list/v2",{"asset":"' + sym + '","period":' + period + ',"offset":0,"limit":' + limit + '}]');
         ws.send('42["chart_notification/get",{"asset":"' + sym + '","version":"1.0.0"}]');
-        return { ok: true, asset: sym, period: period };
+        return { ok: true, asset: sym, period: period, limit: limit };
       } catch (e) {
         return { ok: false, error: String(e && e.message || e) };
       }
@@ -2112,7 +2118,7 @@
     onCandle: function (msg) {
       if (!msg || !msg.asset) return;
       var key = msg.asset + "@" + (msg.period || 60);
-      live.candles[key] = Array.isArray(msg.candles) ? msg.candles.slice(-400) : [];
+      live.candles[key] = Array.isArray(msg.candles) ? msg.candles.slice(-5000) : [];
       var oldKeyAt = candleKeyOrder.indexOf(key);
       if (oldKeyAt >= 0) candleKeyOrder.splice(oldKeyAt, 1);
       candleKeyOrder.push(key);
@@ -2768,7 +2774,7 @@
       var sub = ev.data.payload || {};
       internalSubscriptionSend = true;
       var r;
-      try { r = Q.subscribeHistory(handle.lastWs, sub.asset, sub.period); }
+      try { r = Q.subscribeHistory(handle.lastWs, sub.asset, sub.period, sub.limit); }
       finally { internalSubscriptionSend = false; }
       emit("subscribe_result", { ok: !!(r && r.ok), payload: r || {} });
     } else if (ev.data.kind === "place_ws") {

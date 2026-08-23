@@ -96,7 +96,7 @@
     onCandle: function (msg) {
       if (!msg || !msg.asset) return;
       var key = msg.asset + "@" + (msg.period || 60);
-      live.candles[key] = Array.isArray(msg.candles) ? msg.candles.slice(-400) : [];
+      live.candles[key] = Array.isArray(msg.candles) ? msg.candles.slice(-5000) : [];
       var oldKeyAt = candleKeyOrder.indexOf(key);
       if (oldKeyAt >= 0) candleKeyOrder.splice(oldKeyAt, 1);
       candleKeyOrder.push(key);
@@ -752,7 +752,7 @@
       var sub = ev.data.payload || {};
       internalSubscriptionSend = true;
       var r;
-      try { r = Q.subscribeHistory(handle.lastWs, sub.asset, sub.period); }
+      try { r = Q.subscribeHistory(handle.lastWs, sub.asset, sub.period, sub.limit); }
       finally { internalSubscriptionSend = false; }
       emit("subscribe_result", { ok: !!(r && r.ok), payload: r || {} });
     } else if (ev.data.kind === "place_ws") {

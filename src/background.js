@@ -477,7 +477,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // arbitrary Quotex tab returned by chrome.tabs.query().
   if (msg.type === "CYBER_SET_ASSET" || msg.type === "CYBER_SET_STRATEGY" ||
       msg.type === "CYBER_SET_AUTO" || msg.type === "CYBER_DETECT_ASSET" ||
-      msg.type === "CYBER_QUOTEX_SET_AUTH") {
+      msg.type === "CYBER_REQUEST_HISTORY" || msg.type === "CYBER_QUOTEX_SET_AUTH") {
     getPrimaryTab().then((tab) => {
       if (!tab || tab.id == null) {
         sendResponse({ ok: false, error: "No Quotex tab selected" });

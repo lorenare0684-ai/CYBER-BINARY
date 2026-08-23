@@ -238,6 +238,12 @@ else {
   const wsPlace = Q.placeTradeWs(fakeW, { asset: "EURUSD_otc", dir: "CALL", amount: 1, expiry: 60, isDemo: true });
   if (!wsPlace || !wsPlace.ok) { console.error("placeTradeWs should succeed with fake ws"); failed++; }
   if (!fakeW.sent.some((m) => m.indexOf('"orders/open"') !== -1)) { console.error("orders/open not sent"); failed++; }
+  const historyRequest = Q.subscribeHistory(fakeW, "EURUSD", 60, 9000);
+  const historyFrame = fakeW.sent.find((m) => m.indexOf('"history/list/v2"') !== -1);
+  if (!historyRequest || !historyRequest.ok || historyRequest.limit !== 5000 ||
+      !historyFrame || historyFrame.indexOf('"limit":5000') === -1) {
+    console.error("subscribeHistory must explicitly request bounded broker OHLC history"); failed++;
+  }
 
   // v2.3: outgoing-frame sniffing — the client's own requests reveal the
   // active asset (this is the primary auto-detection source).
