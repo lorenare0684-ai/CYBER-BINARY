@@ -645,10 +645,12 @@
       const sel = $("strategy-select");
       if (sel && sel.value !== activeStrategy) sel.value = activeStrategy;
     }
-    if (state.realHistoryReady === true && Array.isArray(state.candles) && state.candles.length) {
-      // Keep only the bounded payload from the authoritative selected tab.
-      // The content script marks this true only after genuine 1m broker OHLC
-      // has replaced the synthetic warm-up feed.
+    if (Array.isArray(state.candles) && state.candles.length) {
+      // Cache the latest 1m series for the active asset so the backtest can
+      // consume it immediately instead of waiting for chrome.storage to settle.
+      // The backtest's own minBars gate rejects insufficient data; we must not
+      // withhold a genuine series just because realHistoryReady hasn't flipped
+      // yet (that flag requires ≥40 bars and can lag behind the live push).
       liveCandlesByAsset[activeAsset] = state.candles.slice(-500);
     }
 
@@ -753,8 +755,12 @@
     // v2.2: prefer the broker's own history for the chart; fall back to the
     // engine's 1m series. Real data replaces the synthetic seed, so the
     // chart matches the platform chart (same candles, EMA + MACD subplot).
+    // IMPORTANT: never fall back from chartCandles (the broker's actual
+    // timeframe candles) to candles (the 1m engine feed which may still
+    // contain synthetic warm-up bars). Mixing the two sources made the
+    // dashboard chart diverge from the platform chart.
     const chartCandles = (Array.isArray(state.chartCandles) && state.chartCandles.length
-      ? state.chartCandles : (Array.isArray(state.candles) ? state.candles : [])).slice(-500);
+      ? state.chartCandles : []).slice(-500);
     const markers = Array.isArray(state.markers) ? state.markers.slice(-600) : [];
     const nextChartKey = chartStateKey(chartCandles, state.chartPeriod, markers);
     if (nextChartKey !== lastChartKey) {
