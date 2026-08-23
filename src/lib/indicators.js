@@ -91,21 +91,24 @@
     const out = new Array(len).fill(null);
     period = Math.floor(numeric(period));
     if (!Number.isFinite(period) || period <= 0 || len < period) return out;
-    for (let i = period - 1; i < values.length; i++) {
+    const nums = new Array(len);
+    for (let i = 0; i < len; i++) {
+      const n = numeric(values[i]);
+      if (!Number.isFinite(n)) return out;
+      nums[i] = n;
+    }
+    for (let i = period - 1; i < len; i++) {
       let scale = 0;
-      let valid = true;
       for (let j = i - period + 1; j <= i; j++) {
-        const n = numeric(values[j]);
-        if (!Number.isFinite(n)) { valid = false; break; }
-        scale = Math.max(scale, Math.abs(n));
+        const absVal = Math.abs(nums[j]);
+        if (absVal > scale) scale = absVal;
       }
-      if (!valid) continue;
       if (scale === 0) { out[i] = 0; continue; }
       let scaledMean = 0;
-      for (let j = i - period + 1; j <= i; j++) scaledMean += (numeric(values[j]) / scale) / period;
+      for (let j = i - period + 1; j <= i; j++) scaledMean += (nums[j] / scale) / period;
       let scaledSquares = 0;
       for (let j = i - period + 1; j <= i; j++) {
-        const d = numeric(values[j]) / scale - scaledMean;
+        const d = nums[j] / scale - scaledMean;
         scaledSquares += (d * d) / period;
       }
       const result = Math.sqrt(scaledSquares) * scale;
@@ -182,25 +185,24 @@
         !Number.isFinite(kPeriod) || !Number.isFinite(dPeriod) || kPeriod <= 0 || dPeriod <= 0) {
       return { k, d: new Array(len).fill(null) };
     }
-    for (let i = kPeriod - 1; i < len; i++) {
-      let hh = -Infinity;
-      let ll = Infinity;
-      let valid = true;
-      for (let j = i - kPeriod + 1; j <= i; j++) {
-        const high = numeric(highs[j]), low = numeric(lows[j]);
-        if (!Number.isFinite(high) || !Number.isFinite(low) || high < low) { valid = false; break; }
-        if (high > hh) hh = high;
-        if (low < ll) ll = low;
+    const hNums = new Array(len), lNums = new Array(len), cNums = new Array(len);
+    for (let i = 0; i < len; i++) {
+      const h = numeric(highs[i]), l = numeric(lows[i]), c = numeric(closes[i]);
+      if (!Number.isFinite(h) || !Number.isFinite(l) || !Number.isFinite(c) || h < l || c > h || c < l) {
+        return { k, d: new Array(len).fill(null) };
       }
-      const close = numeric(closes[i]);
-      const currentHigh = numeric(highs[i]), currentLow = numeric(lows[i]);
-      if (!valid || !Number.isFinite(close) || close > currentHigh || close < currentLow) continue;
-      const range = hh - ll;
-      k[i] = range === 0 ? 50 : ((close - ll) / range) * 100;
+      hNums[i] = h; lNums[i] = l; cNums[i] = c;
     }
-    // Average only real %K values. Replacing the warm-up nulls with zero
-    // biased the first dPeriod-1 valid %D samples sharply downward.
-    const d = new Array(closes.length).fill(null);
+    for (let i = kPeriod - 1; i < len; i++) {
+      let hh = -Infinity, ll = Infinity;
+      for (let j = i - kPeriod + 1; j <= i; j++) {
+        if (hNums[j] > hh) hh = hNums[j];
+        if (lNums[j] < ll) ll = lNums[j];
+      }
+      const range = hh - ll;
+      k[i] = range === 0 ? 50 : ((cNums[i] - ll) / range) * 100;
+    }
+    const d = new Array(len).fill(null);
     const compact = [];
     const indices = [];
     for (let i = 0; i < k.length; i++) {
@@ -256,9 +258,6 @@
     return rma(tr, period);
   }
 
-  /* -------- new indicators -------- */
-
-  /** True range + Directional Movement (ADX / +DI / -DI) */
   function adx(highs, lows, closes, period) {
     const len = Array.isArray(closes) ? closes.length : 0;
     const tr = new Array(len).fill(null);
@@ -328,7 +327,6 @@
     return { tr: trN, plus: plusDI, minus: minusDI, adx: adxArr };
   }
 
-  /** Keltner channels (EMA + ATR) */
   function keltner(highs, lows, closes, period, mult) {
     const len = Array.isArray(closes) ? closes.length : 0;
     const mid = ema(closes, period);
@@ -350,7 +348,6 @@
     return { mid, upper, lower, atr: a };
   }
 
-  /** Parabolic SAR */
   function psar(highs, lows, opts) {
     const requestedStep = numeric(opts && opts.step);
     const requestedMax = numeric(opts && opts.max);
@@ -360,43 +357,42 @@
     const len = Array.isArray(highs) ? highs.length : 0;
     const out = new Array(len).fill(null);
     if (!Array.isArray(lows) || lows.length !== len || len < 2) return out;
+    const hNums = new Array(len), lNums = new Array(len);
     for (let i = 0; i < len; i++) {
       const high = numeric(highs[i]), low = numeric(lows[i]);
       if (!Number.isFinite(high) || !Number.isFinite(low) || high < low) return out;
+      hNums[i] = high; lNums[i] = low;
     }
-    // Rising bars begin bullish; the old comparison was reversed and seeded
-    // a rising market as bearish.
-    let bull = (numeric(highs[1]) + numeric(lows[1])) >= (numeric(highs[0]) + numeric(lows[0]));
+    let bull = (hNums[1] + lNums[1]) >= (hNums[0] + lNums[0]);
     let af = step;
-    let ep = bull ? Math.max(numeric(highs[0]), numeric(highs[1])) : Math.min(numeric(lows[0]), numeric(lows[1]));
-    let sar = bull ? Math.min(numeric(lows[0]), numeric(lows[1])) : Math.max(numeric(highs[0]), numeric(highs[1]));
+    let ep = bull ? Math.max(hNums[0], hNums[1]) : Math.min(lNums[0], lNums[1]);
+    let sar = bull ? Math.min(lNums[0], lNums[1]) : Math.max(hNums[0], hNums[1]);
     out[0] = sar;
     for (let i = 1; i < len; i++) {
       sar = sar + af * (ep - sar);
-      // SAR cannot penetrate either of the two previous bars.
-      if (bull) sar = Math.min(sar, lows[i - 1], i > 1 ? lows[i - 2] : lows[i - 1]);
-      else sar = Math.max(sar, highs[i - 1], i > 1 ? highs[i - 2] : highs[i - 1]);
+      if (bull) sar = Math.min(sar, lNums[i - 1], i > 1 ? lNums[i - 2] : lNums[i - 1]);
+      else sar = Math.max(sar, hNums[i - 1], i > 1 ? hNums[i - 2] : hNums[i - 1]);
       if (bull) {
-        if (lows[i] < sar) {
+        if (lNums[i] < sar) {
           bull = false;
           sar = ep;
-          ep = lows[i];
+          ep = lNums[i];
           af = step;
         } else {
-          if (highs[i] > ep) {
-            ep = highs[i];
+          if (hNums[i] > ep) {
+            ep = hNums[i];
             af = Math.min(max, af + step);
           }
         }
       } else {
-        if (highs[i] > sar) {
+        if (hNums[i] > sar) {
           bull = true;
           sar = ep;
-          ep = highs[i];
+          ep = hNums[i];
           af = step;
         } else {
-          if (lows[i] < ep) {
-            ep = lows[i];
+          if (lNums[i] < ep) {
+            ep = lNums[i];
             af = Math.min(max, af + step);
           }
         }
@@ -406,7 +402,6 @@
     return out;
   }
 
-  /** Supertrend (ATR-based) */
   function supertrend(highs, lows, closes, period, mult) {
     const len = Array.isArray(closes) ? closes.length : 0;
     const a = atr(highs, lows, closes, period);
@@ -417,11 +412,13 @@
     mult = numeric(mult);
     if (!Number.isFinite(mult) || mult <= 0 || !Array.isArray(highs) || !Array.isArray(lows) ||
         highs.length !== len || lows.length !== len) return { upper, lower, st, trend };
+    const hNums = new Array(len), lNums = new Array(len), cNums = new Array(len);
     for (let i = 0; i < len; i++) {
       const high = numeric(highs[i]), low = numeric(lows[i]), close = numeric(closes[i]);
       if (![high, low, close].every(Number.isFinite) || high < low || close > high || close < low) {
         return { upper, lower, st, trend };
       }
+      hNums[i] = high; lNums[i] = low; cNums[i] = close;
       if (a[i] == null) continue;
       const hl2 = (high + low) / 2;
       upper[i] = hl2 + mult * a[i];
@@ -430,25 +427,23 @@
     for (let i = 1; i < len; i++) {
       if (upper[i] == null) continue;
       if (upper[i - 1] == null) {
-        trend[i] = numeric(closes[i]) >= numeric(closes[i - 1]) ? 1 : -1;
+        trend[i] = cNums[i] >= cNums[i - 1] ? 1 : -1;
         st[i] = trend[i] === 1 ? lower[i] : upper[i];
         continue;
       }
-      if (upper[i] < upper[i - 1] || closes[i - 1] > upper[i - 1]) {
-        // keep
+      if (upper[i] < upper[i - 1] || cNums[i - 1] > upper[i - 1]) {
       } else {
         upper[i] = upper[i - 1];
       }
-      if (lower[i] > lower[i - 1] || closes[i - 1] < lower[i - 1]) {
-        // keep
+      if (lower[i] > lower[i - 1] || cNums[i - 1] < lower[i - 1]) {
       } else {
         lower[i] = lower[i - 1];
       }
       if (st[i - 1] == null) {
-        st[i] = closes[i] > upper[i] ? lower[i] : upper[i];
-        trend[i] = closes[i] > upper[i] ? 1 : -1;
+        st[i] = cNums[i] > upper[i] ? lower[i] : upper[i];
+        trend[i] = cNums[i] > upper[i] ? 1 : -1;
       } else if (st[i - 1] === upper[i - 1]) {
-        if (closes[i] > upper[i]) {
+        if (cNums[i] > upper[i]) {
           st[i] = lower[i];
           trend[i] = 1;
         } else {
@@ -456,7 +451,7 @@
           trend[i] = -1;
         }
       } else {
-        if (closes[i] < lower[i]) {
+        if (cNums[i] < lower[i]) {
           st[i] = upper[i];
           trend[i] = -1;
         } else {
@@ -468,7 +463,6 @@
     return { upper, lower, st, trend };
   }
 
-  /** VWAP — uses typical price, cumulative. Suitable for intraday resampling. */
   function vwap(highs, lows, closes, volumes) {
     const len = Array.isArray(closes) ? closes.length : 0;
     const out = new Array(len).fill(null);
@@ -492,35 +486,38 @@
     return out;
   }
 
-  /** Hurst exponent over a window — measures trend strength (0.5=random, >0.5=trending) */
   function hurst(closes, period) {
     const len = Array.isArray(closes) ? closes.length : 0;
     const out = new Array(len).fill(null);
     period = Math.floor(numeric(period));
     if (!Number.isFinite(period) || period < 2 || len < period) return out;
+    const nums = new Array(len);
+    for (let i = 0; i < len; i++) {
+      const n = numeric(closes[i]);
+      if (!Number.isFinite(n)) return out;
+      nums[i] = n;
+    }
+    const logN = Math.log(period);
     for (let i = period - 1; i < len; i++) {
-      const slice = closes.slice(i - period + 1, i + 1).map(numeric);
-      if (!slice.every(Number.isFinite)) continue;
-      const n = slice.length;
-      const mean = slice.reduce((a, b) => a + b, 0) / n;
-      let cumDev = 0;
-      let maxCum = 0;
-      let minCum = 0;
-      for (let j = 0; j < n; j++) {
-        cumDev += slice[j] - mean;
+      const start = i - period + 1;
+      let sum = 0;
+      for (let j = start; j <= i; j++) sum += nums[j];
+      const mean = sum / period;
+      let cumDev = 0, maxCum = 0, minCum = 0, sumSq = 0;
+      for (let j = start; j <= i; j++) {
+        const diff = nums[j] - mean;
+        cumDev += diff;
         if (cumDev > maxCum) maxCum = cumDev;
         if (cumDev < minCum) minCum = cumDev;
+        sumSq += diff * diff;
       }
       const R = maxCum - minCum;
-      let s = 0;
-      for (let j = 0; j < n; j++) s += (slice[j] - mean) ** 2;
-      s = Math.sqrt(s / n);
-      out[i] = s > 0 ? Math.log(R / s) / Math.log(n) : 0.5;
+      const s = Math.sqrt(sumSq / period);
+      out[i] = s > 0 ? Math.log(R / s) / logN : 0.5;
     }
     return out;
   }
 
-  /** Momentum — current close vs N bars ago, normalized by stdev. */
   function momentum(closes, period) {
     const len = Array.isArray(closes) ? closes.length : 0;
     const out = new Array(len).fill(null);
@@ -534,32 +531,32 @@
     return out;
   }
 
-  /** Williams %R */
   function williamsR(highs, lows, closes, period) {
     const len = Array.isArray(closes) ? closes.length : 0;
     const out = new Array(len).fill(null);
     period = Math.floor(numeric(period));
     if (!Array.isArray(highs) || !Array.isArray(lows) || highs.length !== len || lows.length !== len ||
         !Number.isFinite(period) || period <= 0) return out;
-    for (let i = period - 1; i < len; i++) {
-      let hh = -Infinity;
-      let ll = Infinity;
-      let valid = true;
-      for (let j = i - period + 1; j <= i; j++) {
-        const high = numeric(highs[j]), low = numeric(lows[j]);
-        if (!Number.isFinite(high) || !Number.isFinite(low) || high < low) { valid = false; break; }
-        if (high > hh) hh = high;
-        if (low < ll) ll = low;
+    const hNums = new Array(len), lNums = new Array(len), cNums = new Array(len);
+    for (let i = 0; i < len; i++) {
+      const h = numeric(highs[i]), l = numeric(lows[i]), c = numeric(closes[i]);
+      if (!Number.isFinite(h) || !Number.isFinite(l) || !Number.isFinite(c) || h < l || c > h || c < l) {
+        return out;
       }
-      const close = numeric(closes[i]);
-      if (!valid || !Number.isFinite(close) || close > numeric(highs[i]) || close < numeric(lows[i])) continue;
+      hNums[i] = h; lNums[i] = l; cNums[i] = c;
+    }
+    for (let i = period - 1; i < len; i++) {
+      let hh = -Infinity, ll = Infinity;
+      for (let j = i - period + 1; j <= i; j++) {
+        if (hNums[j] > hh) hh = hNums[j];
+        if (lNums[j] < ll) ll = lNums[j];
+      }
       const range = hh - ll;
-      out[i] = range === 0 ? -50 : ((hh - close) / range) * -100;
+      out[i] = range === 0 ? -50 : ((hh - cNums[i]) / range) * -100;
     }
     return out;
   }
 
-  /** Commodity Channel Index */
   function cci(highs, lows, closes, period) {
     const len = Array.isArray(closes) ? closes.length : 0;
     const out = new Array(len).fill(null);
@@ -584,7 +581,6 @@
     return out;
   }
 
-  /** Money Flow Index */
   function mfi(highs, lows, closes, volumes, period) {
     const len = Array.isArray(closes) ? closes.length : 0;
     const out = new Array(len).fill(null);
@@ -593,9 +589,7 @@
         highs.length !== len || lows.length !== len || volumes.length < len ||
         !Number.isFinite(period) || period <= 0) return out;
     for (let i = period; i < len; i++) {
-      let pos = 0;
-      let neg = 0;
-      let valid = true;
+      let pos = 0, neg = 0, valid = true;
       for (let j = i - period + 1; j <= i; j++) {
         const values = [highs[j], lows[j], closes[j], highs[j - 1], lows[j - 1], closes[j - 1], volumes[j]].map(numeric);
         if (!values.every(Number.isFinite) || values[6] < 0 ||
@@ -615,7 +609,6 @@
     return out;
   }
 
-  /** On-Balance Volume */
   function obv(closes, volumes) {
     const len = Array.isArray(closes) ? closes.length : 0;
     const out = new Array(len).fill(null);
@@ -635,7 +628,6 @@
     return out;
   }
 
-  /** Donchian channels (highest high / lowest low over period) */
   function donchian(highs, lows, period) {
     const len = Array.isArray(highs) ? highs.length : 0;
     const upper = new Array(len).fill(null);
@@ -644,26 +636,30 @@
     if (!Array.isArray(lows) || lows.length !== len || !Number.isFinite(period) || period <= 0) {
       return { upper, lower, mid: upper.slice() };
     }
-    for (let i = period - 1; i < len; i++) {
-      let hh = -Infinity;
-      let ll = Infinity;
-      let valid = true;
-      for (let j = i - period + 1; j <= i; j++) {
-        const high = numeric(highs[j]), low = numeric(lows[j]);
-        if (!Number.isFinite(high) || !Number.isFinite(low) || high < low) { valid = false; break; }
-        if (high > hh) hh = high;
-        if (low < ll) ll = low;
+    const hNums = new Array(len), lNums = new Array(len);
+    for (let i = 0; i < len; i++) {
+      const h = numeric(highs[i]), l = numeric(lows[i]);
+      if (!Number.isFinite(h) || !Number.isFinite(l) || h < l) {
+        return { upper, lower, mid: upper.slice() };
       }
-      if (!valid) continue;
+      hNums[i] = h; lNums[i] = l;
+    }
+    for (let i = period - 1; i < len; i++) {
+      let hh = -Infinity, ll = Infinity;
+      for (let j = i - period + 1; j <= i; j++) {
+        if (hNums[j] > hh) hh = hNums[j];
+        if (lNums[j] < ll) ll = lNums[j];
+      }
       upper[i] = hh;
       lower[i] = ll;
     }
-    return { upper, lower, mid: upper.map((u, i) => u == null ? null : (u + lower[i]) / 2) };
+    const mid = new Array(len).fill(null);
+    for (let i = period - 1; i < len; i++) {
+      mid[i] = (upper[i] + lower[i]) / 2;
+    }
+    return { upper, lower, mid };
   }
 
-  /* -------- multi-timeframe resampler -------- */
-
-  /** Resample a 1m candle series into N-minute bars. */
   function resample(candles, minutes) {
     if (!Array.isArray(candles)) return [];
     minutes = Math.floor(numeric(minutes));
@@ -737,19 +733,11 @@
     return { value: null, index: -1 };
   }
 
-  /** Score-based confidence calibration — softmax of weighted vote scores. */
   function softmaxProbs(callScore, putScore) {
-    // Vote scores are small integers and qualifying signals usually lead by at
-    // least two points. The former 2.5 multiplier turned a routine 2-point
-    // lead into 99.3%, so the dashboard could display only 99% or WAIT/0%.
-    // A gentler temperature keeps confidence proportional to vote separation:
-    // 1 point ≈ 60%, 2 ≈ 69%, 3 ≈ 77%, 5 ≈ 88%.
     const k = 0.4;
     const c = numeric(callScore);
     const p = numeric(putScore);
     if (!Number.isFinite(c) || !Number.isFinite(p)) return { call: 0.5, put: 0.5 };
-    // Subtract the largest logit before exponentiating. This is algebraically
-    // identical but cannot produce Infinity / Infinity for large scores.
     const cLogit = k * Math.max(-1000000, Math.min(1000000, c));
     const pLogit = k * Math.max(-1000000, Math.min(1000000, p));
     const maxLogit = Math.max(cLogit, pLogit);

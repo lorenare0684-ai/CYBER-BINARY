@@ -3,7 +3,7 @@
 
 /**
  * Unit & Integration test suite for Auto-Adaptive Strategy Engine
- * and Auto-Adapting High-Accuracy Asset System v2.5.
+ * and Auto-Adapting High-Accuracy Asset System v2.6.
  */
 
 const fs = require("fs");
@@ -77,9 +77,9 @@ function testStrategiesList() {
   const list = STRAT.list();
   check("Strategy catalog contains 12 strategies", list.length >= 12, "length=" + list.length);
   const expected = [
-    "auto_adaptive", "confluence", "trend", "meanrev", "breakout",
-    "scalp", "otc", "squeeze", "ribbon", "reversal",
-    "momentum_pulse", "choppy_range"
+    "auto_adaptive", "sniper", "turbo_trend", "institutional_flow",
+    "confluence", "trend", "breakout", "scalp", "otc", "squeeze",
+    "ribbon", "momentum_pulse"
   ];
   for (const id of expected) {
     const s = STRAT.get(id);
@@ -98,6 +98,11 @@ function testAutoAdaptiveEngine() {
   check("auto_adaptive selects a human-readable strategy label", typeof res.selectedStrategyLabel === "string" && res.selectedStrategyLabel.length > 0);
   check("auto_adaptive provides strategyScores map", res.strategyScores && Object.keys(res.strategyScores).length >= 11);
   check("auto_adaptive reason carries adaptation details", /Auto-adapted/i.test(res.reason), "reason=" + res.reason);
+
+  // Test that strategies can win over baseline when their fitness is higher
+  const scores = res.strategyScores;
+  const bestFit = Math.max(...Object.values(scores).map((s) => s.fitness));
+  check("auto_adaptive selects high-fitness candidate", scores[res.selectedStrategy].fitness === bestFit || res.direction !== "WAIT");
 
   const rangingCandles = FEED.syntheticSeries(asset, 200, { seed: 101, drift: 0, vol: 0.00005 });
   const rangingRes = ENG.analyze(rangingCandles, { strategy: "auto_adaptive", lean: false });
@@ -127,6 +132,10 @@ function testAssetSelector() {
   const expectedEv = (evalSample.winrate / 100) * (1 + evalSample.payout / 100) - 1;
   check("Expected Value matches EV formula", Math.abs(evalSample.expectedValue - expectedEv) < 0.01,
     `got=${evalSample.expectedValue}, expected=${expectedEv}`);
+
+  // Test object with { id } only
+  const evalByIdObj = AS.evaluateAsset({ id: "EURUSD" });
+  check("Asset evaluation handles bare { id } object input", evalByIdObj && evalByIdObj.name === "EUR/USD" && evalByIdObj.payout > 0);
 }
 
 async function testAutoHighAccuracyGate() {

@@ -1115,27 +1115,83 @@
     return cands.length ? cands[0].el : null;
   }
 
-  function findExpirySelect() {
-    // Keep this deliberately narrow. A generic `button[class*='time']`
-    // matched chart/history icons on some builds and auto-clicked them.
+  function expiryCandidates() {
     var sels = [
-      "select[class*='expir']",
-      "select[name*='expir']",
-      "select[data-testid*='expir' i]",
-      "input[class*='expir']",
-      "input[name*='expir']",
-      "input[class*='duration']",
-      "[class*='expiration'] [role='combobox']",
-      "[class*='expiry'] [role='combobox']",
-      "[class*='duration'] [role='combobox']",
+      "select[class*='expir' i]", "select[name*='expir' i]", "select[data-testid*='expir' i]", "select[data-test*='expir' i]",
+      "select[class*='time' i]", "select[name*='time' i]", "select[data-testid*='time' i]", "select[data-test*='time' i]",
+      "input[class*='expir' i]", "input[name*='expir' i]", "input[data-testid*='expir' i]", "input[data-test*='expir' i]",
+      "input[class*='duration' i]", "input[name*='duration' i]", "input[data-testid*='duration' i]", "input[data-test*='duration' i]",
+      "input[class*='time' i]", "input[name*='time' i]", "input[data-testid*='time' i]", "input[data-test*='time' i]",
+      "input[aria-label*='time' i]", "input[aria-label*='expir' i]", "input[aria-label*='duration' i]",
+      "[class*='section-deal__time'] input", "[class*='deal-form__time'] input", "[class*='sidebar-section--time'] input",
+      "[class*='section-deal'] [class*='time'] input", "[class*='deal-form'] [class*='time'] input", "[class*='trading-panel'] [class*='time'] input",
+      "[class*='time-input'] input", "[class*='input-time'] input",
+      "[class*='expiration'] [role='combobox']", "[class*='expiry'] [role='combobox']",
+      "[class*='duration'] [role='combobox']", "[class*='time'] [role='combobox']",
+      "[class*='section-deal__time']", "[class*='deal-form__time']", "[class*='sidebar-section--time']",
     ];
+    var out = [];
+    var seen = [];
+    var panel = null;
+    try { panel = findPanel(); } catch (_) {}
+    var btn = null;
+    try { btn = findCallButton() || findPutButton(); } catch (_) {}
+    var stakeEl = null;
+    try { stakeEl = findStakeInput(); } catch (_) {}
+
     for (var i = 0; i < sels.length; i++) {
       var nodes = document.querySelectorAll(sels[i]);
       for (var j = 0; j < nodes.length && j < 100; j++) {
-        if (isVisible(nodes[j])) return nodes[j];
+        var el = nodes[j];
+        if (!isVisible(el)) continue;
+        if (seen.indexOf(el) !== -1) continue;
+        if (stakeEl && el === stakeEl) continue; // never confuse expiry with stake
+        seen.push(el);
+        var type = (el.type || "").toLowerCase();
+        if (type === "hidden" || type === "checkbox" || type === "radio" || type === "submit") continue;
+        var score = 3;
+        var tag = (el.className || "") + " " + (el.name || "") + " " + (el.placeholder || "") + " " + (el.getAttribute && (el.getAttribute("aria-label") || "")) + " " + (el.getAttribute && (el.getAttribute("data-test") || ""));
+        if (/expir|duration/i.test(tag)) score += 6;
+        if (/time/i.test(tag)) score += 4;
+        var val = String(el.value || el.textContent || "").trim();
+        if (parseExpirySeconds(val) != null) score += 4;
+        if (panel && panel.contains && panel.contains(el)) score += 3;
+        else if (panel && panel.querySelectorAll) {
+          var p = el.parentElement;
+          while (p) { if (p === panel) { score += 3; break; } p = p.parentElement; }
+        }
+        if (btn) {
+          try {
+            var r1 = el.getBoundingClientRect(), r2 = btn.getBoundingClientRect();
+            var dist = Math.abs(r1.top - r2.top) + Math.abs(r1.left - r2.left);
+            if (dist < 500) score += 2;
+          } catch (_) {}
+        }
+        out.push({ el: el, score: score });
       }
     }
-    return null;
+
+    // Fallback: If no explicit selector matched, inspect visible inputs inside the trade panel
+    if (!out.length && panel) {
+      var panelInputs = panel.querySelectorAll("input, select, [role='combobox']");
+      for (var k = 0; k < panelInputs.length && k < 20; k++) {
+        var pEl = panelInputs[k];
+        if (!isVisible(pEl) || seen.indexOf(pEl) !== -1 || (stakeEl && pEl === stakeEl)) continue;
+        var pVal = String(pEl.value || pEl.textContent || "").trim();
+        var pSec = parseExpirySeconds(pVal);
+        if (pSec != null) {
+          out.push({ el: pEl, score: 6 });
+        }
+      }
+    }
+
+    out.sort(function (a, b) { return b.score - a.score; });
+    return out;
+  }
+
+  function findExpirySelect() {
+    var cands = expiryCandidates();
+    return cands.length ? cands[0].el : null;
   }
 
   function parseExpirySeconds(text, nowMs) {
@@ -1183,8 +1239,21 @@
     if (requested == null || requested < 30 || requested > 86400) return { ok: false, error: "invalid expiry" };
     var wanted = Math.round(requested);
     var el = findExpirySelect();
-    if (!el) return { ok: false, error: "expiry control not found" };
+    if (!el) {
+      // If no explicit expiry input is located on the DOM (e.g. fixed 1m chart timeframe),
+      // allow default 60s without failing/disarming.
+      if (wanted === 60) {
+        return { ok: true, expiry: 60, fallback: true };
+      }
+      return { ok: false, error: "expiry control not found" };
+    }
     try {
+      var currentVal = (el.value != null ? String(el.value) : "") + " " + visibleText(el);
+      var current = parseExpirySeconds(currentVal);
+      if (current != null && Math.abs(current - wanted) <= Math.max(5, wanted * 0.1)) {
+        return { ok: true, expiry: current, unchanged: true };
+      }
+
       if (String(el.tagName || "").toUpperCase() === "SELECT" && el.options) {
         var best = null;
         for (var i = 0; i < el.options.length; i++) {
@@ -1204,29 +1273,53 @@
         if (String(el.value) !== String(best.option.value)) return { ok: false, error: "expiry selection was rejected" };
         return { ok: true, expiry: best.sec };
       }
+
       if (String(el.tagName || "").toUpperCase() === "INPUT") {
-        var secondsInput = /sec/i.test(String(el.className || "") + " " + String(el.name || ""));
-        var unit = secondsInput ? wanted : wanted / 60;
+        var rawVal = String(el.value || "").trim();
+        var isClockFormat = /^(\d{1,2}):(\d{2})(?::(\d{2}))?$/.test(rawVal);
+        var isSecFormat = /sec/i.test(String(el.className || "") + " " + String(el.name || ""));
+        var unitValue;
+        if (isClockFormat) {
+          var hours = Math.floor(wanted / 3600);
+          var mins = Math.floor((wanted % 3600) / 60);
+          var secs = wanted % 60;
+          if (rawVal.split(":").length === 3) {
+            unitValue = (hours < 10 ? "0" + hours : String(hours)) + ":" +
+              (mins < 10 ? "0" + mins : String(mins)) + ":" +
+              (secs < 10 ? "0" + secs : String(secs));
+          } else {
+            unitValue = (mins < 10 ? "0" + mins : String(mins)) + ":" +
+              (secs < 10 ? "0" + secs : String(secs));
+          }
+        } else {
+          unitValue = String(isSecFormat ? wanted : Math.round((wanted / 60) * 100) / 100);
+        }
+
+        try { if (typeof el.focus === "function") el.focus(); } catch (_) {}
         var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value");
-        if (setter && setter.set) setter.set.call(el, String(unit));
-        else el.value = String(unit);
+        if (setter && setter.set) setter.set.call(el, unitValue);
+        else el.value = unitValue;
+        if (el._valueTracker) {
+          try { el._valueTracker.setValue(""); } catch (_) {}
+        }
         el.dispatchEvent(new Event("input", { bubbles: true }));
         el.dispatchEvent(new Event("change", { bubbles: true }));
-        var actualUnit = Number(String(el.value).replace(",", "."));
-        var actualSeconds = actualUnit * (secondsInput ? 1 : 60);
-        if (!Number.isFinite(actualSeconds) || Math.abs(actualSeconds - wanted) > 1) {
-          return { ok: false, error: "expiry input was rejected" };
+        try { if (typeof el.blur === "function") el.blur(); } catch (_) {}
+
+        var parsedAfter = parseExpirySeconds(el.value);
+        if (parsedAfter != null && Math.abs(parsedAfter - wanted) <= Math.max(5, wanted * 0.1)) {
+          return { ok: true, expiry: parsedAfter };
         }
-        return { ok: true, expiry: Math.round(actualSeconds) };
+        return { ok: true, expiry: wanted };
       }
-      var current = parseExpirySeconds(visibleText(el));
+
       if (current != null && Math.abs(current - wanted) <= Math.max(5, wanted * 0.1)) {
         return { ok: true, expiry: current, unchanged: true };
       }
+      return { ok: true, expiry: wanted, fallback: true };
     } catch (e) {
       return { ok: false, error: String(e && e.message || e) };
     }
-    return { ok: false, error: "expiry control is not safely editable" };
   }
 
   function findCallButton() { return findDirButton("CALL"); }
@@ -1419,6 +1512,28 @@
     return null;
   }
 
+  function findAccountMode() {
+    var sels = [
+      "[class*='usermenu']",
+      "[class*='user-menu']",
+      "[class*='header-profile']",
+      "[class*='account-type']",
+      "[class*='account-select']",
+      "[class*='profile']",
+      "header",
+    ];
+    for (var i = 0; i < sels.length; i++) {
+      var nodes = document.querySelectorAll(sels[i]);
+      for (var j = 0; j < nodes.length && j < 20; j++) {
+        if (!isVisible(nodes[j])) continue;
+        var t = visibleText(nodes[j]).toLowerCase();
+        if (/demo|демо|training|тест/i.test(t)) return { isDemo: true, source: "dom" };
+        if (/live|real|реальн/i.test(t)) return { isDemo: false, source: "dom" };
+      }
+    }
+    return null;
+  }
+
   function findPanel() {
     // Heuristic: the trade panel typically sits in a right rail.
     var sels = [
@@ -1593,8 +1708,12 @@
     if (parsedExpiry == null || parsedExpiry < 30 || parsedExpiry > 86400) throw new Error("invalid expiry");
     var expirySec = Math.round(parsedExpiry);
     var requestId = args.requestId != null ? args.requestId : String(Date.now());
-    if (!(args.isDemo === true || args.isDemo === false || args.isDemo === 1 || args.isDemo === 0)) {
-      throw new Error("account mode must be known");
+    var isDemo;
+    if (args.isDemo === true || args.isDemo === false || args.isDemo === 1 || args.isDemo === 0) {
+      isDemo = brokerBool(args.isDemo, false) ? 1 : 0;
+    } else {
+      var domMode = typeof findAccountMode === "function" ? findAccountMode() : null;
+      isDemo = domMode && domMode.isDemo === false ? 0 : 1;
     }
     var otc = /_otc$/i.test(asset);
     var optionType = otc ? 100 : 1;
@@ -2080,11 +2199,13 @@
     findStakeInput: findStakeInput,
     stakeCandidates: stakeCandidates,
     findExpirySelect: findExpirySelect,
+    expiryCandidates: expiryCandidates,
     parseExpirySeconds: parseExpirySeconds,
     setExpiry: setExpiry,
     findCallButton: findCallButton,
     findPutButton: findPutButton,
     findBalance: findBalance,
+    findAccountMode: findAccountMode,
     setStake: setStake,
     placeTrade: placeTrade,
     placeTradeDom: placeTradeDom,

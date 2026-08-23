@@ -1,8 +1,37 @@
-# CYBER BINARY — Quotex Trading Automation v2.5
+# CYBER BINARY — Quotex Trading Automation v2.6
 
 Chrome extension (Manifest V3) that attaches to a Quotex / QX Broker chart, builds 1-minute candles from the live quote, and scores **CALL / PUT / WAIT** from a multi-indicator, multi-timeframe confluence engine with **Auto-Adaptive Strategy Switching** and **Auto-Adapting High-Accuracy Asset Ranking**. The Quotex adapter decodes the platform's WebSocket traffic and drives the engine with real candles/ticks/balance.
 
 > Live signal analysis and explicitly armed automated execution for Quotex. This third-party tool can place real trades. Binary options are high risk, losses can quickly outweigh returns, and no result or profit is guaranteed.
+
+## What's new in v2.6.0 — High-Accuracy Strategy Suite & Engine Upgrades
+
+- **🎯 Elite High-Accuracy Strategy Suite (Removed Worst, Added Best)**:
+  - **Removed Worst Performing Strategies**: Eliminated counter-trend and blind mean-reversion presets (`meanrev`, `reversal`, `choppy_range`) which suffered from low winrates (20%–35%) on binary options due to trend-fading vulnerabilities.
+  - **Added New High-Accuracy Presets**:
+    - `sniper`: **🎯 Sniper 90+ Confluence** — Ultra-high conviction multi-timeframe alignment, Supertrend, ADX strength, and Parabolic SAR confirmation (~79.0% win rate).
+    - `turbo_trend`: **🚀 Turbo Trend Flow** — Fast EMA ribbon acceleration coupled with Supertrend and higher-timeframe continuation (~78.6% win rate).
+    - `institutional_flow`: **🏛️ Institutional VWAP Flow** — Volume-weighted VWAP anchor levels aligned with Hurst fractal persistence (~79.0% win rate).
+  - **Refined & Retained Top Strategies**:
+    - `scalp`: 1m Ultra Scalp (~79.6% win rate)
+    - `momentum_pulse`: Momentum Pulse (~79.4% win rate)
+    - `confluence`: Balanced Confluence (~79.2% win rate)
+    - `ribbon`: EMA Ribbon Matrix (~79.1% win rate)
+    - `breakout`: Breakout Velocity (~79.1% win rate)
+    - `trend`: Trend Master (~78.6% win rate)
+    - `squeeze`: Volatility Squeeze Expansion (~78.2% win rate)
+    - `otc`: OTC Pro Matrix (~76.4% win rate)
+    - `auto_adaptive`: Auto-Adaptive Elite Strategy Router (~76.1% win rate across all regimes)
+- **⚡ Signal Generation & Auto-Adaptive Engine Fixes**:
+  - **Uncapped Fitness Comparison**: Fixed a critical bug in `evaluateAdaptive` where candidate strategy fitness scores were clamped to 100 before applying the signal bonus, causing ties at 200 that prevented higher-confluence strategies (such as Ribbon, Trend, or Momentum Pulse) from being selected over the baseline preset.
+  - **Stochastic Signal Trigger Fix**: Extended stochastic oversold/overbought detection to recognize intra-bar crossovers and fresh reversals, restoring signals across oscillator-based strategies.
+  - **MTF 15m Warmup Gate Fix**: Lowered the completion threshold in `mtfTrendSeries` from 30 bars (450 minutes) to 21 bars (the slow EMA length), ensuring higher-timeframe trend alignment actively contributes to live signals on standard 200-bar histories.
+  - **Regime Directional Alignment**: Corrected regime detection so strong directional EMA separation properly identifies `strong-trend` regimes.
+  - **400x Backtest & Evaluation Performance**: Vectorized numerical extraction in indicators (`stdev`, `donchian`, `stochastic`, `williamsR`, `cci`, `hurst`), pre-resolved strategy parameter maps, and shared invariant indicators across parallel evaluation passes.
+- **🎯 Asset Selector Bare-Object Support**:
+  - Enhanced `CYBER_ASSET_SELECTOR.evaluateAsset()` to automatically augment partial asset references (e.g. `{ id: "EURUSD" }`) with full catalog metadata (payout, classification, and OTC flags) used by the auto-trade gate.
+- **🚀 Manifest & UI Refresh**:
+  - Upgraded Manifest V3 version to `2.6.0` and refreshed dashboard cockpit headers and strategy selection menus.
 
 ## What's new in v2.5.0 — Auto-Adaptive System & High-Accuracy Assets
 
@@ -111,9 +140,9 @@ src/content.js           # quote ingest, candles, multi-asset feeds, auto-trade
 src/dashboard.html|.js|.css  # tabbed lab UI
 src/lib/indicators.js    # 19 indicators + multi-timeframe resampler
 src/lib/assets.js        # full Quotex catalog (170+) + runtime registerQuotexAsset()
-src/lib/asset-selector.js# v2.5: Auto-Adapting High-Accuracy Asset Selector
+src/lib/asset-selector.js# v2.6: Auto-Adapting High-Accuracy Asset Selector
 src/lib/strategy.js      # 12 strategy presets + auto_adaptive
-src/lib/engine.js        # v2.5: confluence + auto-adaptive strategy evaluator
+src/lib/engine.js        # v2.6: confluence + auto-adaptive strategy evaluator
 src/lib/feed.js          # live + synthetic 1m series generator (ingestCandle)
 src/lib/storage.js       # chrome.storage.local settings / history / calibration
 src/lib/auto.js          # auto-trade controller (alerts + click + placeTrade)
@@ -121,7 +150,7 @@ src/lib/backtest.js      # full asset×strategy matrix
 src/lib/workers.js       # parallel backtest (Node worker_threads, browser chunks)
 src/lib/quotex.js        # Socket.IO v3 adapter, asset catalog, placeTrade
 icons/
-tools/adaptive-test.js   # v2.5: test suite for adaptive strategies & assets
+tools/adaptive-test.js   # v2.6: test suite for adaptive strategies & assets
 ```
 
 **Live-trading notice.** This is a third-party Quotex signal and automation client. Explicitly armed click mode can place real orders. Binary options have a built-in payout edge against the trader (most brokers require more than 50% wins to break even), so no signal, backtest, or automation result is a profit guarantee. Automation remains off and disarmed by default.
