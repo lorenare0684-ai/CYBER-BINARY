@@ -153,7 +153,12 @@
     // Live (lean: false) uses 200; backtest uses cfg.minBars (default 150).
     const liveMinBars = (opts && opts.lean === false) ? 200 : 0;
     const fallback = Math.max(cfg.minBars || 150, liveMinBars);
-    const minNeeded = Math.max(40, cfg.hurstPeriod + 50, cfg.stochK * 4, cfg.adxPeriod * 2, fallback);
+    // MTF EMA(8/21) needs enough completed 15m buckets. The former 200-bar
+    // live window could produce at most 14 x 15m candles, so the 30-candle
+    // guard below was unreachable and MTF stayed 0 forever.
+    const mtfWarmup = Math.max(cfg.mtfFast, cfg.mtfMid) * 30;
+    const minNeeded = Math.max(40, cfg.hurstPeriod + 50, cfg.stochK * 4,
+      cfg.adxPeriod * 2, mtfWarmup, fallback);
     const startIdx = Math.max(0, candles.length - minNeeded);
     const window = candles.slice(startIdx);
     const hasInputTimes = window.some((bar) => bar && bar.time != null);
@@ -226,35 +231,32 @@
     }
 
     // Multi-timeframe alignment: resample 1m → 5m, 15m and check trend agreement.
-    // Use only the last 120 bars of the window so this stays O(N) per call.
+    // Keep 30 buckets for the slowest timeframe so EMA(21) can actually warm.
     let mtfBias = 0;
     let mtfChecked = 0;
     if (window[0] && window[0].time != null && window.length >= 60) {
-      const tail = window.slice(-120);
+      const mtfBars = Math.max(120, Math.max(cfg.mtfFast, cfg.mtfMid) * 30);
+      const tail = window.slice(-mtfBars);
       const c5 = TA.resample(tail, cfg.mtfFast);
       const c15 = TA.resample(tail, cfg.mtfMid);
-      if (c5.length >= 30) {
-        const closes5 = c5.map((x) => x.close);
-        const ef5 = TA.ema(closes5, 8);
-        const es5 = TA.ema(closes5, 21);
-        const j5 = closes5.length - 1;
-        if (ef5[j5] != null && es5[j5] != null) {
-          mtfChecked++;
-          if (closes5[j5] > ef5[j5] && ef5[j5] > es5[j5]) mtfBias += 1;
-          else if (closes5[j5] < ef5[j5] && ef5[j5] < es5[j5]) mtfBias -= 1;
-        }
-      }
-      if (c15.length >= 30) {
-        const closes15 = c15.map((x) => x.close);
-        const ef15 = TA.ema(closes15, 8);
-        const es15 = TA.ema(closes15, 21);
-        const j15 = closes15.length - 1;
-        if (ef15[j15] != null && es15[j15] != null) {
-          mtfChecked++;
-          if (closes15[j15] > ef15[j15] && ef15[j15] > es15[j15]) mtfBias += 1;
-          else if (closes15[j15] < ef15[j15] && ef15[j15] < es15[j15]) mtfBias -= 1;
-        }
-      }
+      const addMtfBias = (resampled) => {
+        if (!Array.isArray(resampled) || resampled.length < 8) return;
+        const closes = resampled.map((x) => x.close);
+        // Use the standard 8/21 pair when history permits. Quotex commonly
+        // returns only ~199 initial 1m bars (about 13 x 15m bars), so use a
+        // proportional 5/10-style fallback rather than leaving MTF unchecked.
+        const slowPeriod = closes.length >= 21 ? 21 : Math.max(5, Math.floor(closes.length * 0.7));
+        const fastPeriod = closes.length >= 21 ? 8 : Math.max(2, Math.floor(slowPeriod * 0.5));
+        const fast = TA.ema(closes, fastPeriod);
+        const slow = TA.ema(closes, slowPeriod);
+        const j = closes.length - 1;
+        if (fast[j] == null || slow[j] == null) return;
+        mtfChecked++;
+        if (closes[j] > fast[j] && fast[j] > slow[j]) mtfBias += 1;
+        else if (closes[j] < fast[j] && fast[j] < slow[j]) mtfBias -= 1;
+      };
+      addMtfBias(c5);
+      addMtfBias(c15);
     }
 
     const votes = [];
@@ -377,12 +379,18 @@
     // Choppy conditions need two additional independent weight points. The
     // old block documented this veto but did nothing.
     const requiredScore = baseMinScore + (regime === "choppy" ? 2 : 0);
+    // Requiring a full two-point lead in an established directional trend can
+    // deadlock the engine at WAIT: several correlated overbought/oversold
+    // oscillators commonly cast short-lived counter-trend votes together. In
+    // a confirmed trend, let the larger side win by any positive margin while
+    // retaining the stricter lead everywhere else.
+    const requiredLead = regime === "trending" ? 0 : 1;
 
     let direction = "WAIT";
     let score = 0;
-    if (call >= requiredScore && call > put + 1) {
+    if (call >= requiredScore && call > put + requiredLead) {
       direction = "CALL"; score = call;
-    } else if (put >= requiredScore && put > call + 1) {
+    } else if (put >= requiredScore && put > call + requiredLead) {
       direction = "PUT"; score = put;
     }
 
@@ -403,7 +411,7 @@
       regime,
       reason:
         direction === "WAIT"
-          ? "No confluence"
+          ? `No confluence (CALL ${call} · PUT ${put} · need ${requiredScore})`
           : votes.filter((v) => v.dir === direction).map((v) => v.name).join(" · "),
       votes,
       metrics: {
@@ -436,6 +444,7 @@
         callScore: call,
         putScore: put,
         requiredScore,
+        requiredLead,
       },
     };
   }
@@ -571,9 +580,10 @@
     const rawMin = numberValue(cfg.minScore);
     const baseMin = rawMin != null ? Math.max(0, rawMin) : DEFAULTS.minScore;
     const required = baseMin + (regime === "choppy" ? 2 : 0);
+    const requiredLead = regime === "trending" ? 0 : 1;
     let direction = "WAIT", score = 0;
-    if (call >= required && call > put + 1) { direction = "CALL"; score = call; }
-    else if (put >= required && put > call + 1) { direction = "PUT"; score = put; }
+    if (call >= required && call > put + requiredLead) { direction = "CALL"; score = call; }
+    else if (put >= required && put > call + requiredLead) { direction = "PUT"; score = put; }
     let confidence = 0;
     if (direction !== "WAIT") {
       const probs = TA.softmaxProbs(call, put);

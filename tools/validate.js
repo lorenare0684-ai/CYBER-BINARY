@@ -175,11 +175,20 @@ else {
   if (!f3 || f3.type !== "bin" || !f3.payload || f3.payload.balance !== 50) { console.error("quotex binary frame"); failed++; }
   const inst = Q.parseInstruments([[1,"EURUSD","EUR/USD","currency",85,0,0,0,0,0,0,0,[[60]],0,true,[]]]);
   if (inst.length !== 1 || inst[0].symbol !== "EURUSD") { console.error("quotex parseInstruments"); failed++; }
-  const cNorm = Q.normalizeCandles({ asset:"EURUSD", period:60, raw:[[1700000000,1.08,1.075,1.085,1.082,100]] });
-  if (cNorm.length !== 1 || cNorm[0].time !== 1700000000000) { console.error("quotex candle epoch ms"); failed++; }
+  // Quotex wire order is [time, open, close, high, low, volume]. Close must
+  // never be read from index 4 (the low), or old candles diverge from chart.
+  const cNorm = Q.normalizeCandles({ asset:"EURUSD", period:60, raw:[[1700000000,1.08,1.082,1.085,1.075,100]] });
+  const objectNorm = Q.normalizeCandles({ asset:"EURUSD", period:60, raw:[{
+    time:1700000060, open:1.082, close:1.079, high:1.084, low:1.078, volume:12,
+  }] });
+  if (cNorm.length !== 1 || cNorm[0].time !== 1700000000000 || cNorm[0].open !== 1.08 ||
+      cNorm[0].close !== 1.082 || cNorm[0].high !== 1.085 || cNorm[0].low !== 1.075 ||
+      objectNorm.length !== 1 || objectNorm[0].close !== 1.079 || objectNorm[0].low !== 1.078) {
+    console.error("quotex OHLC wire order/epoch normalization failed"); failed++;
+  }
   const strictCandles = Q.normalizeCandles({ asset:"EURUSD", period:60, raw:[
-    ["1700000060junk", "1.08", "1.07", "1.09", "1.085", "10"],
-    ["1700000060", "1.08junk", "1.07", "1.09", "1.085", "10"],
+    ["1700000060junk", "1.08", "1.085", "1.09", "1.07", "10"],
+    ["1700000060", "1.08junk", "1.085", "1.09", "1.07", "10"],
   ] });
   if (strictCandles.length !== 0) { console.error("malformed numeric candle prefixes must be rejected"); failed++; }
   const unknownClose = Q.parseOrderClosed({ id:"missing-outcome", asset:"EURUSD", amount:10, status:"closed" });
@@ -238,6 +247,12 @@ else {
   const wsPlace = Q.placeTradeWs(fakeW, { asset: "EURUSD_otc", dir: "CALL", amount: 1, expiry: 60, isDemo: true });
   if (!wsPlace || !wsPlace.ok) { console.error("placeTradeWs should succeed with fake ws"); failed++; }
   if (!fakeW.sent.some((m) => m.indexOf('"orders/open"') !== -1)) { console.error("orders/open not sent"); failed++; }
+  const historyRequest = Q.subscribeHistory(fakeW, "EURUSD", 60, 9000);
+  const historyFrame = fakeW.sent.find((m) => m.indexOf('"history/list/v2"') !== -1);
+  if (!historyRequest || !historyRequest.ok || historyRequest.limit !== 5000 ||
+      !historyFrame || historyFrame.indexOf('"limit":5000') === -1) {
+    console.error("subscribeHistory must explicitly request bounded broker OHLC history"); failed++;
+  }
 
   // v2.3: outgoing-frame sniffing — the client's own requests reveal the
   // active asset (this is the primary auto-detection source).
@@ -311,6 +326,12 @@ const rs = TA.resample([
 ], 1);
 if (rs.length !== 2 || rs[0].time !== 1700000000000) { console.error("resample must normalize second timestamps"); failed++; }
 if (TA.softmaxProbs(1e308, 0).call < 0.99) { console.error("softmax overflow guard failed"); failed++; }
+const onePointConfidence = TA.softmaxProbs(4, 3).call;
+const twoPointConfidence = TA.softmaxProbs(5, 3).call;
+if (onePointConfidence < 0.59 || onePointConfidence > 0.61 ||
+    twoPointConfidence < 0.68 || twoPointConfidence > 0.70) {
+  console.error("softmax confidence is saturated instead of tracking vote separation"); failed++;
+}
 if (TA.lastValid(null).index !== -1) { console.error("lastValid malformed-input guard failed"); failed++; }
 let malformedIndicatorsSafe = true;
 try {
@@ -376,6 +397,49 @@ const callSignal = sandbox.self.CYBER_ENGINE.analyze(directionalSeries(1), { str
 const putSignal = sandbox.self.CYBER_ENGINE.analyze(directionalSeries(-1), { strategy: "confluence", lean: false });
 if (!callSignal || callSignal.direction !== "CALL") { console.error("engine CALL coverage failed", callSignal && callSignal.direction); failed++; }
 if (!putSignal || putSignal.direction !== "PUT") { console.error("engine PUT coverage failed", putSignal && putSignal.direction); failed++; }
+if (!callSignal.metrics || callSignal.metrics.mtfChecked !== 2 || callSignal.metrics.mtfBias !== 2 ||
+    !putSignal.metrics || putSignal.metrics.mtfChecked !== 2 || putSignal.metrics.mtfBias !== -2) {
+  console.error("5m/15m MTF must warm from a normal bounded Quotex history response"); failed++;
+}
+
+// A strong trend often has several correlated oscillators briefly voting the
+// other way. A narrow winning margin must not leave the live engine stuck at
+// score/confidence zero in that regime.
+function trendingPullbackSeries() {
+  const out = [];
+  let state = 1;
+  let px = 1;
+  const random = () => {
+    state = (state * 1664525 + 1013904223) >>> 0;
+    return state / 4294967296;
+  };
+  for (let i = 0; i < 260; i++) {
+    const drift = i > 180 ? 0.0005 : 0.00008;
+    let change = drift + (random() - 0.45) * 0.0005;
+    if (i === 259) change = -0.00003;
+    const next = px * (1 + change);
+    const pad = px * (0.00008 + random() * 0.00008);
+    out.push({
+      time: i * 60000,
+      open: px,
+      high: Math.max(px, next) + pad,
+      low: Math.min(px, next) - pad,
+      close: next,
+    });
+    px = next;
+  }
+  return out;
+}
+const trendPullbackSignal = sandbox.self.CYBER_ENGINE.analyze(trendingPullbackSeries(), {
+  strategy: "scalp", lean: false,
+});
+if (!trendPullbackSignal || trendPullbackSignal.regime !== "trending" ||
+    trendPullbackSignal.direction !== "CALL" || trendPullbackSignal.score <= 0 ||
+    trendPullbackSignal.confidence <= 0 || trendPullbackSignal.metrics.callScore <= trendPullbackSignal.metrics.putScore ||
+    trendPullbackSignal.metrics.mtfChecked !== 2) {
+  console.error("trending narrow vote lead must generate a signal", trendPullbackSignal);
+  failed++;
+}
 
 // Backtest smoke (lean path)
 const r = sandbox.self.CYBER_ENGINE.backtest(candles, { strategy: "confluence", horizon: 3, minBars: 200 });

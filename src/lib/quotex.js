@@ -409,7 +409,7 @@
             (ID_TO_SYMBOL[n0] || n1 > 1e9)) {
           return "quote"; // [assetId, timestamp, price]
         }
-        // Candle rows: [ts, open, low, high, close, ...] or [ts, open, high, low, close, ...]
+        // Quotex candle rows: [ts, open, close, high, low, ...]
         if (first.length >= 5 && n0 != null && n1 != null && n2 != null &&
             numberValue(first[3]) != null && numberValue(first[4]) != null) {
           if (n0 > 1e9) return "candles"; // timestamps far in the past → history batch
@@ -622,26 +622,31 @@
       if (row && !Array.isArray(row) && typeof row === "object") {
         row = [
           row.time != null ? row.time : (row.ts != null ? row.ts : row.timestamp),
-          row.open, row.low, row.high, row.close,
+          row.open, row.close, row.high, row.low,
           row.volume != null ? row.volume : row.vol,
         ];
       }
       if (!Array.isArray(row) || row.length < 5) continue;
-      // Quotex history rows are [ts, open, low, high, close, vol?]. Some
-      // regions reverse low/high, so derive the envelope from ALL OHLC fields
-      // rather than trusting positions 2/3. This prevents inverted or clipped
-      // candle wicks on the dashboard.
+      // Quotex history rows are [ts, open, close, high, low, vol?]. The old
+      // decoder treated index 4 (low) as close, which made historical candle
+      // bodies and every close-based indicator disagree with the broker chart.
+      // Derive the wick envelope from all four prices to tolerate occasional
+      // high/low inversions while preserving the canonical close at index 2.
       var ts = numberValue(row[0]);
       var o = numberValue(row[1]);
-      var a = numberValue(row[2]);
-      var b = numberValue(row[3]);
-      var c = numberValue(row[4]);
+      var c = numberValue(row[2]);
+      var reportedHigh = numberValue(row[3]);
+      var reportedLow = numberValue(row[4]);
       if (ts == null || o == null || c == null ||
           o <= 0 || c <= 0 || o > 1e100 || c > 1e100) continue;
       var hi = Math.max(o, c);
       var lo = Math.min(o, c);
-      if (a != null && a > 0 && a <= 1e100) { hi = Math.max(hi, a); lo = Math.min(lo, a); }
-      if (b != null && b > 0 && b <= 1e100) { hi = Math.max(hi, b); lo = Math.min(lo, b); }
+      if (reportedHigh != null && reportedHigh > 0 && reportedHigh <= 1e100) {
+        hi = Math.max(hi, reportedHigh); lo = Math.min(lo, reportedHigh);
+      }
+      if (reportedLow != null && reportedLow > 0 && reportedLow <= 1e100) {
+        hi = Math.max(hi, reportedLow); lo = Math.min(lo, reportedLow);
+      }
       var rawVol = row.length > 5 && row[5] != null ? numberValue(row[5]) : 0;
       var vol = rawVol == null ? 0 : rawVol;
       // Accept unix seconds, milliseconds, microseconds, or nanoseconds consistently.
@@ -1331,7 +1336,9 @@
       "input[placeholder*='amount' i]", "input[placeholder*='stake' i]", "input[placeholder*='invest' i]",
       "input[name='amount']", "input[name='sum']", "input[name='stake']", "input[name='investment']",
       "input[data-testid*='amount' i]", "input[data-testid*='stake' i]", "input[data-testid*='invest' i]",
-      "[class*='stake'] input[type='number']", "[class*='amount'] input[type='number']", "[class*='invest'] input[type='number']",
+      "[class*='stake'] input", "[class*='amount'] input", "[class*='invest'] input", "[class*='investment'] input",
+      "[data-testid*='stake' i] input", "[data-testid*='amount' i] input", "[data-testid*='invest' i] input",
+      "[data-test*='stake' i] input", "[data-test*='amount' i] input", "[data-test*='invest' i] input",
     ];
     var out = [];
     var seen = [];
@@ -1382,14 +1389,19 @@
     if (el.min !== "" && Number.isFinite(min) && wanted < min) return false;
     if (el.max !== "" && Number.isFinite(max) && wanted > max) return false;
     try {
+      try { if (typeof el.focus === "function") el.focus(); } catch (_) {}
       var proto = el.tagName === "TEXTAREA" ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
       var setter = Object.getOwnPropertyDescriptor(proto, "value");
       if (setter && setter.set) setter.set.call(el, String(wanted));
       else el.value = String(wanted);
       el.dispatchEvent(new Event("input", { bubbles: true }));
       el.dispatchEvent(new Event("change", { bubbles: true }));
-      try { el.dispatchEvent(new Event("blur", { bubbles: true })); } catch (_) {}
-      var actual = Number(String(el.value).replace(",", "."));
+      // Quotex may render a currency prefix/suffix or localized decimal after
+      // React processes the input. Validate the numeric content, not the raw
+      // decorated string.
+      var cleaned = String(el.value == null ? "" : el.value)
+        .replace(/[^0-9,.-]/g, "").replace(",", ".");
+      var actual = Number(cleaned);
       return Number.isFinite(actual) && Math.abs(actual - wanted) <= Math.max(1e-9, Math.abs(wanted) * 1e-9);
     } catch (_) { return false; }
   }
@@ -1946,19 +1958,25 @@
      * chart opens, so nothing extra is needed to receive `quotes/stream` and
      * `history/list/v2` frames from the server. Safe to call repeatedly.
      */
-    subscribeHistory: function (ws, asset, period) {
+    subscribeHistory: function (ws, asset, period, limit) {
       if (!ws || typeof ws.send !== "function") return { ok: false, error: "no websocket handle" };
       if (ws.readyState != null && numberValue(ws.readyState) !== 1) return { ok: false, error: "websocket is not open" };
       var sym = normalizeSymbolName(asset || "");
       if (!sym) return { ok: false, error: "asset required" };
       period = numberValue(period);
       period = period != null && period > 0 ? Math.min(86400, Math.floor(period)) : 60;
+      limit = numberValue(limit);
+      limit = limit != null ? Math.max(60, Math.min(5000, Math.floor(limit))) : 5000;
       try {
         ws.send('42["tick"]');
         ws.send('42["instruments/follow","' + sym + '"]');
         ws.send('42["instruments/update",{"asset":"' + sym + '","period":' + period + '}]');
+        // chart_notification/get does not return OHLC history on every Quotex
+        // build. Request the actual history endpoint explicitly; otherwise the
+        // cache receives ticks only and can take hours to become backtestable.
+        ws.send('42["history/list/v2",{"asset":"' + sym + '","period":' + period + ',"offset":0,"limit":' + limit + '}]');
         ws.send('42["chart_notification/get",{"asset":"' + sym + '","version":"1.0.0"}]');
-        return { ok: true, asset: sym, period: period };
+        return { ok: true, asset: sym, period: period, limit: limit };
       } catch (e) {
         return { ok: false, error: String(e && e.message || e) };
       }

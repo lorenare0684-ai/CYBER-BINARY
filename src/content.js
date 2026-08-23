@@ -111,7 +111,9 @@
 
   function createFeedFor(assetId) {
     if (feeds[assetId]) return feeds[assetId];
-    const f = self.CYBER_FEED.createFeed({ tfMs: TF_MS, max: 400 });
+    // Keep enough genuine 1m history for a useful multi-day backtest. The old
+    // 400-bar cap silently discarded most of the broker's history response.
+    const f = self.CYBER_FEED.createFeed({ tfMs: TF_MS, max: 5000 });
     feeds[assetId] = f;
     const a = ASSETS.get(assetId) || ASSETS.ensureRegistered(assetId) ||
       { id: assetId, basePrice: 1.0, vol: 0.0001, jumpRate: 0.005, decimals: 5 };
@@ -454,19 +456,25 @@
     catch (_) {}
   }
 
-  /** Push the active asset's markers (+ recent bars for the overlay
-   *  fallback) to the MAIN-world page hook, which renders them natively on
-   *  the lightweight-charts instance (or its own overlay canvas). */
+  /** Push the active asset's markers plus bars from the SAME timeframe shown
+   *  by Quotex. Sending 1m bars while the platform displayed 5m/15m made the
+   *  overlay project arrows into the wrong horizontal slots. */
   function sendMarkers() {
     if (!markerStore) return;
     try {
+      const visibleChart = chartForActiveAsset();
+      const period = visibleChart && Number.isFinite(Number(visibleChart.period))
+        ? Math.max(1, Math.floor(Number(visibleChart.period))) : 60;
+      const bars = visibleChart && Array.isArray(visibleChart.candles) && visibleChart.candles.length
+        ? visibleChart.candles : activeFeed.series();
       window.postMessage({
         source: "CYBER_BINARY_CONTENT",
         kind: "markers",
         payload: {
           asset: activeAsset,
+          period,
           markers: markerStore.list(activeAsset),
-          bars: activeFeed.series().slice(-200),
+          bars: bars.slice(-400),
         },
       }, "*");
     } catch (_) {}
@@ -581,14 +589,34 @@
   function chartForActiveAsset() {
     const periods = chartHistory[activeAsset];
     if (!periods) return null;
-    if (periods[lastWsPeriod] && periods[lastWsPeriod].candles.length) return periods[lastWsPeriod];
-    if (periods[60] && periods[60].candles.length) return periods[60];
-    let freshest = null;
-    for (const p in periods) {
-      const item = periods[p];
-      if (item && item.candles && item.candles.length && (!freshest || item.ts > freshest.ts)) freshest = item;
+    let selected = null;
+    if (periods[lastWsPeriod] && periods[lastWsPeriod].candles.length) selected = periods[lastWsPeriod];
+    else if (periods[60] && periods[60].candles.length) selected = periods[60];
+    else {
+      for (const p in periods) {
+        const item = periods[p];
+        if (item && item.candles && item.candles.length && (!selected || item.ts > selected.ts)) selected = item;
+      }
     }
-    return freshest;
+    if (!selected) return null;
+
+    // Quotex sends higher-timeframe history only occasionally, while the 1m
+    // feed receives every live tick. Without this merge a 5m/15m dashboard
+    // ended at the last history response and the next refreshed candle jumped
+    // away from the live feed. Resample the genuine 1m feed into the visible
+    // broker timeframe and replace matching buckets with those live values.
+    const period = Number(selected.period);
+    if (period > 60 && period % 60 === 0 && self.CYBER_TA && typeof self.CYBER_TA.resample === "function") {
+      const live = self.CYBER_TA.resample(activeFeed.series(), period / 60);
+      if (live.length) {
+        const byTime = Object.create(null);
+        for (const bar of selected.candles) if (bar && Number.isFinite(Number(bar.time))) byTime[Number(bar.time)] = bar;
+        for (const bar of live) if (bar && Number.isFinite(Number(bar.time))) byTime[Number(bar.time)] = bar;
+        const times = Object.keys(byTime).map(Number).sort((a, b) => a - b).slice(-400);
+        return { period, candles: times.map((time) => byTime[time]), ts: Date.now() };
+      }
+    }
+    return selected;
   }
 
   function scheduleTickSignalRefresh() {
@@ -687,6 +715,7 @@
     // other open/mini charts are retained per asset+period but NEVER select
     // the active chart.
     mergeChartCandles(id, safePeriod, real);
+    if (id === activeAsset && safePeriod === lastWsPeriod) sendMarkers();
   }
 
   function normalizeStatus(value) {
@@ -866,11 +895,15 @@
       cachedSignal = sig;
       cachedAnalysisKey = analysisKey;
 
-      if (markerStore && sig.ready && sig.direction !== "WAIT" && sig.time != null && closed) {
+      if (markerStore && sig.ready && sig.direction !== "WAIT" && sig.entryTime != null && closed) {
         const added = markerStore.add({
           asset: sig.asset,
-          time: sig.time,
-          price: closed.close,
+          // The decision is known at the closed bar boundary, which is the
+          // opening timestamp of the actual entry candle on Quotex. Anchoring
+          // to sig.time put live arrows one candle left of settled-history
+          // arrows, which already use entryTime.
+          time: sig.entryTime,
+          price: sig.entryPrice != null ? sig.entryPrice : closed.close,
           dir: sig.direction,
           confidence: sig.confidence,
         });
@@ -1117,19 +1150,26 @@
     return true;
   }
 
-  function ensureHistorySubscription(det) {
-    if (!det || !QUOTEX || !QUOTEX.subscribeHistory) return;
+  function ensureHistorySubscription(det, force, requestedLimit) {
+    if (!det || !QUOTEX || !QUOTEX.subscribeHistory) return false;
     const id = det.id;
     const at = historyRequestedAt[id] || 0;
-    if (Date.now() - at < 30000) return; // at most one request / 30s per asset
+    // Once real history has arrived, live ticks extend the cache; do not pull a
+    // 5,000-row batch on every periodic scan. The backtest button can still
+    // force one refresh on demand.
+    if (!force && historySeeded[id]) return false;
+    if (!force && Date.now() - at < 30000) return false; // retry initial attachment at most every 30s
+    const rawLimit = Number(requestedLimit);
+    const limit = Number.isFinite(rawLimit) ? Math.max(60, Math.min(5000, Math.floor(rawLimit))) : 5000;
     historyRequestedAt[id] = Date.now();
     try {
       window.postMessage({
         source: "CYBER_BINARY_CONTENT",
         kind: "subscribe",
-        payload: { asset: id, period: 60 },
+        payload: { asset: id, period: 60, limit },
       }, "*");
-    } catch (_) {}
+      return true;
+    } catch (_) { return false; }
   }
 
   function tick() {
@@ -1209,6 +1249,7 @@
             lastWsPrice = null;
             lastWsTickAt = 0;
           }
+          sendMarkers();
         }
         break;
       }
@@ -1536,7 +1577,22 @@
         pendingDomOrder = null;
         cancelDomWait({ ok: false, confirmed: false, mode: "dom", error: "DOM placement failed" });
       }
-      return Object.assign({ ok: false, confirmed: false, mode: "dom" }, domResult || { error: "DOM placement failed" });
+      const failure = String(domResult && domResult.error || "DOM placement failed");
+      // Missing/rejected controls are deterministic page-integration failures,
+      // not market rejections. Continuing to attempt every new candle only
+      // repeats the same error (and could become unsafe if the DOM changes
+      // mid-session), so fail closed and require an explicit re-arm.
+      if (/stake input|expiry|trade button/i.test(failure)) {
+        try {
+          const saved = await STORE.setSettings({ armed: false });
+          runtimeSettings = saved;
+          if (autoController) autoController.setArmed(false);
+        } catch (_) {
+          if (autoController) autoController.setArmed(false);
+        }
+        return { ok: false, confirmed: false, mode: "dom", error: failure + " — automation disarmed" };
+      }
+      return Object.assign({ ok: false, confirmed: false, mode: "dom" }, domResult || { error: failure });
     }
     const confirmed = await domConfirmation;
     if (confirmed && confirmed.ok) {
@@ -1612,6 +1668,12 @@
     }
     if (msg && msg.type === "CYBER_PING") {
       sendResponse({ ok: true, attached: attached, bars: activeFeed.series().length, asset: activeAsset });
+    }
+    if (msg && msg.type === "CYBER_REQUEST_HISTORY") {
+      const det = ASSETS.get(activeAsset) || ASSETS.ensureRegistered(lastWsSymbol || activeAsset);
+      const requested = ensureHistorySubscription(det, true, msg.limit);
+      sendResponse({ ok: requested, asset: det && det.id || activeAsset, requested });
+      return;
     }
     if (msg && msg.type === "CYBER_SET_STRATEGY") {
       const requested = typeof msg.strategy === "string" ? msg.strategy.trim() : "";

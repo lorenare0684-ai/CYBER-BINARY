@@ -6,7 +6,7 @@
  *   - tools/page-hook.shell.js (MAIN-world WebSocket hook shell)
  *
  * Rebuild after any change to either source file.
- * Generated: 2026-08-23T06:04:03.092Z
+ * Generated: 2026-08-23T06:43:07.130Z
  */
 /* ====================================================================
  * Inlined CYBER_QUOTEX adapter (src/lib/quotex.js).
@@ -423,7 +423,7 @@
             (ID_TO_SYMBOL[n0] || n1 > 1e9)) {
           return "quote"; // [assetId, timestamp, price]
         }
-        // Candle rows: [ts, open, low, high, close, ...] or [ts, open, high, low, close, ...]
+        // Quotex candle rows: [ts, open, close, high, low, ...]
         if (first.length >= 5 && n0 != null && n1 != null && n2 != null &&
             numberValue(first[3]) != null && numberValue(first[4]) != null) {
           if (n0 > 1e9) return "candles"; // timestamps far in the past → history batch
@@ -636,26 +636,31 @@
       if (row && !Array.isArray(row) && typeof row === "object") {
         row = [
           row.time != null ? row.time : (row.ts != null ? row.ts : row.timestamp),
-          row.open, row.low, row.high, row.close,
+          row.open, row.close, row.high, row.low,
           row.volume != null ? row.volume : row.vol,
         ];
       }
       if (!Array.isArray(row) || row.length < 5) continue;
-      // Quotex history rows are [ts, open, low, high, close, vol?]. Some
-      // regions reverse low/high, so derive the envelope from ALL OHLC fields
-      // rather than trusting positions 2/3. This prevents inverted or clipped
-      // candle wicks on the dashboard.
+      // Quotex history rows are [ts, open, close, high, low, vol?]. The old
+      // decoder treated index 4 (low) as close, which made historical candle
+      // bodies and every close-based indicator disagree with the broker chart.
+      // Derive the wick envelope from all four prices to tolerate occasional
+      // high/low inversions while preserving the canonical close at index 2.
       var ts = numberValue(row[0]);
       var o = numberValue(row[1]);
-      var a = numberValue(row[2]);
-      var b = numberValue(row[3]);
-      var c = numberValue(row[4]);
+      var c = numberValue(row[2]);
+      var reportedHigh = numberValue(row[3]);
+      var reportedLow = numberValue(row[4]);
       if (ts == null || o == null || c == null ||
           o <= 0 || c <= 0 || o > 1e100 || c > 1e100) continue;
       var hi = Math.max(o, c);
       var lo = Math.min(o, c);
-      if (a != null && a > 0 && a <= 1e100) { hi = Math.max(hi, a); lo = Math.min(lo, a); }
-      if (b != null && b > 0 && b <= 1e100) { hi = Math.max(hi, b); lo = Math.min(lo, b); }
+      if (reportedHigh != null && reportedHigh > 0 && reportedHigh <= 1e100) {
+        hi = Math.max(hi, reportedHigh); lo = Math.min(lo, reportedHigh);
+      }
+      if (reportedLow != null && reportedLow > 0 && reportedLow <= 1e100) {
+        hi = Math.max(hi, reportedLow); lo = Math.min(lo, reportedLow);
+      }
       var rawVol = row.length > 5 && row[5] != null ? numberValue(row[5]) : 0;
       var vol = rawVol == null ? 0 : rawVol;
       // Accept unix seconds, milliseconds, microseconds, or nanoseconds consistently.
@@ -1345,7 +1350,9 @@
       "input[placeholder*='amount' i]", "input[placeholder*='stake' i]", "input[placeholder*='invest' i]",
       "input[name='amount']", "input[name='sum']", "input[name='stake']", "input[name='investment']",
       "input[data-testid*='amount' i]", "input[data-testid*='stake' i]", "input[data-testid*='invest' i]",
-      "[class*='stake'] input[type='number']", "[class*='amount'] input[type='number']", "[class*='invest'] input[type='number']",
+      "[class*='stake'] input", "[class*='amount'] input", "[class*='invest'] input", "[class*='investment'] input",
+      "[data-testid*='stake' i] input", "[data-testid*='amount' i] input", "[data-testid*='invest' i] input",
+      "[data-test*='stake' i] input", "[data-test*='amount' i] input", "[data-test*='invest' i] input",
     ];
     var out = [];
     var seen = [];
@@ -1396,14 +1403,19 @@
     if (el.min !== "" && Number.isFinite(min) && wanted < min) return false;
     if (el.max !== "" && Number.isFinite(max) && wanted > max) return false;
     try {
+      try { if (typeof el.focus === "function") el.focus(); } catch (_) {}
       var proto = el.tagName === "TEXTAREA" ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
       var setter = Object.getOwnPropertyDescriptor(proto, "value");
       if (setter && setter.set) setter.set.call(el, String(wanted));
       else el.value = String(wanted);
       el.dispatchEvent(new Event("input", { bubbles: true }));
       el.dispatchEvent(new Event("change", { bubbles: true }));
-      try { el.dispatchEvent(new Event("blur", { bubbles: true })); } catch (_) {}
-      var actual = Number(String(el.value).replace(",", "."));
+      // Quotex may render a currency prefix/suffix or localized decimal after
+      // React processes the input. Validate the numeric content, not the raw
+      // decorated string.
+      var cleaned = String(el.value == null ? "" : el.value)
+        .replace(/[^0-9,.-]/g, "").replace(",", ".");
+      var actual = Number(cleaned);
       return Number.isFinite(actual) && Math.abs(actual - wanted) <= Math.max(1e-9, Math.abs(wanted) * 1e-9);
     } catch (_) { return false; }
   }
@@ -1960,19 +1972,25 @@
      * chart opens, so nothing extra is needed to receive `quotes/stream` and
      * `history/list/v2` frames from the server. Safe to call repeatedly.
      */
-    subscribeHistory: function (ws, asset, period) {
+    subscribeHistory: function (ws, asset, period, limit) {
       if (!ws || typeof ws.send !== "function") return { ok: false, error: "no websocket handle" };
       if (ws.readyState != null && numberValue(ws.readyState) !== 1) return { ok: false, error: "websocket is not open" };
       var sym = normalizeSymbolName(asset || "");
       if (!sym) return { ok: false, error: "asset required" };
       period = numberValue(period);
       period = period != null && period > 0 ? Math.min(86400, Math.floor(period)) : 60;
+      limit = numberValue(limit);
+      limit = limit != null ? Math.max(60, Math.min(5000, Math.floor(limit))) : 5000;
       try {
         ws.send('42["tick"]');
         ws.send('42["instruments/follow","' + sym + '"]');
         ws.send('42["instruments/update",{"asset":"' + sym + '","period":' + period + '}]');
+        // chart_notification/get does not return OHLC history on every Quotex
+        // build. Request the actual history endpoint explicitly; otherwise the
+        // cache receives ticks only and can take hours to become backtestable.
+        ws.send('42["history/list/v2",{"asset":"' + sym + '","period":' + period + ',"offset":0,"limit":' + limit + '}]');
         ws.send('42["chart_notification/get",{"asset":"' + sym + '","version":"1.0.0"}]');
-        return { ok: true, asset: sym, period: period };
+        return { ok: true, asset: sym, period: period, limit: limit };
       } catch (e) {
         return { ok: false, error: String(e && e.message || e) };
       }
@@ -2112,7 +2130,7 @@
     onCandle: function (msg) {
       if (!msg || !msg.asset) return;
       var key = msg.asset + "@" + (msg.period || 60);
-      live.candles[key] = Array.isArray(msg.candles) ? msg.candles.slice(-400) : [];
+      live.candles[key] = Array.isArray(msg.candles) ? msg.candles.slice(-5000) : [];
       var oldKeyAt = candleKeyOrder.indexOf(key);
       if (oldKeyAt >= 0) candleKeyOrder.splice(oldKeyAt, 1);
       candleKeyOrder.push(key);
@@ -2240,10 +2258,25 @@
       return !!s && typeof s === "object" && typeof s.setMarkers === "function";
     }
 
+    function seriesRank(s) {
+      if (!s || typeof s !== "object") return -1;
+      var type = "";
+      try { type = typeof s.seriesType === "function" ? String(s.seriesType()) : ""; } catch (_) {}
+      if (/candlestick/i.test(type)) return 100;
+      if (/bar/i.test(type)) return 90;
+      if (isSeriesLike(s) && typeof s.priceToCoordinate === "function") return 40;
+      return isSeriesLike(s) ? 10 : -1;
+    }
+
     function findExistingSeries(c) {
+      var best = null, bestRank = -1;
+      function consider(candidate) {
+        var rank = seriesRank(candidate);
+        if (rank > bestRank) { best = candidate; bestRank = rank; }
+      }
       try {
         var arr = c.series();
-        if (Array.isArray(arr) && arr.length && isSeriesLike(arr[0])) return arr[0];
+        if (Array.isArray(arr)) for (var ai = 0; ai < arr.length; ai++) consider(arr[ai]);
       } catch (_) {}
       try {
         var keys = Object.keys(c);
@@ -2251,11 +2284,11 @@
         for (var i = 0; i < n; i++) {
           var v = c[keys[i]];
           if (Array.isArray(v)) {
-            for (var j = 0; j < v.length && j < 20; j++) if (isSeriesLike(v[j])) return v[j];
-          } else if (isSeriesLike(v)) return v;
+            for (var j = 0; j < v.length && j < 20; j++) consider(v[j]);
+          } else consider(v);
         }
       } catch (_) {}
-      return null;
+      return best;
     }
 
     function containerArea(el) {
@@ -2302,17 +2335,29 @@
 
     function hasChart() { return !!chart; }
 
+    function markerPeriod() {
+      var raw = Number(lastPayload && lastPayload.period);
+      return Number.isFinite(raw) && raw >= 1 && raw <= 86400 ? Math.floor(raw) : 60;
+    }
+
+    function markerSecond(value) {
+      var time = Number(value);
+      if (!Number.isFinite(time) || time <= 0) return null;
+      while (time >= 1e14) time /= 1000;
+      var sec = Math.floor(time >= 1e11 ? time / 1000 : time);
+      if (!Number.isSafeInteger(sec) || sec <= 0) return null;
+      var period = markerPeriod();
+      return Math.floor(sec / period) * period;
+    }
+
     /** Raw markers -> lightweight-charts setMarkers() format. */
     function normalize(list) {
       var byTime = Object.create(null);
       var arr = Array.isArray(list) ? list.slice(-MAX) : [];
       for (var i = 0; i < arr.length; i++) {
         var m = arr[i];
-        var time = Number(m && m.time);
-        if (!m || (m.dir !== "CALL" && m.dir !== "PUT") || !Number.isFinite(time) || time <= 0) continue;
-        while (time >= 1e14) time /= 1000;
-        var sec = Math.floor(time >= 1e11 ? time / 1000 : time);
-        if (!Number.isSafeInteger(sec) || sec <= 0) continue;
+        var sec = markerSecond(m && m.time);
+        if (!m || (m.dir !== "CALL" && m.dir !== "PUT") || sec == null) continue;
         var put = m.dir === "PUT";
         byTime[sec] = {
           time: sec,
@@ -2335,6 +2380,7 @@
       if (!payload || typeof payload !== "object" || Array.isArray(payload)) payload = null;
       lastPayload = payload ? {
         asset: typeof payload.asset === "string" ? payload.asset.slice(0, 64) : "",
+        period: Number.isFinite(Number(payload.period)) ? Math.max(1, Math.min(86400, Math.floor(Number(payload.period)))) : 60,
         markers: Array.isArray(payload.markers) ? payload.markers.slice(-MAX) : [],
         bars: Array.isArray(payload.bars) ? payload.bars.slice(-400) : [],
       } : null;
@@ -2383,7 +2429,10 @@
     }
 
     function ensureOverlay() {
-      var target = findChartCanvas();
+      // Lightweight Charts coordinates are relative to its container. Prefer
+      // that exact element over guessing the largest canvas on the page.
+      var target = chartContainer && chartContainer.isConnected && containerArea(chartContainer) > 0
+        ? chartContainer : findChartCanvas();
       if (overlay && overlay.el && overlay.el.isConnected && overlay.target === target) return overlay;
       if (overlay) hideOverlay();
       overlay = null;
@@ -2451,17 +2500,57 @@
       var pad = (hi - lo) * 0.08 || (hi * 0.001 || 0.001);
       lo -= pad; hi += pad;
       var W = rect.width, H = rect.height;
+      var timeScale = null;
+      try { timeScale = chart && typeof chart.timeScale === "function" ? chart.timeScale() : null; } catch (_) {}
+      var exactTime = !!timeScale && typeof timeScale.timeToCoordinate === "function";
+      var exactPrice = !!series && typeof series.priceToCoordinate === "function";
+      var periodMs = markerPeriod() * 1000;
       for (var k = 0; k < markers.length; k++) {
         var m = markers[k];
-        var markerTime = Number(m && m.time), markerPrice = Number(m && m.price);
-        if (!m || (m.dir !== "CALL" && m.dir !== "PUT") || !Number.isFinite(markerTime) ||
+        var markerSec = markerSecond(m && m.time);
+        var markerPrice = Number(m && m.price);
+        if (!m || (m.dir !== "CALL" && m.dir !== "PUT") || markerSec == null ||
             !Number.isFinite(markerPrice) || markerPrice <= 0) continue;
-        while (markerTime >= 1e14) markerTime /= 1000;
-        if (markerTime < 1e11) markerTime *= 1000;
-        if (markerTime < t0 || markerTime > t1) continue;
-        var x = ((markerTime - t0) / (t1 - t0)) * W;
-        var y = H - ((markerPrice - lo) / (hi - lo)) * H;
-        if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+        var markerTime = markerSec * 1000;
+        if (markerTime < t0 || markerTime > t1 + periodMs) continue;
+
+        // Find the matching broker-timeframe candle. This both avoids linear
+        // timestamp drift across gaps and gives the true high/low for vertical
+        // placement rather than drawing at the candle close.
+        var barIndex = -1;
+        for (var bi = bars.length - 1; bi >= 0; bi--) {
+          var bt = Number(bars[bi] && bars[bi].time);
+          while (bt >= 1e14) bt /= 1000;
+          if (bt < 1e11) bt *= 1000;
+          bt = Math.floor(bt / periodMs) * periodMs;
+          if (bt === markerTime) { barIndex = bi; break; }
+          if (bt < markerTime) break;
+        }
+        var matchedBar = barIndex >= 0 ? bars[barIndex] : null;
+        var anchorPrice = m.dir === "PUT" && matchedBar ? Number(matchedBar.high)
+          : (m.dir === "CALL" && matchedBar ? Number(matchedBar.low) : markerPrice);
+        if (!Number.isFinite(anchorPrice) || anchorPrice <= 0) anchorPrice = markerPrice;
+
+        var x = NaN, y = NaN;
+        if (exactTime) {
+          try {
+            var rawX = timeScale.timeToCoordinate(markerSec);
+            x = rawX == null ? NaN : Number(rawX);
+          } catch (_) {}
+          // A null/off-screen coordinate must stay hidden, not be remapped to
+          // the full cached history range.
+          if (!Number.isFinite(x)) continue;
+        } else if (barIndex >= 0) {
+          x = ((barIndex + 0.5) / bars.length) * W;
+        }
+        if (exactPrice) {
+          try {
+            var rawY = series.priceToCoordinate(anchorPrice);
+            y = rawY == null ? NaN : Number(rawY);
+          } catch (_) {}
+        }
+        if (!Number.isFinite(y)) y = H - ((anchorPrice - lo) / (hi - lo)) * H;
+        if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || x > W || y < -30 || y > H + 30) continue;
         drawArrow(ctx, x, y, m.dir === "PUT");
       }
     }
@@ -2768,7 +2857,7 @@
       var sub = ev.data.payload || {};
       internalSubscriptionSend = true;
       var r;
-      try { r = Q.subscribeHistory(handle.lastWs, sub.asset, sub.period); }
+      try { r = Q.subscribeHistory(handle.lastWs, sub.asset, sub.period, sub.limit); }
       finally { internalSubscriptionSend = false; }
       emit("subscribe_result", { ok: !!(r && r.ok), payload: r || {} });
     } else if (ev.data.kind === "place_ws") {

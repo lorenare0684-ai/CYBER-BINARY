@@ -301,6 +301,7 @@ function calibrationTest() {
   check("calibrationAdjust with <5 samples leaves input", adjCold === 80);
   const adjHot = STORE.calibrationAdjust(80, { 80: { hits: 0, n: 25 } });
   check("calibrationAdjust pulls confidence toward observed 0%", adjHot < 80, "adj=" + adjHot);
+  check("calibration cannot collapse a signal bucket to 0% and starve new samples", adjHot === 55, "adj=" + adjHot);
 }
 
 async function storageSanitizeTest() {

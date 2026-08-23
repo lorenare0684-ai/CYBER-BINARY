@@ -42,6 +42,8 @@
   let activeTab = "live";
   let assetsRenderToken = 0;
   let historyRenderToken = 0;
+  const recentAutoLogKeys = new Set();
+  const recentAutoLogOrder = [];
 
   function tfLabel(sec) {
     if (!sec) return "1m";
@@ -88,6 +90,16 @@
     const x = finite(n, null);
     if (x == null) return "—";
     return Math.abs(x) >= 20 ? x.toFixed(2) : x.toFixed(5);
+  }
+  function fmtReading(n) {
+    if (!Number.isFinite(n)) return "—";
+    const magnitude = Math.abs(n);
+    if (magnitude < 1e-12) return "0";
+    // Keep small MACD/ATR-style values readable as ordinary decimals instead
+    // of exposing implementation-looking notation such as -5.304e-5.
+    const places = Math.max(4, Math.min(10, Math.ceil(-Math.log10(magnitude)) + 4));
+    const fixed = n.toFixed(places);
+    return fixed.includes(".") ? fixed.replace(/0+$/, "").replace(/\.$/, "") : fixed;
   }
   function fmtTime(ts) {
     if (ts == null || ts === "") return "—";
@@ -674,6 +686,9 @@
         ["CCI", m.cci],
         ["Hurst", m.hurst],
         ["Momentum", m.momentum],
+        ["CALL votes", m.callScore],
+        ["PUT votes", m.putScore],
+        ["Required score", m.requiredScore],
         ["Score", sig.score != null ? sig.score : "—"],
         ["Confidence", finite(sig.confidence, null) != null ? finite(sig.confidence, 0) + "%" : "—"],
         ["Regime", sig.regime],
@@ -689,9 +704,7 @@
             if (r[0] === "+DI" && r[1] > 30) cls = "call";
             if (r[0] === "-DI" && r[1] > 30) cls = "put";
           }
-          const rendered = typeof r[1] === "number"
-            ? (Number.isFinite(r[1]) ? (Math.abs(r[1]) < 1e-10 ? "0" : (Math.abs(r[1]) < 0.0001 ? r[1].toExponential(3) : r[1].toFixed(4))) : "—")
-            : r[1];
+          const rendered = typeof r[1] === "number" ? fmtReading(r[1]) : r[1];
           return '<div class="reading ' + cls + '"><span>' + esc(r[0]) + '</span><b>' + esc(rendered) +
             '</b></div>';
         }).join("");
@@ -954,6 +967,12 @@
   function appendAutoLog(entry) {
     const ul = $("auto-log");
     if (!ul) return;
+    const at = finite(entry && entry.at, Date.now());
+    const key = String(entry && entry.level || "") + "|" + String(entry && entry.msg || "") + "|" + Math.floor(at / 1000);
+    if (recentAutoLogKeys.has(key)) return;
+    recentAutoLogKeys.add(key);
+    recentAutoLogOrder.push(key);
+    while (recentAutoLogOrder.length > 100) recentAutoLogKeys.delete(recentAutoLogOrder.shift());
     const li = document.createElement("li");
     const cls = entry.level === "trade" || entry.level === "alert" ? "win"
       : entry.level === "error" ? "loss" : "";
@@ -1072,7 +1091,9 @@
     const minConf = Number.isFinite(rawMinConf) ? Math.max(0, Math.min(100, rawMinConf)) : 0;
     const kind = $("bt-kinds").value;
     const kinds = kind === "all" ? null : [kind];
-    const o = { days, horizon, minConf, kinds, minBars: 150, liveOnly: true, requireLive: true };
+    // Lean backtests warm up at 50 bars. Requiring 155 cached bars here made a
+    // normal 100-bar Quotex history response look like "no data".
+    const o = { days, horizon, minConf, kinds, minBars: 50, liveOnly: true, requireLive: true };
 
     const btn = $("bt-run");
     btn.disabled = true;
@@ -1086,10 +1107,18 @@
     }
 
     const assetPool = ASSETS.list().filter((a) => !kinds || kinds.includes(a.kind)).slice(0, 256);
-    const minNeeded = Math.max(40, o.minBars + horizon + 2);
-    const loadLiveCache = Promise.all(assetPool.map((a) =>
+    const minNeeded = Math.max(40, 50 + horizon + 1);
+    // Ask the selected Quotex tab for broker history immediately instead of
+    // assuming its periodic subscription has already completed. Give the
+    // socket response/storage write a short window before reading the cache.
+    const requestFreshHistory = hasChrome
+      ? chrome.runtime.sendMessage({ type: "CYBER_REQUEST_HISTORY", limit: 5000 })
+          .catch(() => null)
+          .then(() => new Promise((resolve) => setTimeout(resolve, 1200)))
+      : Promise.resolve();
+    const loadLiveCache = requestFreshHistory.then(() => Promise.all(assetPool.map((a) =>
       STORE.getCandles(a.id).then((bars) => ({ asset: a, bars })).catch(() => ({ asset: a, bars: [] }))
-    )).then((rows) => {
+    ))).then((rows) => {
       const cachedByAsset = Object.create(null);
       const liveAssets = [];
       rows.forEach((row) => {
@@ -1100,7 +1129,7 @@
         }
       });
       if (!liveAssets.length) {
-        return { results: [], count: 0, liveOnly: true, error: "No cached Quotex live candles yet. Open Quotex, let the tick feed run for a few minutes, then retry." };
+        return { results: [], count: 0, liveOnly: true, error: "No usable Quotex candles were received. Keep the selected Quotex chart open and connected, then retry; at least " + minNeeded + " one-minute bars are required." };
       }
       o.assets = liveAssets;
       o.cachedByAsset = cachedByAsset;

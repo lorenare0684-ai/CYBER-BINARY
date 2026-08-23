@@ -8,7 +8,7 @@
 
   const STRATEGIES = {
     "confluence": {
-      label: "Balanced confluence",
+      label: "Balanced Confluence",
       blurb: "Multi-indicator agreement, rejects most bars. Default.",
       params: {
         rsiPeriod: 14, rsiBuy: 42, rsiSell: 58,
@@ -26,7 +26,7 @@
       },
     },
     "trend": {
-      label: "Trend follower",
+      label: "Trend Follower",
       blurb: "EMA + ADX + Supertrend heavy. Best in directional markets.",
       params: {
         rsiPeriod: 14, rsiBuy: 45, rsiSell: 55,
@@ -44,7 +44,7 @@
       },
     },
     "meanrev": {
-      label: "Mean reversion",
+      label: "Mean Reversion",
       blurb: "Bollinger + Williams + CCI extremes. Best in quiet, ranging markets.",
       params: {
         rsiPeriod: 14, rsiBuy: 30, rsiSell: 70,
@@ -80,7 +80,7 @@
       },
     },
     "scalp": {
-      label: "1m scalp",
+      label: "1m Scalp",
       blurb: "Tighter filters, faster reaction. More trades, lower accuracy.",
       params: {
         rsiPeriod: 7, rsiBuy: 40, rsiSell: 60,

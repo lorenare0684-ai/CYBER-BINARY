@@ -739,7 +739,12 @@
 
   /** Score-based confidence calibration — softmax of weighted vote scores. */
   function softmaxProbs(callScore, putScore) {
-    const k = 2.5; // temperature
+    // Vote scores are small integers and qualifying signals usually lead by at
+    // least two points. The former 2.5 multiplier turned a routine 2-point
+    // lead into 99.3%, so the dashboard could display only 99% or WAIT/0%.
+    // A gentler temperature keeps confidence proportional to vote separation:
+    // 1 point ≈ 60%, 2 ≈ 69%, 3 ≈ 77%, 5 ≈ 88%.
+    const k = 0.4;
     const c = numeric(callScore);
     const p = numeric(putScore);
     if (!Number.isFinite(c) || !Number.isFinite(p)) return { call: 0.5, put: 0.5 };

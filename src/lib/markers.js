@@ -5,9 +5,10 @@
  * It is created exactly once per (asset, barTime, direction) — even if the
  * same signal re-fires — and its anchor never changes afterwards. Rendering
  * is purely presentational, so re-rendering the chart can never move an
- * arrow: signals are computed on CLOSED bars (see content.js), the anchor
- * is the closed bar's (time, close), and the chart (native lightweight-charts
- * markers, or our overlay) positions the arrow from that anchor alone.
+ * arrow: signals are computed on CLOSED bars (see content.js), and the anchor
+ * is the resulting entry candle's (open time, entry price). The chart (native
+ * lightweight-charts markers, or our overlay) positions the arrow from that
+ * anchor alone.
  *
  * Exposes:
  *   CYBER_MARKERS.createStore(opts)  -> { add, seedHistory, list, count, clear }

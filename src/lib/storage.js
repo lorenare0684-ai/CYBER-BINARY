@@ -702,7 +702,13 @@
     const prior = bounded / 100;
     const weight = Math.min(1, Number(v.n) / 25);
     const blended = prior * (1 - weight) + obs * weight;
-    return Math.round(blended * 100);
+    const calibrated = Math.round(blended * 100);
+    // Calibration must not permanently starve its own sample stream. With 25
+    // early losses, the old full-weight adjustment changed any confidence to
+    // 0%; the confidence gate then rejected every future signal, so that
+    // bucket could never recover. Bound one calibration step to ±25 points.
+    return Math.max(0, Math.min(100,
+      Math.max(bounded - 25, Math.min(bounded + 25, calibrated))));
   }
 
   function onChange(fn) {
