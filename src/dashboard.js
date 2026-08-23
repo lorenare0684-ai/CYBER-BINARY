@@ -89,6 +89,16 @@
     if (x == null) return "—";
     return Math.abs(x) >= 20 ? x.toFixed(2) : x.toFixed(5);
   }
+  function fmtReading(n) {
+    if (!Number.isFinite(n)) return "—";
+    const magnitude = Math.abs(n);
+    if (magnitude < 1e-12) return "0";
+    // Keep small MACD/ATR-style values readable as ordinary decimals instead
+    // of exposing implementation-looking notation such as -5.304e-5.
+    const places = Math.max(4, Math.min(10, Math.ceil(-Math.log10(magnitude)) + 4));
+    const fixed = n.toFixed(places);
+    return fixed.includes(".") ? fixed.replace(/0+$/, "").replace(/\.$/, "") : fixed;
+  }
   function fmtTime(ts) {
     if (ts == null || ts === "") return "—";
     const d = new Date(ts);
@@ -692,9 +702,7 @@
             if (r[0] === "+DI" && r[1] > 30) cls = "call";
             if (r[0] === "-DI" && r[1] > 30) cls = "put";
           }
-          const rendered = typeof r[1] === "number"
-            ? (Number.isFinite(r[1]) ? (Math.abs(r[1]) < 1e-10 ? "0" : (Math.abs(r[1]) < 0.0001 ? r[1].toExponential(3) : r[1].toFixed(4))) : "—")
-            : r[1];
+          const rendered = typeof r[1] === "number" ? fmtReading(r[1]) : r[1];
           return '<div class="reading ' + cls + '"><span>' + esc(r[0]) + '</span><b>' + esc(rendered) +
             '</b></div>';
         }).join("");

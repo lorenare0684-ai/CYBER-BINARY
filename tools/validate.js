@@ -326,6 +326,12 @@ const rs = TA.resample([
 ], 1);
 if (rs.length !== 2 || rs[0].time !== 1700000000000) { console.error("resample must normalize second timestamps"); failed++; }
 if (TA.softmaxProbs(1e308, 0).call < 0.99) { console.error("softmax overflow guard failed"); failed++; }
+const onePointConfidence = TA.softmaxProbs(4, 3).call;
+const twoPointConfidence = TA.softmaxProbs(5, 3).call;
+if (onePointConfidence < 0.59 || onePointConfidence > 0.61 ||
+    twoPointConfidence < 0.68 || twoPointConfidence > 0.70) {
+  console.error("softmax confidence is saturated instead of tracking vote separation"); failed++;
+}
 if (TA.lastValid(null).index !== -1) { console.error("lastValid malformed-input guard failed"); failed++; }
 let malformedIndicatorsSafe = true;
 try {
