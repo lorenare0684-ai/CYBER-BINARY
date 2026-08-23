@@ -81,8 +81,13 @@
     const days = boundedDays(opts.days);
     const rawSeed = numberValue(opts.seed);
     const seed = rawSeed != null ? rawSeed : 7;
+    const cachedByAsset = opts.cachedByAsset && typeof opts.cachedByAsset === "object" ? opts.cachedByAsset : null;
     for (const a of assets) {
-      const s = FEED.syntheticSeries(a, days * 24 * 60, { seed });
+      let s = null;
+      if (cachedByAsset && Array.isArray(cachedByAsset[a.id]) && root.CYBER_HIST && root.CYBER_HIST.getSeries) {
+        s = root.CYBER_HIST.getSeries(a, { days, seed, cachedByAsset, liveOnly: opts.liveOnly === true || opts.requireLive === true });
+      }
+      if (!s) s = (opts.liveOnly === true || opts.requireLive === true) ? [] : FEED.syntheticSeries(a, days * 24 * 60, { seed });
       seriesByAsset[a.id] = s;
     }
     const jobs = [];
@@ -319,7 +324,16 @@
         }
         if (seriesAsset !== job.asset.id) {
           seriesAsset = job.asset.id;
-          series = FEED.syntheticSeries(job.asset, Math.round(days * 24 * 60), { seed: opts.seed });
+          const cachedByAsset = opts.cachedByAsset && typeof opts.cachedByAsset === "object" ? opts.cachedByAsset : null;
+          series = null;
+          if (cachedByAsset && Array.isArray(cachedByAsset[job.asset.id]) && root.CYBER_HIST && root.CYBER_HIST.getSeries) {
+            series = root.CYBER_HIST.getSeries(job.asset, {
+              days, seed: opts.seed, cachedByAsset,
+              liveOnly: opts.liveOnly === true || opts.requireLive === true,
+            });
+          }
+          if (!series) series = (opts.liveOnly === true || opts.requireLive === true)
+            ? [] : FEED.syntheticSeries(job.asset, Math.round(days * 24 * 60), { seed: opts.seed });
         }
         for (const result of runChunk({ [job.asset.id]: series }, [job], opts)) out.push(result);
         i++;
@@ -352,6 +366,8 @@
       minConf: opts.minConf,
       minBars: opts.minBars,
       sortBy: opts.sortBy,
+      cachedByAsset: opts.cachedByAsset,
+      liveOnly: opts.liveOnly === true || opts.requireLive === true,
     };
     return new Promise((resolve) => {
       let worker = null, finished = false;

@@ -63,7 +63,7 @@ The completed 500-instance v2.4.0 hardening ledger and final regression evidence
   - **Alerts** — sound + desktop notification + dashboard pulse on qualifying signals. (Default.)
   - **Click** — actively click the visible CALL/PUT button with your stake and expiry, gated by safety limits.
 - **Safety limits** — confidence floor, daily loss cap, hourly / daily trade caps, cooldown bars, per-asset freeze, kill-switch (ARM/DISARM).
-- **Historic backtest** — runs the engine across the full asset catalog (170+ assets: every Quotex FX pair + OTC twins, crypto OTC, commodities, indices, stocks OTC) on deterministic synthetic 1m candles that cycle through trending / ranging / choppy regimes. Returns per-asset, per-strategy, per-regime, per-confidence-bucket accuracy.
+- **Historic backtest** — runs the engine on cached Quotex live/tick-built 1m candles captured from the page feed (no synthetic fallback in the dashboard backtester). Returns per-asset, per-strategy, per-regime, per-confidence-bucket accuracy.
 - **Per-asset historic accuracy** + best-strategy recommendation.
 - **Trade history** with filters (dir / outcome / asset), CSV export, and per-asset / per-strategy / per-regime breakdowns.
 - **Walk-forward validation** helper to detect overfit.
@@ -168,11 +168,9 @@ src/lib/quotex.js        # v2.1: Socket.IO v3 adapter, asset catalog, placeTrade
 icons/
 ```
 
-## Notes on the synthetic history
+## Notes on live history
 
-The engine always has **at least 40 candles** because the active asset's feed is **seeded with 120 synthetic bars** of the matching profile (FX, crypto, commodity, etc.) when the page loads. The engine waits for live ticks to flow in on top of that. The seeded bars use a regime cycle (trending → ranging → choppy → trending-down) so the dashboard has something to score immediately.
-
-The historic backtest uses the **same generator** at longer windows (1–14 days) so the accuracy numbers are comparable to what you'd see on a similar live period — though obviously synthetic, not a substitute for live forward testing.
+The live engine still seeds the active asset with temporary warm-up bars so the UI can boot immediately, but execution and stored analytics wait for genuine Quotex history/ticks. The dashboard backtester consumes only the cached live/tick-built candle buffer from `chrome.storage.local`; if no Quotex cache exists yet, open the broker page and let the feed run before backtesting.
 
 ## Limits
 

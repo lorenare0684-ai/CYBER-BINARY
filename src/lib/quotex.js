@@ -1134,20 +1134,49 @@
         (el.getAttribute("data-direction") || "") + " " +
         (el.getAttribute("data-testid") || "");
     } catch (_) {}
-    var text = " " + (el.textContent || "") + " " + attrs + " " + (el.className || "") + " ";
+    var child = "";
+    try {
+      var nodes = el.querySelectorAll ? el.querySelectorAll("svg, path, use, span, i") : [];
+      for (var i = 0; i < nodes.length && i < 8; i++) {
+        child += " " + (nodes[i].textContent || "") + " " + (nodes[i].className || "") + " " +
+          (nodes[i].getAttribute && ((nodes[i].getAttribute("aria-label") || "") + " " +
+          (nodes[i].getAttribute("d") || "") + " " + (nodes[i].getAttribute("href") || "")));
+      }
+    } catch (_) {}
+    var text = " " + (el.textContent || "") + " " + attrs + " " + (el.className || "") + child + " ";
     var call = CALL_HINTS.test(text);
     var put = PUT_HINTS.test(text);
     return { call: call, put: put, explicit: call !== put };
   }
 
+  function colorVoteFromStyle(style) {
+    if (!style) return null;
+    var raw = String(style.backgroundColor || "") + " " + String(style.backgroundImage || "") + " " +
+      String(style.borderColor || "") + " " + String(style.color || "");
+    var matches = raw.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/g);
+    if (!matches) return null;
+    var green = 0, red = 0;
+    for (var i = 0; i < matches.length; i++) {
+      var m = matches[i].match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+      if (!m) continue;
+      var r = +m[1], g = +m[2], b = +m[3];
+      if (g > r + 25 && g > b + 25) green++;
+      if (r > g + 25 && r > b + 25) red++;
+    }
+    if (green && !red) return true;
+    if (red && !green) return false;
+    return null;
+  }
+
   function elementIsGreen(el) {
     try {
-      var bg = getComputedStyle(el).backgroundColor;
-      var m = bg.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
-      if (!m) return null;
-      var r = +m[1], g = +m[2], b = +m[3];
-      if (g > r + 25 && g > b + 25) return true;   // clearly green
-      if (r > g + 25 && r > b + 25) return false;  // clearly red
+      var direct = colorVoteFromStyle(getComputedStyle(el));
+      if (direct !== null) return direct;
+      var kids = el.querySelectorAll ? el.querySelectorAll("span, div, svg, i") : [];
+      for (var i = 0; i < kids.length && i < 8; i++) {
+        var vote = colorVoteFromStyle(getComputedStyle(kids[i]));
+        if (vote !== null) return vote;
+      }
       return null;
     } catch (_) { return null; }
   }
@@ -1155,7 +1184,7 @@
   function findDirButton(dir) {
     var panel = findPanel();
     var scope = panel || document;
-    var all = scope.querySelectorAll("button, [role='button'], [data-type], [data-direction]");
+    var all = scope.querySelectorAll("button, [role='button'], [data-type], [data-direction], [aria-label*='up' i], [aria-label*='down' i], [aria-label*='call' i], [aria-label*='put' i], [class*='call' i], [class*='put' i], [class*='up' i], [class*='down' i], [class*='higher' i], [class*='lower' i], [class*='buy' i], [class*='sell' i]");
     var explicit = [];
     var greens = [];
     var reds = [];
@@ -1166,7 +1195,7 @@
       if (el.disabled || (el.getAttribute && el.getAttribute("aria-disabled") === "true")) return false;
       var blob = ((el.textContent || "") + " " + (el.className || "") + " " +
         (el.getAttribute && (el.getAttribute("aria-label") || ""))).toLowerCase();
-      if (/open.?chart|add.?chart|chart.?icon|new.?chart/.test(blob)) return false;
+      if (/open.?chart|add.?chart|chart.?icon|new.?chart|settings|deposit|withdraw|profile|menu|timeframe/.test(blob)) return false;
       try {
         var r = el.getBoundingClientRect();
         // Icon controls are normally square and < 60px. Direction buttons

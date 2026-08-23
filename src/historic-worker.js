@@ -33,6 +33,8 @@ self.onmessage = function (event) {
     minConf: input.minConf,
     minBars: input.minBars,
     sortBy: input.sortBy,
+    cachedByAsset: input.cachedByAsset && typeof input.cachedByAsset === "object" ? input.cachedByAsset : null,
+    liveOnly: input.liveOnly === true || input.requireLive === true,
     onProgress: function (progress) {
       self.postMessage({ type: "progress", i: progress.i, total: progress.total });
     },

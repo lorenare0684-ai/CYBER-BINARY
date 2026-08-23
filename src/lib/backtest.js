@@ -4,8 +4,8 @@
  * walk-forward splits, and a calibration curve.
  *
  * Data sources (in order of preference):
- *   1. Cached live candles from chrome.storage.local (s.candles[asset])
- *   2. Synthetic 1m series for the asset (always available, deterministic)
+ *   1. Cached Quotex live/tick-built candles from chrome.storage.local (s.candles[asset])
+ *   2. Synthetic 1m series only when liveOnly/requireLive is not requested
  *
  * This runs both in the extension content-script and Node (for `node tools/`).
  */
@@ -62,6 +62,7 @@
     }
     let cleanCached = Array.from(byTime.values()).sort((a, b) => a.time - b.time);
     if (cleanCached.length > minutes) cleanCached = cleanCached.slice(-minutes);
+    if (o.liveOnly === true || o.requireLive === true) return cleanCached;
     const missing = Math.max(0, minutes - cleanCached.length);
     if (!missing || (cleanCached.length && cleanCached[0].time < missing * 60000)) return cleanCached;
     const startTime = cleanCached.length ? cleanCached[0].time - missing * 60000 : undefined;
