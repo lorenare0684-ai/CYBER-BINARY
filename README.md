@@ -4,6 +4,13 @@ Chrome extension (Manifest V3) that attaches to a Quotex / QX Broker chart, buil
 
 > Live signal analysis and explicitly armed automated execution for Quotex. This third-party tool can place real trades. Binary options are high risk, losses can quickly outweigh returns, and no result or profit is guaranteed.
 
+## What's new in v2.6.7 — Real Quotex Capture Tool
+
+- **`tools/capture-quotex.js`**: a Playwright script you run ON YOUR MACHINE to capture genuine Quotex candles with a demo account. It injects the extension's actual protocol decoder (src/page-hook.js) into a real Chromium, logs in (auto-fill or manual headed mode), subscribes 1m history for the assets you name, and writes the standard export file plus a diagnostics block with raw WebSocket frame samples.
+- Credentials never leave your machine: pass `--email/--password` as local arguments, or omit them and log in by hand in the visible browser. Do not paste account credentials into chats.
+- Output feeds the existing verification chain: `node tools/data-quality.js --candles <file>` (is the data clean?) then `node tools/accuracy.js --candles <file> --horizon 8` (does the preset hold on real candles?).
+- The diagnostics frames let us verify the candle-row layout voting and every parser assumption against REAL payloads, not simulations.
+
 ## What's new in v2.6.6 — Live Signal Integrity
 
 Signals can now only ever come from the desired asset's real, verified feed:
