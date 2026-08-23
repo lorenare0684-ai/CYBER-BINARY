@@ -644,9 +644,15 @@
   function notifyDesktop(signal) {
     try {
       if (typeof Notification === "undefined") return;
+      // `assetLabel` is local to handleSignal(); derive the display label from
+      // the signal here. Referencing the out-of-scope name threw a silent
+      // ReferenceError before `new Notification`, so granted-permission desktop
+      // alerts never fired.
+      const asset = String(signal && signal.asset != null ? signal.asset : "")
+        .replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, 64);
       if (Notification.permission === "granted") {
         new Notification(`CYBER BINARY ${signal.direction}`, {
-          body: `${assetLabel} conf=${signal.confidence}% ${signal.reason || ""}`,
+          body: `${asset} conf=${signal.confidence}% ${signal.reason || ""}`,
         });
       } else if (Notification.permission !== "denied") {
         Notification.requestPermission();

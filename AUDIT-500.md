@@ -59,3 +59,43 @@ node tools/historic.js --days 1 --kinds fx --strategies confluence --minBars 120
 ```
 
 Deterministic benchmark result remains **14,233 resolved trades at 56.73% aggregate win rate**. The one-day FX worker matrix also completed successfully across 76 asset variants.
+
+## Post-audit findings (v2.4.1)
+
+The 500-instance cap is closed. The pass below continued hunting for genuinely
+critical defects in the current source and fixed two that the closed audit did
+not cover, each with a new regression check.
+
+1. **auto.js `notifyDesktop` out-of-scope `assetLabel` (alerts-mode desktop
+   notifications).** `notifyDesktop(signal)` built its `Notification` body with
+   `` `${assetLabel}` ``, but `assetLabel` is a local declared only inside
+   `handleSignal()` — not in scope. The `ReferenceError` fired while evaluating
+   the body argument, before `new Notification(...)` ran, and the surrounding
+   `try/catch` swallowed it, so granted-permission desktop alerts never
+   appeared. Fix: derive the label from `signal.asset` with the same
+   control-char strip + length cap used elsewhere. Regression: a new
+   `notifyDesktopTest` scenario in `tools/bugs.js` (Notification stub asserts a
+   notification is constructed when permitted, requests permission when
+   undecided, is a no-op when denied, tolerates malformed signals, and
+   sanitizes the label). The scenario was verified to FAIL on the pre-fix code
+   (`created=0`) and PASS after the fix.
+
+2. **dashboard.js backtest history-wait early error (prior commit de362b6).**
+   `runBacktest()` could surface "could not collect enough history" before the
+   fresh-history request had a chance to return enough bars. Fix: only short
+   circuit on a genuine deadline; otherwise nudge a fresh fetch and continue
+   polling up to the full window.
+
+Full post-audit regression run (all green):
+
+```text
+node --check (all src/**/*.js and tools/*.js)
+git diff --check
+node tools/validate.js
+node tools/bugs.js
+node tools/auto-trade.js
+node tools/background.js
+node tools/markers.js
+node tools/detection-e2e.js
+node tools/backtest.js
+```
