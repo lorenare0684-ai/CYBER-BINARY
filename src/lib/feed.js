@@ -234,6 +234,46 @@
       return mergeCandles([c]);
     }
 
+    /**
+     * Scale an existing warm-up series so its newest close matches a real
+     * quote. This is intentionally explicit: callers use it only before real
+     * broker history has arrived, preventing the first live tick from drawing
+     * a giant synthetic-to-live candle and corrupting every indicator scale.
+     */
+    function rebase(price) {
+      const target = numberValue(price);
+      const source = current ? current.close : (candles.length ? candles[candles.length - 1].close : null);
+      if (target == null || target <= 0 || target > 1e15 ||
+          source == null || source <= 0 || source > 1e15) return false;
+      const ratio = target / source;
+      if (!Number.isFinite(ratio) || ratio <= 0) return false;
+      const scale = (bar) => {
+        if (!bar) return null;
+        const open = bar.open * ratio;
+        const high = bar.high * ratio;
+        const low = bar.low * ratio;
+        const close = bar.close * ratio;
+        if (![open, high, low, close].every((value) => Number.isFinite(value) && value > 0 && value <= 1e15)) return null;
+        return Object.assign({}, bar, { open, high, low, close });
+      };
+      const scaledCandles = [];
+      for (let i = 0; i < candles.length; i++) {
+        const bar = scale(candles[i]);
+        if (!bar) return false;
+        scaledCandles.push(bar);
+      }
+      const scaledCurrent = current ? scale(current) : null;
+      if (current && !scaledCurrent) return false;
+      candles = scaledCandles;
+      current = scaledCurrent;
+      // Avoid a tiny floating-point mismatch at the join with the first real
+      // quote; the newest close is the requested broker price by definition.
+      if (current) current.close = target;
+      else if (candles.length) candles[candles.length - 1].close = target;
+      last = target;
+      return true;
+    }
+
     /** Close the current bar if it is stale (bucket older than `ts`). */
     function forceClose(ts) {
       if (!current) return null;
@@ -266,7 +306,7 @@
     }
 
     return {
-      ingest, ingestCandle, mergeCandles, series, seedHistory, setSeries,
+      ingest, ingestCandle, mergeCandles, series, seedHistory, setSeries, rebase,
       replaceCandles, forceClose, pruneBefore,
       lastPrice: () => last,
       hasCurrent: () => !!current,

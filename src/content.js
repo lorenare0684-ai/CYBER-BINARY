@@ -606,7 +606,11 @@
     // away from the live feed. Resample the genuine 1m feed into the visible
     // broker timeframe and replace matching buckets with those live values.
     const period = Number(selected.period);
-    if (period > 60 && period % 60 === 0 && self.CYBER_TA && typeof self.CYBER_TA.resample === "function") {
+    // Never overlay resampled synthetic warm-up bars on genuine higher-
+    // timeframe broker history. Until a real 1m batch arrives, those two
+    // series can have different price levels and create a fake final spike.
+    if (historySeeded[activeAsset] && period > 60 && period % 60 === 0 &&
+        self.CYBER_TA && typeof self.CYBER_TA.resample === "function") {
       const live = self.CYBER_TA.resample(activeFeed.series(), period / 60);
       if (live.length) {
         const byTime = Object.create(null);
@@ -1113,15 +1117,37 @@
     el.querySelector(".cb-hud-meta").textContent = metaText;
   }
 
-  function ingest(price, assetOverride, tickTime) {
+  function ingest(price, assetOverride, tickTime, source) {
     const safePrice = Number(price);
     if (!Number.isFinite(safePrice) || safePrice <= 0 || safePrice > 1e12) return false;
+    const targetAsset = assetOverride || activeAsset;
+    const targetFeed = createFeedFor(targetAsset);
+    const priorPrice = Number(targetFeed.lastPrice());
+    const relativeMove = Number.isFinite(priorPrice) && priorPrice > 0
+      ? Math.abs(safePrice / priorPrice - 1) : 0;
+
+    // The DOM is only a fallback and can briefly point at a balance, payout,
+    // strike, or another chart while the broker SPA is remounting. Once real
+    // history anchors the feed, reject a single DOM value more than 2% away;
+    // WebSocket quotes and broker OHLC remain authoritative.
+    if (source === "dom" && historySeeded[targetAsset] && relativeMove > 0.02) return false;
+
     let ts = tickTime == null ? Date.now() : Number(tickTime);
     if (!Number.isFinite(ts)) return false;
     while (Math.abs(ts) >= 1e14) ts /= 1000;
     if (Math.abs(ts) < 1e11) ts *= 1000;
     ts = Math.floor(ts);
     if (!Number.isSafeInteger(ts) || ts < Date.now() - 7 * 86400000 || ts > Date.now() + 60000) return false;
+
+    // Before genuine 1m history is available the feed contains a synthetic
+    // indicator warm-up. Align that warm-up to the first valid real quote (and
+    // to a later source correction if it differs by >2%) instead of joining
+    // two unrelated price levels with the giant candle in the bug report.
+    if (!historySeeded[targetAsset] && typeof targetFeed.rebase === "function" &&
+        (!lastAcceptedQuoteAt[targetAsset] || relativeMove > 0.02)) {
+      targetFeed.rebase(safePrice);
+    }
+
     if (assetOverride && assetOverride !== activeAsset) {
       // Keep background charts warm. Per-asset pending calls may settle only
       // from their own feed, never from the currently selected asset's price.
@@ -1189,7 +1215,7 @@
       const p = findPrice();
       if (p && p !== lastDomPriceByAsset[activeAsset]) {
         lastDomPriceByAsset[activeAsset] = p;
-        ingest(p, det && det.id);
+        ingest(p, det && det.id, currentTime, "dom");
       }
     }
     maybeSignal();
@@ -1225,7 +1251,7 @@
           const relevant = det && (det.id === activeAsset || !!pendingByAsset[det.id]);
           // Unrelated subscriptions from mini/open charts must not allocate a
           // synthetic feed or trigger analysis work on every quote.
-          const accepted = relevant ? ingest(price, det.id, p.time) : false;
+          const accepted = relevant ? ingest(price, det.id, p.time, "websocket") : false;
           if (accepted && lastWsSymbol && QUOTEX &&
               QUOTEX.normalizeSymbol(symbol) === QUOTEX.normalizeSymbol(lastWsSymbol)) {
             lastWsPrice = price;

@@ -68,6 +68,15 @@ else {
   const f = sandbox.self.CYBER_FEED.createFeed({ tfMs: 60000 });
   f.seedHistory(50, 1.1);
   if (f.series().length < 40) { console.error("feed seed failed"); failed++; }
+  const beforeRebase = f.series();
+  const beforeShape = beforeRebase[beforeRebase.length - 2].close / beforeRebase[beforeRebase.length - 1].close;
+  if (!f.rebase(1.75)) { console.error("feed warm-up rebase failed"); failed++; }
+  const afterRebase = f.series();
+  const afterShape = afterRebase[afterRebase.length - 2].close / afterRebase[afterRebase.length - 1].close;
+  if (f.lastPrice() !== 1.75 || afterRebase[afterRebase.length - 1].close !== 1.75 ||
+      Math.abs(beforeShape - afterShape) > 1e-12) {
+    console.error("feed rebase must align newest close while preserving shape"); failed++;
+  }
   const s1 = sandbox.self.CYBER_FEED.syntheticSeries("EURUSD", 80, { seed: 7 });
   const s2 = sandbox.self.CYBER_FEED.syntheticSeries("GBPUSD", 80, { seed: 7 });
   if (!s1.length || !s2.length || s1[20].close / s1[20].open === s2[20].close / s2[20].open) {
