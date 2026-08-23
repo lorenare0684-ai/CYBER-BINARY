@@ -10,6 +10,7 @@ let primarySelection = null;
 let primaryEpoch = 0;
 let activationEpoch = 0;
 let primaryPersistQueue = Promise.resolve();
+let lastStateEpoch = null;
 const stateByTab = new Map();
 const STORAGE_KEY = "cyberBinaryV2";
 const STORAGE_ROOTS = new Set(["settings", "stats", "candles", "automation", "calibration"]);
@@ -135,11 +136,10 @@ function setPrimaryTab(tabId) {
   primaryEpoch++;
   persistPrimaryTab();
   broadcastPrimary();
-  const state = stateByTab.get(tabId);
-  if (state) {
-    chrome.storage.session.set({ lastState: state, lastStateTabId: tabId }).catch(() => {});
-    chrome.runtime.sendMessage({ type: "CYBER_STATE_PUSH", payload: state }).catch(() => {});
-  }
+  // Secondary tabs cannot refresh stateByTab, so this entry belongs to the
+  // tab's previous ownership period. Replaying it would present an old asset
+  // or balance as live until the promoted content script publishes again.
+  stateByTab.delete(tabId);
   return true;
 }
 
@@ -401,6 +401,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ ok: true, primary: false });
         return;
       }
+      lastStateEpoch = primaryEpoch;
       chrome.storage.session.set({ lastState: msg.payload, lastStateTabId: tabId }).catch(() => {});
       chrome.runtime.sendMessage({ type: "CYBER_STATE_PUSH", payload: msg.payload }).catch(() => {});
       sendResponse({ ok: true, primary: true });
@@ -428,7 +429,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const d = await chrome.storage.session.get(["lastState", "lastStateTabId"]);
       const saved = d && d.lastState;
       const savedAge = saved && Number.isFinite(Number(saved.ts)) ? Date.now() - Number(saved.ts) : Infinity;
-      const fresh = saved && d.lastStateTabId === tabId && savedAge >= 0 && savedAge < 15000;
+      // null means this worker has just restarted, where the persisted owner is
+      // still valid. A numeric mismatch means ownership changed in this worker
+      // and the saved snapshot belongs to an earlier promotion of this tab.
+      const epochValid = lastStateEpoch == null || lastStateEpoch === primaryEpoch;
+      const fresh = epochValid && saved && d.lastStateTabId === tabId && savedAge >= 0 && savedAge < 15000;
       sendResponse({ ok: true, payload: fresh ? saved : null, tabId });
     }).catch((e) => sendResponse({ ok: false, payload: null, error: String(e) }));
     return true;

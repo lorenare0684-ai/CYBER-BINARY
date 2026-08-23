@@ -6,7 +6,7 @@
  *   - tools/page-hook.shell.js (MAIN-world WebSocket hook shell)
  *
  * Rebuild after any change to either source file.
- * Generated: 2026-08-23T07:10:09.022Z
+ * Generated: 2026-08-23T07:18:45.700Z
  */
 /* ====================================================================
  * Inlined CYBER_QUOTEX adapter (src/lib/quotex.js).
@@ -405,8 +405,19 @@
     }
   }
 
-  function inferEventFromPayload(p) {
+  function inferEventFromPayload(p, depth) {
     if (p == null) return "unknown";
+    depth = Number.isInteger(depth) ? depth : 0;
+    if (depth < 8 && !Array.isArray(p) && typeof p === "object") {
+      // ACK/binary variants frequently add one transport envelope. Inspect it
+      // before shape detection so {data:[[symbol,time,price]]} is not dropped.
+      var wrapped = p.tick != null ? p.tick
+        : (p.quotes != null ? p.quotes : (p.data != null ? p.data : p.result));
+      if (wrapped != null && wrapped !== p) {
+        var wrappedEvent = inferEventFromPayload(wrapped, depth + 1);
+        if (wrappedEvent !== "unknown") return wrappedEvent;
+      }
+    }
     if (Array.isArray(p)) {
       if (!p.length) return "unknown";
       var first = p[0];
@@ -599,11 +610,14 @@
   function parseCandles(payload) {
     if (!payload || typeof payload !== "object") return null;
     var body = payload.data && !Array.isArray(payload.data) && typeof payload.data === "object"
-      ? payload.data : payload;
+      ? payload.data
+      : (payload.result && !Array.isArray(payload.result) && typeof payload.result === "object" ? payload.result : payload);
     var asset = body.asset || body.symbol || body.pair || payload.asset || payload.symbol || payload.pair || null;
     if (asset != null && /^\d+$/.test(String(asset)) && ID_TO_SYMBOL[Number(asset)]) asset = ID_TO_SYMBOL[Number(asset)];
     var period = body.period != null ? body.period : (body.timeframe != null ? body.timeframe : (payload.period || payload.timeframe || null));
-    var rows = body.history || body.candles || (Array.isArray(body.data) ? body.data : null) || (Array.isArray(payload.data) ? payload.data : null) || null;
+    var rows = body.history || body.candles || (Array.isArray(body.data) ? body.data : null) ||
+      (Array.isArray(body.result) ? body.result : null) || (Array.isArray(payload.data) ? payload.data : null) ||
+      (Array.isArray(payload.result) ? payload.result : null) || null;
     if (!asset || period == null) {
       // Some servers push {history:[...]} without metadata (headerless flow).
       // Caller should know the requested asset/period; assume 60s here.
@@ -695,13 +709,20 @@
     return Number.isSafeInteger(n) && Math.abs(n) <= 8640000000000000 ? n : null;
   }
 
-  function parseQuote(payload) {
+  function parseQuote(payload, depth) {
     if (!payload) return null;
-    // Object wrappers seen on some builds: {"tick": [[...],...]} or
-    // {"quotes": [...]} or a single quote object.
+    depth = Number.isInteger(depth) ? depth : 0;
+    // Object wrappers seen on broker builds. Unwrap objects as well as arrays;
+    // transports may emit {data:{symbol,time,price}} rather than a bare row.
     if (!Array.isArray(payload) && typeof payload === "object") {
-      if (payload.tick != null && Array.isArray(payload.tick)) payload = payload.tick;
-      else if (payload.quotes != null && Array.isArray(payload.quotes)) payload = payload.quotes;
+      var wrapped = payload.tick != null ? payload.tick
+        : (payload.quotes != null ? payload.quotes
+        : (payload.quote != null ? payload.quote
+        : (payload.data != null ? payload.data : payload.result)));
+      if (wrapped != null && wrapped !== payload) {
+        if (depth >= 8) return null;
+        return parseQuote(wrapped, depth + 1);
+      }
     }
     var symbol = null, ts = null, price = null;
     if (Array.isArray(payload)) {
@@ -757,11 +778,18 @@
     };
   }
 
-  function parseQuotes(payload) {
+  function parseQuotes(payload, depth) {
     if (!payload) return [];
+    depth = Number.isInteger(depth) ? depth : 0;
     if (!Array.isArray(payload) && typeof payload === "object") {
-      if (Array.isArray(payload.tick)) return parseQuotes(payload.tick);
-      if (Array.isArray(payload.quotes)) return parseQuotes(payload.quotes);
+      var wrapped = payload.tick != null ? payload.tick
+        : (payload.quotes != null ? payload.quotes
+        : (payload.quote != null ? payload.quote
+        : (payload.data != null ? payload.data : payload.result)));
+      if (wrapped != null && wrapped !== payload) {
+        if (depth >= 8) return [];
+        return parseQuotes(wrapped, depth + 1);
+      }
     }
     var out = [];
     if (Array.isArray(payload) && payload.length &&
@@ -778,8 +806,16 @@
     return out;
   }
 
-  function parseBalance(payload) {
-    if (!payload || typeof payload !== "object") return null;
+  function parseBalance(payload, depth) {
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+    depth = Number.isInteger(depth) ? depth : 0;
+    var wrapped = payload.data != null ? payload.data
+      : (payload.result != null ? payload.result
+      : (payload.account != null ? payload.account
+      : (payload.balance && typeof payload.balance === "object" ? payload.balance : null)));
+    if (wrapped && typeof wrapped === "object" && !Array.isArray(wrapped) && wrapped !== payload) {
+      return depth >= 8 ? null : parseBalance(wrapped, depth + 1);
+    }
     var uid = positiveId(payload.uid);
     var bal = numberValue(payload.balance != null ? payload.balance : (payload.amount != null ? payload.amount : 0));
     return {
@@ -794,8 +830,21 @@
 
   function orderBody(payload) {
     if (!payload || typeof payload !== "object" || Array.isArray(payload)) return payload;
-    var nested = payload.order || payload.deal || payload.ticket || payload.data;
-    return nested && typeof nested === "object" && !Array.isArray(nested) ? nested : payload;
+    var nested = payload.order || payload.deal || payload.ticket || payload.data ||
+      (payload.result && typeof payload.result === "object" ? payload.result : null);
+    if (!nested || typeof nested !== "object" || Array.isArray(nested)) return payload;
+    // Placement ACKs often keep correlation on the envelope and order fields
+    // under data/result. Preserve the ID or automation times out despite a
+    // broker-confirmed order.
+    if (nested.requestId == null && payload.requestId != null) {
+      var correlated = {};
+      for (var key in nested) {
+        if (Object.prototype.hasOwnProperty.call(nested, key) && key !== "__proto__") correlated[key] = nested[key];
+      }
+      correlated.requestId = payload.requestId;
+      return correlated;
+    }
+    return nested;
   }
 
   function orderDirection(payload) {

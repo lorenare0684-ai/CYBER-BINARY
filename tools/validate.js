@@ -232,6 +232,22 @@ else {
   if (!stringQuote || stringQuote.symbol !== "EURUSD" || stringQuote.price !== 1.0815) {
     console.error("numeric-string headerless quotes must be inferred and parsed"); failed++;
   }
+  let wrappedQuote = null;
+  const wrappedQuoteRouter = Q.createRouter({ onTick: (quote) => { wrappedQuote = quote; } });
+  wrappedQuoteRouter.dispatch({ type:"bin", payload:{ data:[["EURUSD", 1700000000, 1.0825]] } });
+  const wrappedObjectQuote = Q.parseQuote({ result:{ symbol:"EURUSD", time:1700000001, price:1.083 } });
+  const wrappedCandles = Q.parseCandles({ result:{ asset:"EURUSD", period:60,
+    candles:[[1700000000,1.08,1.082,1.085,1.075,100]] } });
+  const wrappedBalance = Q.parseBalance({ data:{ uid:7, balance:52.5, currency:"USD" } });
+  const wrappedOrder = Q.parseOrderOpened({ requestId:"req-envelope", result:{
+    id:"order-7", asset:"EURUSD", amount:10, action:"call"
+  } });
+  if (!wrappedQuote || wrappedQuote.price !== 1.0825 || !wrappedObjectQuote ||
+      wrappedObjectQuote.price !== 1.083 || !wrappedCandles || wrappedCandles.raw.length !== 1 ||
+      !wrappedBalance || wrappedBalance.balance !== 52.5 || !wrappedOrder ||
+      wrappedOrder.id !== "order-7" || wrappedOrder.requestId !== "req-envelope") {
+    console.error("broker data/result envelopes must preserve quotes, history, balance, and order correlation"); failed++;
+  }
   let malformedBrokerSafe = true;
   try {
     malformedBrokerSafe = Q.toMs(Symbol("time")) === null &&

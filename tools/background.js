@@ -163,6 +163,18 @@ function ok(condition, label) {
     "in-flight dashboard command follows the latest explicit tab activation");
   ok(sessionData.primaryTabId === 1, "serialized session persistence converges on the latest owner");
 
+  // A cached snapshot from tab 1 must not be replayed after ownership moves
+  // away and back. Secondary tabs cannot refresh it, so it is no longer live.
+  const oldSnapshot = { ts: Date.now(), asset: "EURUSD", candles: [] };
+  await request({ type: "CYBER_STATE", payload: oldSnapshot }, tabs.get(1));
+  onActivated.emit({ tabId: 2 });
+  await flush();
+  onActivated.emit({ tabId: 1 });
+  await flush();
+  const stateAfterRepromotion = await request({ type: "CYBER_GET_STATE" }, null);
+  ok(stateAfterRepromotion.ok === true && stateAfterRepromotion.payload == null,
+    "re-promoted tabs do not replay state from a previous ownership period");
+
   const wrongStateShape = await request({
     type: "CYBER_STATE", payload: { ts: Date.now(), candles: { not: "an array" } },
   }, tabs.get(1));
