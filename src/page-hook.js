@@ -6,7 +6,7 @@
  *   - tools/page-hook.shell.js (MAIN-world WebSocket hook shell)
  *
  * Rebuild after any change to either source file.
- * Generated: 2026-08-23T06:26:10.480Z
+ * Generated: 2026-08-23T06:28:54.454Z
  */
 /* ====================================================================
  * Inlined CYBER_QUOTEX adapter (src/lib/quotex.js).
@@ -423,7 +423,7 @@
             (ID_TO_SYMBOL[n0] || n1 > 1e9)) {
           return "quote"; // [assetId, timestamp, price]
         }
-        // Candle rows: [ts, open, low, high, close, ...] or [ts, open, high, low, close, ...]
+        // Quotex candle rows: [ts, open, close, high, low, ...]
         if (first.length >= 5 && n0 != null && n1 != null && n2 != null &&
             numberValue(first[3]) != null && numberValue(first[4]) != null) {
           if (n0 > 1e9) return "candles"; // timestamps far in the past → history batch
@@ -636,26 +636,31 @@
       if (row && !Array.isArray(row) && typeof row === "object") {
         row = [
           row.time != null ? row.time : (row.ts != null ? row.ts : row.timestamp),
-          row.open, row.low, row.high, row.close,
+          row.open, row.close, row.high, row.low,
           row.volume != null ? row.volume : row.vol,
         ];
       }
       if (!Array.isArray(row) || row.length < 5) continue;
-      // Quotex history rows are [ts, open, low, high, close, vol?]. Some
-      // regions reverse low/high, so derive the envelope from ALL OHLC fields
-      // rather than trusting positions 2/3. This prevents inverted or clipped
-      // candle wicks on the dashboard.
+      // Quotex history rows are [ts, open, close, high, low, vol?]. The old
+      // decoder treated index 4 (low) as close, which made historical candle
+      // bodies and every close-based indicator disagree with the broker chart.
+      // Derive the wick envelope from all four prices to tolerate occasional
+      // high/low inversions while preserving the canonical close at index 2.
       var ts = numberValue(row[0]);
       var o = numberValue(row[1]);
-      var a = numberValue(row[2]);
-      var b = numberValue(row[3]);
-      var c = numberValue(row[4]);
+      var c = numberValue(row[2]);
+      var reportedHigh = numberValue(row[3]);
+      var reportedLow = numberValue(row[4]);
       if (ts == null || o == null || c == null ||
           o <= 0 || c <= 0 || o > 1e100 || c > 1e100) continue;
       var hi = Math.max(o, c);
       var lo = Math.min(o, c);
-      if (a != null && a > 0 && a <= 1e100) { hi = Math.max(hi, a); lo = Math.min(lo, a); }
-      if (b != null && b > 0 && b <= 1e100) { hi = Math.max(hi, b); lo = Math.min(lo, b); }
+      if (reportedHigh != null && reportedHigh > 0 && reportedHigh <= 1e100) {
+        hi = Math.max(hi, reportedHigh); lo = Math.min(lo, reportedHigh);
+      }
+      if (reportedLow != null && reportedLow > 0 && reportedLow <= 1e100) {
+        hi = Math.max(hi, reportedLow); lo = Math.min(lo, reportedLow);
+      }
       var rawVol = row.length > 5 && row[5] != null ? numberValue(row[5]) : 0;
       var vol = rawVol == null ? 0 : rawVol;
       // Accept unix seconds, milliseconds, microseconds, or nanoseconds consistently.

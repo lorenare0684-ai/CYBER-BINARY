@@ -175,11 +175,20 @@ else {
   if (!f3 || f3.type !== "bin" || !f3.payload || f3.payload.balance !== 50) { console.error("quotex binary frame"); failed++; }
   const inst = Q.parseInstruments([[1,"EURUSD","EUR/USD","currency",85,0,0,0,0,0,0,0,[[60]],0,true,[]]]);
   if (inst.length !== 1 || inst[0].symbol !== "EURUSD") { console.error("quotex parseInstruments"); failed++; }
-  const cNorm = Q.normalizeCandles({ asset:"EURUSD", period:60, raw:[[1700000000,1.08,1.075,1.085,1.082,100]] });
-  if (cNorm.length !== 1 || cNorm[0].time !== 1700000000000) { console.error("quotex candle epoch ms"); failed++; }
+  // Quotex wire order is [time, open, close, high, low, volume]. Close must
+  // never be read from index 4 (the low), or old candles diverge from chart.
+  const cNorm = Q.normalizeCandles({ asset:"EURUSD", period:60, raw:[[1700000000,1.08,1.082,1.085,1.075,100]] });
+  const objectNorm = Q.normalizeCandles({ asset:"EURUSD", period:60, raw:[{
+    time:1700000060, open:1.082, close:1.079, high:1.084, low:1.078, volume:12,
+  }] });
+  if (cNorm.length !== 1 || cNorm[0].time !== 1700000000000 || cNorm[0].open !== 1.08 ||
+      cNorm[0].close !== 1.082 || cNorm[0].high !== 1.085 || cNorm[0].low !== 1.075 ||
+      objectNorm.length !== 1 || objectNorm[0].close !== 1.079 || objectNorm[0].low !== 1.078) {
+    console.error("quotex OHLC wire order/epoch normalization failed"); failed++;
+  }
   const strictCandles = Q.normalizeCandles({ asset:"EURUSD", period:60, raw:[
-    ["1700000060junk", "1.08", "1.07", "1.09", "1.085", "10"],
-    ["1700000060", "1.08junk", "1.07", "1.09", "1.085", "10"],
+    ["1700000060junk", "1.08", "1.085", "1.09", "1.07", "10"],
+    ["1700000060", "1.08junk", "1.085", "1.09", "1.07", "10"],
   ] });
   if (strictCandles.length !== 0) { console.error("malformed numeric candle prefixes must be rejected"); failed++; }
   const unknownClose = Q.parseOrderClosed({ id:"missing-outcome", asset:"EURUSD", amount:10, status:"closed" });
