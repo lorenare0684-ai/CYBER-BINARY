@@ -238,6 +238,8 @@ function feedTest() {
   feed.ingest(1.002, 1020000);      // bar B (bucket 1020000) closes A
   const before = feed.series().length; // 2 (A closed + B live)
   const beforePrice = feed.lastPrice();
+  check("feed can reject stale tick before any pre-ingest mutation", feed.canIngest(1010000) === false);
+  check("feed accepts current/new tick before mutation", feed.canIngest(1020060) === true);
   const stale = feed.ingest(1.05, 1010000); // bucket 960000 < B's 1020000 → stale
   check("stale tick (older bucket) dropped", stale === null, "got=" + JSON.stringify(stale && stale.current));
   check("stale tick cannot overwrite last price", feed.lastPrice() === beforePrice, beforePrice + "→" + feed.lastPrice());

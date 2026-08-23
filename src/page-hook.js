@@ -6,7 +6,7 @@
  *   - tools/page-hook.shell.js (MAIN-world WebSocket hook shell)
  *
  * Rebuild after any change to either source file.
- * Generated: 2026-08-23T06:43:07.130Z
+ * Generated: 2026-08-23T07:03:38.995Z
  */
 /* ====================================================================
  * Inlined CYBER_QUOTEX adapter (src/lib/quotex.js).
@@ -1203,7 +1203,23 @@
   function findDirButton(dir) {
     var panel = findPanel();
     var scope = panel || document;
-    var all = scope.querySelectorAll("button, [role='button'], [data-type], [data-direction], [aria-label*='up' i], [aria-label*='down' i], [aria-label*='call' i], [aria-label*='put' i], [class*='call' i], [class*='put' i], [class*='up' i], [class*='down' i], [class*='higher' i], [class*='lower' i], [class*='buy' i], [class*='sell' i]");
+    // Query direction selectors independently. One unsupported selector or a
+    // brittle DOM shim must not discard every other valid action button, and
+    // de-duplication keeps the bounded scan deterministic.
+    var selectors = [
+      "button", "[role='button']", "[data-type]", "[data-direction]",
+      "[aria-label*='up' i]", "[aria-label*='down' i]", "[aria-label*='call' i]", "[aria-label*='put' i]",
+      "[class*='call' i]", "[class*='put' i]", "[class*='up' i]", "[class*='down' i]",
+      "[class*='higher' i]", "[class*='lower' i]", "[class*='buy' i]", "[class*='sell' i]",
+    ];
+    var all = [];
+    for (var si = 0; si < selectors.length && all.length < 500; si++) {
+      var selected = [];
+      try { selected = scope.querySelectorAll(selectors[si]); } catch (_) { selected = []; }
+      for (var sj = 0; sj < selected.length && all.length < 500; sj++) {
+        if (all.indexOf(selected[sj]) === -1) all.push(selected[sj]);
+      }
+    }
     var explicit = [];
     var greens = [];
     var reds = [];

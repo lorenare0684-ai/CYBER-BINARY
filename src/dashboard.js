@@ -1115,7 +1115,8 @@
       if (n) btn.textContent = "Running live-feed backtest " + i + " / " + n + "…";
     }
 
-    const assetPool = ASSETS.list().filter((a) => !kinds || kinds.includes(a.kind)).slice(0, 256);
+    const assetPool = ASSETS.list().filter((a) => !kinds || kinds.some((kindName) =>
+      typeof ASSETS.matchesKind === "function" ? ASSETS.matchesKind(a, kindName) : a.kind === kindName)).slice(0, 256);
     const minNeeded = Math.max(40, 50 + horizon + 1);
     // Ask the selected Quotex tab for broker history immediately instead of
     // assuming its periodic subscription has completed. Poll the genuine

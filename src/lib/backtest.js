@@ -141,7 +141,9 @@
     const assetInput = Array.isArray(o.assets) ? o.assets : ASSETS.list();
     for (const value of assetInput) {
       const asset = ASSETS.get(typeof value === "string" ? value : value && value.id);
-      if (!asset || seenAssets.has(asset.id) || (allowedKinds && !allowedKinds.has(asset.kind))) continue;
+      const kindMatch = !allowedKinds || Array.from(allowedKinds).some((kind) =>
+        typeof ASSETS.matchesKind === "function" ? ASSETS.matchesKind(asset, kind) : asset && asset.kind === kind);
+      if (!asset || seenAssets.has(asset.id) || !kindMatch) continue;
       seenAssets.add(asset.id); assets.push(asset);
       if (assets.length >= 256) break;
     }

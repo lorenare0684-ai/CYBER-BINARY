@@ -132,18 +132,23 @@
       return { closed, closedBars, current, last };
     }
 
-    function ingest(price, ts) {
-      price = numberValue(price);
-      if (price == null || price <= 0 || price > 1e15) return null;
+    function canIngest(ts) {
       const parsedTickTime = ts != null ? numberValue(ts) : Date.now();
       const tickTime = parsedTickTime == null ? NaN : parsedTickTime;
-      if (!Number.isSafeInteger(tickTime) || tickTime < 0) return null;
+      if (!Number.isSafeInteger(tickTime) || tickTime < 0) return false;
       const t = bucket(tickTime);
-      // Reject replays before updating `last`. When forceClose() has moved the
-      // live bar into `candles`, there is temporarily no `current`; a tick for
-      // that same or an older bucket must still not recreate/overwrite it.
+      // When forceClose() moved the live bar into `candles`, that bucket is
+      // final; otherwise the current bucket may still receive updates.
       const newestClosedTime = candles.length ? candles[candles.length - 1].time : null;
-      if ((current && t < current.time) || (!current && newestClosedTime != null && t <= newestClosedTime)) return null;
+      return !((current && t < current.time) || (!current && newestClosedTime != null && t <= newestClosedTime));
+    }
+
+    function ingest(price, ts) {
+      price = numberValue(price);
+      if (price == null || price <= 0 || price > 1e15 || !canIngest(ts)) return null;
+      const parsedTickTime = ts != null ? numberValue(ts) : Date.now();
+      const tickTime = parsedTickTime == null ? NaN : parsedTickTime;
+      const t = bucket(tickTime);
       last = price;
       let closed = null;
       if (!current || current.time !== t) {
@@ -306,7 +311,7 @@
     }
 
     return {
-      ingest, ingestCandle, mergeCandles, series, seedHistory, setSeries, rebase,
+      ingest, canIngest, ingestCandle, mergeCandles, series, seedHistory, setSeries, rebase,
       replaceCandles, forceClose, pruneBefore,
       lastPrice: () => last,
       hasCurrent: () => !!current,

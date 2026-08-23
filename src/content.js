@@ -1141,7 +1141,8 @@
     while (Math.abs(ts) >= 1e14) ts /= 1000;
     if (Math.abs(ts) < 1e11) ts *= 1000;
     ts = Math.floor(ts);
-    if (!Number.isSafeInteger(ts) || ts < Date.now() - 7 * 86400000 || ts > Date.now() + 60000) return false;
+    if (!Number.isSafeInteger(ts) || ts < Date.now() - 7 * 86400000 || ts > Date.now() + 60000 ||
+        (typeof targetFeed.canIngest === "function" && !targetFeed.canIngest(ts))) return false;
 
     // Before genuine 1m history is available the feed contains a synthetic
     // indicator warm-up. Align that warm-up to the first valid real quote (and

@@ -719,8 +719,21 @@
     return ASSETS.map(cloneAsset);
   }
 
+  /** Match the dashboard's market filters. OTC is a trading venue shared by
+   * FX, crypto, commodities, indices, and stocks—not an asset class. The old
+   * `a.kind === "otc"` check exposed only two synthetic demo symbols and hid
+   * every real `_otc` broker instrument. Other class filters intentionally
+   * continue to include their OTC variants. */
+  function matchesKind(asset, kind) {
+    if (!asset || typeof asset !== "object" || typeof kind !== "string") return false;
+    var wanted = kind.trim().toLowerCase();
+    if (!wanted || wanted === "all") return true;
+    if (wanted === "otc") return /_otc$/i.test(String(asset.id || "")) || asset.kind === "otc" || asset.isOtc === true;
+    return asset.kind === wanted;
+  }
+
   function byKind(kind) {
-    return ASSETS.filter(function (a) { return a.kind === kind; }).map(cloneAsset);
+    return ASSETS.filter(function (a) { return matchesKind(a, kind); }).map(cloneAsset);
   }
 
   function runtimeAliases() {
@@ -733,6 +746,6 @@
     ALIAS: Object.assign({}, ALIAS),
     registerQuotexAsset: registerQuotexAsset, ensureRegistered: ensureRegistered,
     runtimeAliases: runtimeAliases, normalizeSymbol: normalizeSymbol,
-    inferKind: inferKind, humanAliases: humanAliases,
+    inferKind: inferKind, humanAliases: humanAliases, matchesKind: matchesKind,
   };
 })(typeof self !== "undefined" ? self : globalThis);

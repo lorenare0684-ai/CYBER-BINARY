@@ -97,6 +97,15 @@ else {
   for (const k of ["fx", "crypto", "commodity", "index", "stock", "otc"]) {
     if (!kinds.has(k)) { console.error("missing asset kind " + k); failed++; }
   }
+  // OTC is a venue, not a mutually exclusive underlying class. Every real
+  // broker `_otc` symbol must be reachable from the OTC filter even though it
+  // remains classed as fx/crypto/commodity/index/stock.
+  const expectedOtc = all.filter((a) => /_otc$/i.test(a.id) || a.kind === "otc");
+  const filteredOtc = A.byKind("otc");
+  if (expectedOtc.length < 100 || filteredOtc.length !== expectedOtc.length ||
+      expectedOtc.some((a) => !filteredOtc.some((b) => b.id === a.id))) {
+    console.error("OTC filter omitted broker instruments: " + filteredOtc.length + "/" + expectedOtc.length); failed++;
+  }
   // detection smoke (display names + OTC routing + tickers)
   const detCases = [
     ["EURUSD", "EURUSD"], ["EUR/USD", "EURUSD"], ["EURUSD_otc", "EURUSD_otc"],
@@ -164,6 +173,11 @@ if (!W) {
     workerInputsSafe = Object.getPrototypeOf(canonical.seriesByAsset) === null &&
       canonical.jobs.length === 1 && canonical.jobs[0].asset.name !== "FORGED" &&
       canonical.jobs[0].strategy.label !== "FORGED" && canonical.seriesByAsset.EURUSD.length === 1440;
+    const otcJob = W.buildJob(["EURUSD", "EURUSD_otc", "BTCUSD_otc", "AAPL_otc"], ["trend"], {
+      days: 1, kinds: ["otc"],
+    });
+    workerInputsSafe = workerInputsSafe && otcJob.jobs.length === 3 &&
+      otcJob.jobs.every((job) => /_otc$/i.test(job.asset.id));
     W.runChunk(canonical.seriesByAsset, canonical.jobs, {
       days: Symbol("days"), horizon: Symbol("horizon"), minConf: Symbol("confidence"), minBars: Symbol("bars"),
     });
@@ -529,6 +543,13 @@ if (cachedSeries.length !== 1440 || cachedSeries[cachedSeries.length - 1].close 
 }
 const dedupedMatrix = HIST.runMatrix({ days: 1, strategies: ["confluence", "confluence"], assets: ["EURUSD", "EURUSD"] });
 if (dedupedMatrix.count !== 1) { console.error("historic matrix did not deduplicate jobs"); failed++; }
+const otcMatrix = HIST.runMatrix({
+  days: 1, minBars: 40, strategies: ["confluence"], kinds: ["otc"],
+  assets: ["EURUSD", "EURUSD_otc", "BTCUSD_otc", "AAPL_otc"],
+});
+if (otcMatrix.count !== 3 || otcMatrix.results.some((row) => !/_otc$/i.test(row.asset))) {
+  console.error("historic OTC filter omitted cross-class broker markets"); failed++;
+}
 const safeSummary = HIST.summarize({ results: [{ asset: "A", strategy: "S", kind: "fx", wins: "2", losses: "1", draws: Infinity, pnl: "3" }, null] });
 if (!safeSummary || safeSummary.trades !== 3 || safeSummary.draws !== 0 || safeSummary.pnl !== 3) {
   console.error("historic summary sanitation failed"); failed++;
