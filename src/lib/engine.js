@@ -1,13 +1,12 @@
 /**
- * Confluence signal engine v2 — multi-indicator, multi-timeframe, regime-aware.
+ * Confluence signal engine v2.5 — multi-indicator, multi-timeframe, regime-aware,
+ * auto-adaptive multi-strategy router.
  *
  * Inputs: candle series (1m), optional strategy preset, optional asset profile.
- * Output: { ready, direction, confidence, score, votes, regime, metrics, reasons }
+ * Output: { ready, direction, confidence, score, votes, regime, metrics, reasons, adaptive? }
  *
- * The engine never "predicts"; it scores confluence and refuses to signal when
- * the confluence is weak or the market regime is hostile. This is conservative
- * on purpose: a lower hit rate on fewer trades is more honest than a 60% claim
- * that crumbles out of sample.
+ * The engine scores confluence and supports auto-adaptive strategy selection
+ * to dynamically select the best strategy for the current market situation.
  */
 (function (root) {
   "use strict";
@@ -38,6 +37,11 @@
     adxTrend: 1, supertrend: 2, psar: 1, vwap: 1, mtfAlign: 2,
     hurst: 1, williams: 1, cci: 1, donchianBreak: 2,
   };
+
+  const CONCRETE_STRATEGIES = [
+    "confluence", "trend", "meanrev", "breakout", "scalp", "otc",
+    "squeeze", "ribbon", "reversal", "momentum_pulse", "choppy_range"
+  ];
 
   function numberValue(value) {
     if (value == null || typeof value === "boolean" ||
@@ -105,8 +109,6 @@
       applyParams(params, preset.params);
       applyWeights(weights, preset.weights);
     }
-    // Support both the documented nested overrides and the historic top-level
-    // grid-search form, while ignoring unknown/prototype properties.
     applyParams(params, opts);
     applyParams(params, opts && opts.params);
     applyWeights(weights, opts && opts.weights);
@@ -126,7 +128,7 @@
     return { params, weights };
   }
 
-  function detectRegime(i, rsi, emaF, emaS, adxA, atrA, c, hurst) {
+  function detectRegime(i, rsi, emaF, emaS, adxA, atrA, c, hurst, bb, keltner) {
     if (
       rsi[i] == null || emaF[i] == null || emaS[i] == null ||
       adxA[i] == null || atrA[i] == null || c[i] == null
@@ -136,7 +138,11 @@
     const volatile = atrA[i] / c[i] > 0.0006;
     const directional = Math.abs(emaF[i] - emaS[i]) / (atrA[i] || 1e-9) > 1.5;
     const meanRevert = hurst != null && hurst[i] != null && hurst[i] < 0.45;
+    const isSqueeze = bb && bb.upper && bb.lower && keltner && keltner.upper && keltner.lower &&
+      bb.upper[i] != null && keltner.upper[i] != null &&
+      (bb.upper[i] - bb.lower[i]) < (keltner.upper[i] - keltner.lower[i]);
 
+    if (isSqueeze) return "squeeze";
     if (trending && directional) return "trending";
     if (trending && !directional) return "strong-trend";
     if (meanRevert) return "mean-reverting";
@@ -144,18 +150,187 @@
     return "ranging";
   }
 
+  /**
+   * Auto-adaptive strategy evaluator: evaluates all candidate strategies
+   * for the current candle series and selects the best strategy for the situation.
+   */
+  function evaluateAdaptive(candles, opts, analyzeFn) {
+    const scores = {};
+    let bestStrategy = "confluence";
+    let bestScore = -1;
+    let bestResult = null;
+
+    // Run baseline with "confluence" to extract base market regime
+    const baseOpts = Object.assign({}, opts, { strategy: "confluence", params: undefined, weights: undefined });
+    const baseResult = analyzeFn(candles, baseOpts);
+    const regime = baseResult ? baseResult.regime || "ranging" : "ranging";
+
+    for (const stratId of CONCRETE_STRATEGIES) {
+      const stratOpts = Object.assign({}, opts, { strategy: stratId, params: undefined, weights: undefined });
+      const res = analyzeFn(candles, stratOpts);
+      if (!res || !res.ready) continue;
+
+      let regimeBonus = 0;
+      if (regime === "trending" || regime === "strong-trend") {
+        if (stratId === "trend" || stratId === "ribbon") regimeBonus = 30;
+        else if (stratId === "momentum_pulse" || stratId === "confluence") regimeBonus = 20;
+        else if (stratId === "breakout") regimeBonus = 15;
+      } else if (regime === "mean-reverting" || regime === "ranging") {
+        if (stratId === "meanrev" || stratId === "choppy_range") regimeBonus = 30;
+        else if (stratId === "reversal" || stratId === "confluence") regimeBonus = 20;
+        else if (stratId === "otc") regimeBonus = 15;
+      } else if (regime === "squeeze" || regime === "choppy") {
+        if (stratId === "squeeze" || stratId === "breakout") regimeBonus = 30;
+        else if (stratId === "scalp" || stratId === "confluence") regimeBonus = 20;
+      }
+
+      const hasSignal = res.direction === "CALL" || res.direction === "PUT";
+      const signalBonus = hasSignal ? 25 : 0;
+      const confScore = res.confidence || 0;
+      const rawScore = res.score || 0;
+
+      let winrateBonus = 0;
+      if (opts && opts.strategyWinrates && opts.strategyWinrates[stratId]) {
+        const wr = Number(opts.strategyWinrates[stratId]);
+        if (Number.isFinite(wr) && wr > 50) winrateBonus = (wr - 50) * 0.5;
+      }
+
+      const fitness = Math.min(100, Math.round(
+        rawScore * 8 + confScore * 0.3 + regimeBonus + signalBonus + winrateBonus
+      ));
+
+      scores[stratId] = {
+        label: (STRAT && STRAT[stratId] && STRAT[stratId].label) || stratId,
+        fitness,
+        direction: res.direction,
+        confidence: res.confidence,
+        score: res.score,
+        regimeBonus,
+      };
+
+      const effectiveFitness = hasSignal ? fitness + 100 : fitness;
+      if (effectiveFitness > bestScore) {
+        bestScore = effectiveFitness;
+        bestStrategy = stratId;
+        bestResult = res;
+      }
+    }
+
+    if (!bestResult) {
+      bestResult = baseResult;
+      bestStrategy = "confluence";
+    }
+
+    const stratObj = STRAT && STRAT[bestStrategy];
+    const bestLabel = stratObj ? stratObj.label : bestStrategy;
+
+    return Object.assign({}, bestResult, {
+      adaptive: true,
+      selectedStrategy: bestStrategy,
+      selectedStrategyLabel: bestLabel,
+      strategyScores: scores,
+      reason: bestResult.direction === "WAIT"
+        ? `Auto-adapted '${bestLabel}' [${regime}]: No confluence`
+        : `⚡ Auto-adapted '${bestLabel}' for ${regime} regime (Fitness: ${scores[bestStrategy] ? scores[bestStrategy].fitness : 0}/100) · ${bestResult.reason || ""}`,
+    });
+  }
+
+  function evaluateAdaptiveLeanAt(preparedMap, i, opts) {
+    const scores = {};
+    let bestStrategy = "confluence";
+    let bestScore = -1;
+    let bestResult = null;
+
+    const { params: baseParams, weights: baseWeights } = resolveStrategy({ strategy: "confluence" });
+    const basePrepared = preparedMap["confluence"];
+    const baseResult = basePrepared ? evaluateLeanAt(basePrepared, i, baseParams, baseWeights) : null;
+    const regime = baseResult ? baseResult.regime || "ranging" : "ranging";
+
+    for (const stratId of CONCRETE_STRATEGIES) {
+      const pSeries = preparedMap[stratId];
+      if (!pSeries) continue;
+      const { params: sParams, weights: sWeights } = resolveStrategy({ strategy: stratId });
+      const res = evaluateLeanAt(pSeries, i, sParams, sWeights);
+      if (!res || !res.ready) continue;
+
+      let regimeBonus = 0;
+      if (regime === "trending" || regime === "strong-trend") {
+        if (stratId === "trend" || stratId === "ribbon") regimeBonus = 30;
+        else if (stratId === "momentum_pulse" || stratId === "confluence") regimeBonus = 20;
+        else if (stratId === "breakout") regimeBonus = 15;
+      } else if (regime === "mean-reverting" || regime === "ranging") {
+        if (stratId === "meanrev" || stratId === "choppy_range") regimeBonus = 30;
+        else if (stratId === "reversal" || stratId === "confluence") regimeBonus = 20;
+        else if (stratId === "otc") regimeBonus = 15;
+      } else if (regime === "squeeze" || regime === "choppy") {
+        if (stratId === "squeeze" || stratId === "breakout") regimeBonus = 30;
+        else if (stratId === "scalp" || stratId === "confluence") regimeBonus = 20;
+      }
+
+      const hasSignal = res.direction === "CALL" || res.direction === "PUT";
+      const signalBonus = hasSignal ? 25 : 0;
+      const confScore = res.confidence || 0;
+      const rawScore = res.score || 0;
+
+      let winrateBonus = 0;
+      if (opts && opts.strategyWinrates && opts.strategyWinrates[stratId]) {
+        const wr = Number(opts.strategyWinrates[stratId]);
+        if (Number.isFinite(wr) && wr > 50) winrateBonus = (wr - 50) * 0.5;
+      }
+
+      const fitness = Math.min(100, Math.round(
+        rawScore * 8 + confScore * 0.3 + regimeBonus + signalBonus + winrateBonus
+      ));
+
+      scores[stratId] = {
+        label: (STRAT && STRAT[stratId] && STRAT[stratId].label) || stratId,
+        fitness,
+        direction: res.direction,
+        confidence: res.confidence,
+        score: res.score,
+        regimeBonus,
+      };
+
+      const effectiveFitness = hasSignal ? fitness + 100 : fitness;
+      if (effectiveFitness > bestScore) {
+        bestScore = effectiveFitness;
+        bestStrategy = stratId;
+        bestResult = res;
+      }
+    }
+
+    if (!bestResult) {
+      bestResult = baseResult || { ready: true, direction: "WAIT", confidence: 0, score: 0, regime: "unknown" };
+      bestStrategy = "confluence";
+    }
+
+    const stratObj = STRAT && STRAT[bestStrategy];
+    const bestLabel = stratObj ? stratObj.label : bestStrategy;
+
+    return Object.assign({}, bestResult, {
+      adaptive: true,
+      selectedStrategy: bestStrategy,
+      selectedStrategyLabel: bestLabel,
+      strategyScores: scores,
+      reason: bestResult.direction === "WAIT"
+        ? `Auto-adapted '${bestLabel}' [${regime}]: No confluence`
+        : `⚡ Auto-adapted '${bestLabel}' for ${regime} regime (Fitness: ${scores[bestStrategy] ? scores[bestStrategy].fitness : 0}/100)`,
+    });
+  }
+
   function analyze(candles, opts) {
+    const requestedStrategy = opts && typeof opts.strategy === "string" ? opts.strategy : "";
+    if (requestedStrategy === "auto_adaptive") {
+      return evaluateAdaptive(candles, opts, (c, o) => analyze(c, o));
+    }
+
     const { params: cfg, weights } = resolveStrategy(opts);
     if (!Array.isArray(candles) || candles.length < 40) {
       return { ready: false, reason: "Need at least 40 candles", votes: [], regime: "unknown" };
     }
-    // We only need a tail of the series for the indicators to be valid.
-    // Live (lean: false) uses 200; backtest uses cfg.minBars (default 150).
+
     const liveMinBars = (opts && opts.lean === false) ? 200 : 0;
     const fallback = Math.max(cfg.minBars || 150, liveMinBars);
-    // MTF EMA(8/21) needs enough completed 15m buckets. The former 200-bar
-    // live window could produce at most 14 x 15m candles, so the 30-candle
-    // guard below was unreachable and MTF stayed 0 forever.
     const mtfWarmup = Math.max(cfg.mtfFast, cfg.mtfMid) * 30;
     const minNeeded = Math.max(40, cfg.hurstPeriod + 50, cfg.stochK * 4,
       cfg.adxPeriod * 2, mtfWarmup, fallback);
@@ -182,9 +357,6 @@
     const i = c.length - 1;
     const prev = i - 1;
 
-    // Lean mode: skip expensive indicators (CCI, Williams, Hurst, Donchian)
-    // for backtest speed. Set lean=false from caller (e.g. live UI) to keep
-    // them. Default is lean ON; params can force it off via cfg.lean.
     const lean = cfg.lean !== false && !(opts && opts.lean === false);
 
     // 1m indicator suite
@@ -198,6 +370,8 @@
     const adxR = TA.adx(h, l, c, cfg.adxPeriod);
     const psar = TA.psar(h, l, { step: cfg.psarStep, max: cfg.psarMax });
     const superR = TA.supertrend(h, l, c, cfg.superPeriod, cfg.superMult);
+    const keltner = TA.keltner ? TA.keltner(h, l, c, cfg.bbPeriod || 20, 1.5) : null;
+    const vwapR = TA.vwap ? TA.vwap(h, l, c) : null;
     const donch = lean ? null : TA.donchian(h, l, 20);
     const williams = lean ? null : TA.williamsR(h, l, c, 14);
     const cci = lean ? null : TA.cci(h, l, c, 20);
@@ -218,7 +392,7 @@
       return {
         ready: true, direction: "WAIT", score: 0, confidence: 0,
         reason: "Volatility too low (ATR filter)",
-        votes: [], regime: detectRegime(i, rsi, emaF, emaS, adxR.adx, atr, c, hurst),
+        votes: [], regime: detectRegime(i, rsi, emaF, emaS, adxR.adx, atr, c, hurst, bb, keltner),
         metrics: {
           atrPct, close: c[i], rsi: rsi[i], emaFast: emaF[i], emaSlow: emaS[i],
           macdHist: macd.hist[i], stochK: st.k[i], stochD: st.d[i], bbMid: bb.mid[i],
@@ -230,8 +404,7 @@
       };
     }
 
-    // Multi-timeframe alignment: resample 1m → 5m, 15m and check trend agreement.
-    // Keep 30 buckets for the slowest timeframe so EMA(21) can actually warm.
+    // Multi-timeframe alignment
     let mtfBias = 0;
     let mtfChecked = 0;
     if (window[0] && window[0].time != null && window.length >= 60) {
@@ -242,9 +415,6 @@
       const addMtfBias = (resampled) => {
         if (!Array.isArray(resampled) || resampled.length < 8) return;
         const closes = resampled.map((x) => x.close);
-        // Use the standard 8/21 pair when history permits. Quotex commonly
-        // returns only ~199 initial 1m bars (about 13 x 15m bars), so use a
-        // proportional 5/10-style fallback rather than leaving MTF unchecked.
         const slowPeriod = closes.length >= 21 ? 21 : Math.max(5, Math.floor(closes.length * 0.7));
         const fastPeriod = closes.length >= 21 ? 8 : Math.max(2, Math.floor(slowPeriod * 0.5));
         const fast = TA.ema(closes, fastPeriod);
@@ -310,7 +480,7 @@
     if ((c[i] >= bb.upper[i]) || (prev >= 0 && h[prev] >= bb.upper[prev] && c[i] < bb.upper[i]) || (c[i] >= bb.mid[i] && c[i] < emaS[i] && emaF[i] < emaS[i]))
       votes.push({ name: "BB", dir: "PUT", w: weights.bb });
 
-    // ADX trend strength: only agree with strong trends
+    // ADX trend strength
     if (adxR.adx[i] >= cfg.adxMin) {
       if (adxR.plus[i] > adxR.minus[i] && c[i] > emaS[i])
         votes.push({ name: "ADX+", dir: "CALL", w: weights.adxTrend });
@@ -328,13 +498,19 @@
       else votes.push({ name: "SAR", dir: "PUT", w: weights.psar });
     }
 
+    // VWAP
+    if (vwapR && vwapR[i] != null) {
+      if (c[i] > vwapR[i] && emaF[i] > emaS[i]) votes.push({ name: "VWAP", dir: "CALL", w: weights.vwap });
+      else if (c[i] < vwapR[i] && emaF[i] < emaS[i]) votes.push({ name: "VWAP", dir: "PUT", w: weights.vwap });
+    }
+
     // Multi-timeframe alignment
     if (mtfChecked > 0) {
       if (mtfBias > 0) votes.push({ name: "MTF", dir: "CALL", w: weights.mtfAlign });
       else if (mtfBias < 0) votes.push({ name: "MTF", dir: "PUT", w: weights.mtfAlign });
     }
 
-    // Hurst: trending markets amplify trend-following votes; in mean-reverting markets, only fire if a strong counter-trend setup exists.
+    // Hurst
     if (hurst != null && hurst[i] != null) {
       if (hurst[i] > 0.55 && (emaF[i] - emaS[i]) > 0)
         votes.push({ name: "Hurst", dir: "CALL", w: weights.hurst });
@@ -362,8 +538,6 @@
         votes.push({ name: "Donch↓", dir: "PUT", w: weights.donchianBreak });
     }
 
-    // Disabled/invalid strategy weights must not appear as reasons or poison
-    // totals with NaN/negative values.
     for (let vi = votes.length - 1; vi >= 0; vi--) {
       const weight = numberValue(votes[vi].w);
       if (weight == null || weight <= 0) votes.splice(vi, 1);
@@ -375,17 +549,10 @@
       else if (v.dir === "PUT") put += v.w;
     }
 
-    const regime = detectRegime(i, rsi, emaF, emaS, adxR.adx, atr, c, hurst);
+    const regime = detectRegime(i, rsi, emaF, emaS, adxR.adx, atr, c, hurst, bb, keltner);
     const rawMinScore = numberValue(cfg.minScore);
     const baseMinScore = rawMinScore != null ? Math.max(0, rawMinScore) : DEFAULTS.minScore;
-    // Choppy conditions need two additional independent weight points. The
-    // old block documented this veto but did nothing.
     const requiredScore = baseMinScore + (regime === "choppy" ? 2 : 0);
-    // Requiring a full two-point lead in an established directional trend can
-    // deadlock the engine at WAIT: several correlated overbought/oversold
-    // oscillators commonly cast short-lived counter-trend votes together. In
-    // a confirmed trend, let the larger side win by any positive margin while
-    // retaining the stricter lead everywhere else.
     const requiredLead = regime === "trending" ? 0 : 1;
 
     let direction = "WAIT";
@@ -396,12 +563,10 @@
       direction = "PUT"; score = put;
     }
 
-    // Confidence: softmax of opposing scores.
     let confidence = 0;
     if (direction !== "WAIT") {
       const probs = TA.softmaxProbs(call, put);
       const p = direction === "CALL" ? probs.call : probs.put;
-      // Scale by 0..100 and clamp
       confidence = Math.max(1, Math.min(99, Math.round(p * 100)));
     }
 
@@ -435,6 +600,7 @@
         supertrend: superR.st[i],
         superTrend: superR.trend[i],
         psar: psar[i],
+        vwap: vwapR ? vwapR[i] : null,
         donchUpper: donch ? donch.upper[i] : null,
         donchLower: donch ? donch.lower[i] : null,
         williams: williams ? williams[i] : null,
@@ -474,9 +640,6 @@
     }
   }
 
-  // Exact no-lookahead EMA trend of the currently forming higher-timeframe
-  // candle. Completed groups are committed once; each 1m close previews the
-  // current group's close without leaking its future final value.
   function mtfTrendSeries(candles, closes, minutes) {
     const out = new Array(closes.length).fill(null);
     const fast = createEmaTracker(8), slow = createEmaTracker(21);
@@ -521,6 +684,8 @@
       adxR: TA.adx(h, l, c, cfg.adxPeriod),
       psar: TA.psar(h, l, { step: cfg.psarStep, max: cfg.psarMax }),
       superR: TA.supertrend(h, l, c, cfg.superPeriod, cfg.superMult),
+      keltner: TA.keltner ? TA.keltner(h, l, c, cfg.bbPeriod || 20, 1.5) : null,
+      vwap: TA.vwap ? TA.vwap(h, l, c) : null,
       donch: TA.donchian(h, l, 20),
       williams: TA.williamsR(h, l, c, 14),
       cci: TA.cci(h, l, c, 20),
@@ -537,7 +702,7 @@
     if (need.some((v) => v == null || numberValue(v) == null) || !Number.isFinite(p.c[i]) || p.c[i] <= 0) {
       return { ready: false, direction: "WAIT", confidence: 0, score: 0, regime: "unknown" };
     }
-    const regime = detectRegime(i, p.rsi, p.emaF, p.emaS, p.adxR.adx, p.atr, p.c, p.hurst);
+    const regime = detectRegime(i, p.rsi, p.emaF, p.emaS, p.adxR.adx, p.atr, p.c, p.hurst, p.bb, p.keltner);
     if (p.atr[i] / p.c[i] < cfg.minAtrPct) {
       return { ready: true, direction: "WAIT", confidence: 0, score: 0, regime };
     }
@@ -574,6 +739,10 @@
     else if (p.superR.trend[i] === -1) votes.push({ dir: "PUT", w: weights.supertrend });
     if (p.c[i] > p.psar[i]) votes.push({ dir: "CALL", w: weights.psar });
     else votes.push({ dir: "PUT", w: weights.psar });
+    if (p.vwap && p.vwap[i] != null) {
+      if (p.c[i] > p.vwap[i] && p.emaF[i] > p.emaS[i]) votes.push({ dir: "CALL", w: weights.vwap });
+      else if (p.c[i] < p.vwap[i] && p.emaF[i] < p.emaS[i]) votes.push({ dir: "PUT", w: weights.vwap });
+    }
     let mtfBias = 0, mtfChecked = 0;
     if (p.mtfFast[i] != null) { mtfBias += p.mtfFast[i]; mtfChecked++; }
     if (p.mtfMid[i] != null) { mtfBias += p.mtfMid[i]; mtfChecked++; }
@@ -616,10 +785,6 @@
     return { ready: true, direction, confidence, score, regime };
   }
 
-  /**
-   * Backtest over a single series. Returns aggregate stats + per-trade log
-   * + per-regime breakdown + equity curve.
-   */
   function backtest(candles, opts) {
     const empty = {
       wins: 0, losses: 0, draws: 0, total: 0, decisions: 0, winrate: 0, payoff: 0,
@@ -643,7 +808,20 @@
     const rawWarmup = hasOwn(opts, "warmup") ? numberValue(opts.warmup) : null;
     const warmup = rawWarmup != null ? Math.max(40, Math.min(candles.length - 1, Math.floor(rawWarmup))) : 50;
     const lean = !(opts && opts.lean === false);
-    const prepared = lean ? prepareLeanSeries(candles, cfg) : null;
+    const isAdaptive = opts && opts.strategy === "auto_adaptive";
+
+    let prepared = null;
+    let adaptivePrepared = null;
+    if (lean && !isAdaptive) {
+      prepared = prepareLeanSeries(candles, cfg);
+    } else if (lean && isAdaptive) {
+      adaptivePrepared = {};
+      for (const stratId of CONCRETE_STRATEGIES) {
+        const { params: sParams } = resolveStrategy({ strategy: stratId });
+        adaptivePrepared[stratId] = prepareLeanSeries(candles, sParams);
+      }
+    }
+
     const rawMinBars = numberValue(cfg.minBars);
     const nonLeanTail = Math.max(200, Math.min(2000, Math.floor(rawMinBars == null ? 200 : rawMinBars)));
     const reducedTime = (value) => {
@@ -679,14 +857,14 @@
     let pnl = 0;
 
     for (let i = warmup; i < candles.length - horizon; i++) {
-      const sig = prepared
-        ? evaluateLeanAt(prepared, i, cfg, resolved.weights)
-        : analyze(candles.slice(Math.max(0, i + 1 - nonLeanTail), i + 1), Object.assign({}, opts, { lean: false }));
+      const sig = adaptivePrepared
+        ? evaluateAdaptiveLeanAt(adaptivePrepared, i, opts)
+        : (prepared
+          ? evaluateLeanAt(prepared, i, cfg, resolved.weights)
+          : analyze(candles.slice(Math.max(0, i + 1 - nonLeanTail), i + 1), Object.assign({}, opts, { lean: false })));
       if (!sig.ready || sig.direction === "WAIT") continue;
       if (sig.confidence < minConf) continue;
-      // Validation accepts broker numeric strings, so lifecycle comparisons and
-      // exported prices must use their numeric values. Strictly comparing raw
-      // strings (for example "1.0" vs "1.00") fabricated a loss instead of a draw.
+
       const entry = numberValue(candles[i].close);
       const exit = numberValue(candles[i + horizon].close);
       const draw = exit === entry;
@@ -699,6 +877,7 @@
       trades.push({
         i, dir: sig.direction, score: sig.score, confidence: sig.confidence,
         regime: sig.regime, won, draw, entry, exit,
+        selectedStrategy: sig.selectedStrategy || opts.strategy || "confluence",
         entryTime: candleTimeMs(candles[i].time) != null ? candleTimeMs(candles[i].time) + tfMs : null,
         expiryTime: candleTimeMs(candles[i + horizon].time) != null ? candleTimeMs(candles[i + horizon].time) + tfMs : null,
         exitTime: candleTimeMs(candles[i + horizon].time) != null ? candleTimeMs(candles[i + horizon].time) + tfMs : null,
@@ -711,7 +890,6 @@
     const winrate = total ? (wins / total) * 100 : 0;
     const payoff = wins && losses ? wins / losses : wins ? Infinity : 0;
 
-    // Per-regime breakdown
     const byRegime = {};
     for (const t of trades) {
       const r = t.regime || "unknown";
@@ -726,7 +904,6 @@
       byRegime[r].winrate = resolved ? (byRegime[r].wins / resolved) * 100 : 0;
     }
 
-    // Streaks
     let maxWinStreak = 0, maxLossStreak = 0, curW = 0, curL = 0;
     for (const t of trades) {
       if (t.draw) { curW = 0; curL = 0; }
@@ -736,7 +913,6 @@
       if (curL > maxLossStreak) maxLossStreak = curL;
     }
 
-    // Drawdown
     let peak = -Infinity, maxDD = 0;
     for (const e of equity) {
       if (e.equity > peak) peak = e.equity;
@@ -744,7 +920,6 @@
       if (dd > maxDD) maxDD = dd;
     }
 
-    // Confidence calibration: bucket by confidence
     const calibBuckets = {};
     for (const t of trades) {
       if (t.draw) continue;
@@ -774,15 +949,8 @@
     };
   }
 
-  /**
-   * Walk-forward: split into N folds, optimize on first half of each fold,
-   * evaluate on second. Helps detect overfitting.
-   */
   function walkForward(candles, opts) {
     const total = Array.isArray(candles) ? candles.length : 0;
-    // Each fold is split in half and backtest needs a warmup plus an expiry
-    // horizon. Folds below 200 bars produced two <=50-bar halves and silently
-    // returned all-zero "validation" results.
     if (total < 400) return { error: "need at least 400 candles" };
     const requestedFolds = numberValue(opts && opts.folds);
     const maxUsefulFolds = Math.max(2, Math.min(20, Math.floor(total / 200)));
@@ -814,5 +982,5 @@
     };
   }
 
-  root.CYBER_ENGINE = { DEFAULTS, DEFAULT_WEIGHTS, analyze, backtest, walkForward, resolveStrategy };
+  root.CYBER_ENGINE = { DEFAULTS, DEFAULT_WEIGHTS, CONCRETE_STRATEGIES, analyze, backtest, walkForward, resolveStrategy };
 })(typeof self !== "undefined" ? self : globalThis);

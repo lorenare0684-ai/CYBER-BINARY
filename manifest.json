@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "CYBER BINARY — Quotex Trading Automation",
-  "version": "2.4.0",
-  "description": "v2.4.0: live Quotex signals and explicitly armed, broker-confirmed automated execution with anti-spam safety, authoritative chart detection, proper candles, and complete trade lifecycle details.",
+  "version": "2.5.0",
+  "description": "v2.5.0: live Quotex signals with Auto-Adaptive Strategy engine, Auto-Adapting High-Accuracy Assets system, multi-strategy suite, and broker-confirmed automated execution.",
   "permissions": [
     "storage",
     "windows",
@@ -61,6 +61,7 @@
         "src/lib/strategy.js",
         "src/lib/feed.js",
         "src/lib/engine.js",
+        "src/lib/asset-selector.js",
         "src/lib/storage.js",
         "src/lib/auto.js",
         "src/lib/backtest.js",

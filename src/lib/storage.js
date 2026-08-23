@@ -12,7 +12,7 @@
   const KEY = "cyberBinaryV2";
   const DEFAULTS = {
     settings: {
-      strategy: "confluence",
+      strategy: "auto_adaptive",
       autoMode: "off",            // "off" | "alerts" | "click"
       armed: false,
       stake: 1,                   // $ per trade
@@ -25,6 +25,7 @@
       cooldownBars: 2,            // min bars between trades
       minIntervalMs: 5000,        // hard anti-double-submit interval
       calibration: true,          // adjust confidence by observed hit rate
+      autoHighAccuracy: true,     // filter trades by high-accuracy assets EV > 0
       perAssetStrategy: {},       // { ASSET: strategyId }
       notifySound: true,
       notifyDesktop: false,
@@ -115,6 +116,7 @@
     s.cooldownBars = finiteIn(s.cooldownBars, DEFAULTS.settings.cooldownBars, 0, 1440);
     s.minIntervalMs = finiteIn(s.minIntervalMs, DEFAULTS.settings.minIntervalMs, 1000, 3600000);
     s.calibration = !!s.calibration;
+    s.autoHighAccuracy = s.autoHighAccuracy !== false;
     s.notifySound = !!s.notifySound;
     s.notifyDesktop = !!s.notifyDesktop;
     if (!s.perAssetStrategy || typeof s.perAssetStrategy !== "object" || Array.isArray(s.perAssetStrategy)) s.perAssetStrategy = {};

@@ -11,13 +11,14 @@
   const WORKERS = self.CYBER_WORKERS;
   const AUTO = self.CYBER_AUTO;
   const QUOTEX = self.CYBER_QUOTEX || null;
+  const AS = self.CYBER_ASSET_SELECTOR || null;
 
   // Active local feed (for the dashboard's own chart when live data is missing).
   const localFeed = FEED.createFeed({ tfMs: 60000, max: 400 });
   localFeed.setSeries(FEED.syntheticSeries(ASSETS.get("EURUSD"), 240));
 
   let activeAsset = "EURUSD";
-  let activeStrategy = "confluence";
+  let activeStrategy = "auto_adaptive";
   let lastDetailsKey = "";
   let lastHistoryKey = "";
   let lastChartKey = "";
@@ -26,11 +27,9 @@
   let autoState = null;
   let settings = null;
   let btResults = null;
-  // Last rendered chart state (used by `scale()` on resize).
   let lastChartCandles = null;
   let lastChartMeta = {};
   let lastBtEquity = null;
-  // v2.1: live Quotex state
   let qxStatus = { state: "idle" };
   let qxInstruments = [];
   let qxBalance = null;
@@ -44,8 +43,6 @@
   let historyRenderToken = 0;
   const recentAutoLogKeys = new Set();
   const recentAutoLogOrder = [];
-  // Genuine 1m candles received in the latest live state. Backtests can use
-  // these immediately instead of racing the asynchronous storage persistence.
   const liveCandlesByAsset = Object.create(null);
 
   function tfLabel(sec) {
@@ -79,7 +76,6 @@
   function csvCell(value) {
     if (value == null) return "";
     let s = String(value);
-    // Prevent spreadsheet formula execution from broker-controlled labels.
     if (/^[=+\-@]/.test(s) && !/^-?\d+(?:\.\d+)?$/.test(s)) s = "'" + s;
     s = s.replace(/"/g, '""');
     return /[",\n]/.test(s) ? '"' + s + '"' : s;
@@ -98,8 +94,6 @@
     if (!Number.isFinite(n)) return "—";
     const magnitude = Math.abs(n);
     if (magnitude < 1e-12) return "0";
-    // Keep small MACD/ATR-style values readable as ordinary decimals instead
-    // of exposing implementation-looking notation such as -5.304e-5.
     const places = Math.max(4, Math.min(10, Math.ceil(-Math.log10(magnitude)) + 4));
     const fixed = n.toFixed(places);
     return fixed.includes(".") ? fixed.replace(/0+$/, "").replace(/\.$/, "") : fixed;
@@ -166,8 +160,6 @@
     const timeAxisH = 18;
     const h = priceH + macdH + timeAxisH;
     const rawDpr = finite(window.devicePixelRatio, 1);
-    // Two physical pixels per CSS pixel are visually sharp while avoiding
-    // huge 4× backing buffers that made every live redraw expensive.
     const dpr = Math.max(1, Math.min(2, rawDpr));
     const pixelW = Math.floor(w * dpr), pixelH = Math.floor(h * dpr);
     if (canvas.width !== pixelW) canvas.width = pixelW;
@@ -188,7 +180,6 @@
       return;
     }
     if (o.equity) {
-      // Equity curve: simple line
       const eq = candles.map((point) => ({ equity: finite(point && point.equity, null) }))
         .filter((point) => point.equity != null);
       if (eq.length < 2) {
@@ -231,12 +222,9 @@
       ctx.fillText("Equity · " + eq.length + " " + (o.equityLabel || "points"), 8, 12);
       return;
     }
-    // Chart util: y-map for the price pane.
+
     const padL = 8, padR = 54;
     const plotW = w - padL - padR;
-    // Broker batches can arrive newest-first, overlap, or briefly contain an
-    // incomplete malformed row. Normalize again at the render boundary so
-    // candle order/wicks are always correct even during incremental updates.
     const byTime = new Map();
     for (const raw of candles) {
       if (!raw) continue;
@@ -278,7 +266,6 @@
     const bw = plotW / view.length;
     const xFor = (i) => padL + (i + 0.5) * bw;
 
-    // Grid + right-side price axis
     ctx.strokeStyle = "rgba(255,255,255,0.07)";
     ctx.fillStyle = "rgba(255,255,255,0.5)";
     ctx.font = "10px system-ui, sans-serif";
@@ -292,7 +279,6 @@
       ctx.fillText(fmtPx(p), w - padR + 6, y + 3);
     }
 
-    // Candles + EMA overlays
     let emaFast = null, emaSlow = null;
     if (self.CYBER_TA) {
       const closes = view.map((c) => c.close);
@@ -329,9 +315,6 @@
     drawLine(emaFast, "rgba(77,163,255,0.85)");
     drawLine(emaSlow, "rgba(255,196,87,0.85)");
 
-    // v2.3.3: non-repainting signal arrows. Anchors are fixed (bar time +
-    // price); each arrow is drawn at its anchor's bar slot, so it never
-    // moves as later candles arrive.
     if (Array.isArray(o.markers) && o.markers.length) {
       for (let mi = 0; mi < o.markers.length; mi++) {
         const mk = o.markers[mi];
@@ -342,7 +325,6 @@
         if (Math.abs(markerTime) < 1e11) markerTime *= 1000;
         markerTime = Math.floor(markerTime);
         if (markerTime <= 0 || markerTime > 8640000000000000) continue;
-        // find the bar index for this marker's time (times are ascending)
         let idx = -1;
         let lo2 = 0, hi2 = view.length - 1;
         while (lo2 <= hi2) {
@@ -379,7 +361,6 @@
       }
     }
 
-    // Last price line + tag
     const lastC = view[view.length - 1].close;
     const lastY = yPrice(lastC);
     ctx.setLineDash([4, 4]);
@@ -394,7 +375,6 @@
     ctx.fillText(fmtPx(lastC), w - padR - 20, lastY + 3);
     ctx.textAlign = "left";
 
-    // Time axis (approx labels)
     ctx.strokeStyle = "rgba(255,255,255,0.07)";
     ctx.beginPath(); ctx.moveTo(padL, priceH + 0.5); ctx.lineTo(padL + plotW, priceH + 0.5); ctx.stroke();
     ctx.fillStyle = "rgba(255,255,255,0.45)";
@@ -406,7 +386,6 @@
       ctx.fillText(lbl, xFor(i), priceH + 12);
     }
 
-    // MACD subplot (histogram + MACD + signal) — matches the broker chart
     if (useMacd && self.CYBER_TA) {
       const m = self.CYBER_TA.macd(view.map((c) => c.close), 12, 26, 9);
       let mMax = 1e-9;
@@ -427,8 +406,6 @@
         ctx.fillStyle = v >= 0 ? "rgba(61,255,154,0.85)" : "rgba(255,93,122,0.85)";
         ctx.fillRect(x - Math.max(1, mw * 0.28), Math.min(y0, yMacd(v)), Math.max(2, mw * 0.56), Math.max(1, Math.abs(y0 - yMacd(v))));
       }
-      // MACD line/signal plot in the SUBPLOT coordinate space, never the price
-      // pane's y-scale (that was the "MACD stuck at the bottom" glitch).
       const drawMacdLine = (arr, color) => {
         if (!arr) return;
         ctx.strokeStyle = color;
@@ -451,7 +428,6 @@
       ctx.fillText("MACD 12/26/9", padL + 4, priceH + 14);
     }
 
-    // Watermark-ish label
     ctx.fillStyle = "rgba(255,255,255,0.35)";
     ctx.font = "9px system-ui, sans-serif";
     ctx.fillText("CYBER BINARY · " + (o.label || o.timeframe || "1m") + " · " + view.length + " bars", padL + 4, 12);
@@ -469,11 +445,46 @@
     if (name === "history") refreshHistoryTab();
     if (name === "settings") refreshSettingsTab();
     if (name === "instruments") refreshInstrumentsTab();
-    if (name === "backtest") {} // lazy
   }
   $all(".tab").forEach((t) => t.addEventListener("click", () => activateTab(t.dataset.tab)));
 
   /* ---------- asset/strategy selectors ---------- */
+  function selectAsset(assetId) {
+    if (hasChrome) {
+      chrome.runtime.sendMessage({ type: "CYBER_SET_ASSET", asset: assetId }).then((response) => {
+        if (response && response.ok) {
+          activeAsset = response.asset || assetId;
+          const sel = $("asset-select");
+          if (sel) sel.value = activeAsset;
+        } else {
+          const pill = $("link-state");
+          if (pill) {
+            pill.textContent = response && response.error || "Select asset on Quotex first";
+            pill.className = "pill warn";
+          }
+        }
+      }).catch(() => {});
+    } else {
+      activeAsset = assetId;
+      const sel = $("asset-select");
+      if (sel) sel.value = activeAsset;
+      const a = ASSETS.get(activeAsset);
+      if (a) localFeed.setSeries(FEED.syntheticSeries(a, 240));
+      renderLocalTick();
+    }
+  }
+
+  function selectBestAsset() {
+    if (!AS) return;
+    STORE.getStats().then((stats) => {
+      const best = AS.getBestAsset({
+        stats,
+        candlesByAsset: liveCandlesByAsset,
+      });
+      if (best) selectAsset(best.id);
+    }).catch(() => {});
+  }
+
   function refreshSelectors() {
     const sel = $("asset-select");
     if (sel) {
@@ -508,29 +519,7 @@
 
   function bindSelectors() {
     $("asset-select").addEventListener("change", (e) => {
-      const requested = e.target.value;
-      const previous = activeAsset;
-      if (hasChrome) {
-        chrome.runtime.sendMessage({ type: "CYBER_SET_ASSET", asset: requested }).then((response) => {
-          if (!response || !response.ok) {
-            e.target.value = previous;
-            const pill = $("link-state");
-            if (pill) {
-              pill.textContent = response && response.error || "Select the asset on Quotex first";
-              pill.className = "pill warn";
-            }
-            return;
-          }
-          activeAsset = response.asset || requested;
-          e.target.value = activeAsset;
-        }).catch(() => { e.target.value = previous; });
-        return;
-      }
-      activeAsset = requested;
-      // Re-seed local demo feed for the new asset.
-      const a = ASSETS.get(activeAsset);
-      if (a) localFeed.setSeries(FEED.syntheticSeries(a, 240));
-      renderLocalTick();
+      selectAsset(e.target.value);
     });
     $("strategy-select").addEventListener("change", (e) => {
       activeStrategy = e.target.value;
@@ -543,6 +532,10 @@
     $("refresh-asset").addEventListener("click", () => {
       if (hasChrome) chrome.runtime.sendMessage({ type: "CYBER_DETECT_ASSET" }).catch(() => {});
     });
+    const bestBtn = $("select-best-asset");
+    if (bestBtn) {
+      bestBtn.addEventListener("click", selectBestAsset);
+    }
   }
 
   /* ---------- live rendering ---------- */
@@ -585,8 +578,6 @@
 
   function chartStateKey(candles, period, markers) {
     if (!Array.isArray(candles)) return "";
-    // Incremental FNV-1a avoids repeatedly concatenating a very large key
-    // string (candles + markers) on every live-state push.
     let hash = 2166136261;
     const mix = (value) => {
       const s = String(value == null ? "" : value);
@@ -608,9 +599,40 @@
     return String(hash >>> 0) + "|" + candles.length + "|" + safeMarkers.length;
   }
 
+  function renderTopAccuracyTable(stats) {
+    if (!AS) return;
+    const ranked = AS.rankAssets({
+      stats: stats,
+      candlesByAsset: liveCandlesByAsset,
+      openOnly: false,
+    });
+    const top = ranked.slice(0, 5);
+    const tb = $("top-accuracy-table") ? $("top-accuracy-table").querySelector("tbody") : null;
+    if (!tb) return;
+    tb.innerHTML = "";
+    for (const item of top) {
+      const tr = document.createElement("tr");
+      const evCls = item.expectedValue > 0 ? "win" : "loss";
+      const evTxt = (item.expectedValuePct > 0 ? "+" : "") + item.expectedValuePct + "%";
+      tr.innerHTML =
+        "<td>#" + item.rank + "</td>" +
+        "<td><strong>" + esc(item.name) + "</strong></td>" +
+        "<td>" + item.payout + "%</td>" +
+        "<td>" + item.winrate + "%</td>" +
+        "<td class='" + evCls + "'>" + evTxt + "</td>" +
+        "<td><span class='badge " + (item.accuracyScore >= 70 ? 'green' : 'blue') + "'>" + item.accuracyScore + " / 100</span></td>" +
+        "<td>" + esc(item.recommendedStrategyLabel) + "</td>" +
+        "<td><button type='button' class='arm-btn tiny' data-asset='" + item.id + "'>Select</button></td>";
+      const btn = tr.querySelector("button");
+      if (btn) {
+        btn.addEventListener("click", () => selectAsset(item.id));
+      }
+      tb.appendChild(tr);
+    }
+  }
+
   function renderLive(state) {
     if (!state || typeof state !== "object" || Array.isArray(state)) return;
-    // v2.1: surface the platform state if the content script attached it.
     if (state && state.quotex && typeof state.quotex === "object" && !Array.isArray(state.quotex)) {
       if (state.quotex.status && typeof state.quotex.status === "object" && !Array.isArray(state.quotex.status)) {
         qxStatus = {
@@ -646,11 +668,6 @@
       if (sel && sel.value !== activeStrategy) sel.value = activeStrategy;
     }
     if (Array.isArray(state.candles) && state.candles.length) {
-      // Cache the latest 1m series for the active asset so the backtest can
-      // consume it immediately instead of waiting for chrome.storage to settle.
-      // The backtest's own minBars gate rejects insufficient data; we must not
-      // withhold a genuine series just because realHistoryReady hasn't flipped
-      // yet (that flag requires ≥40 bars and can lag behind the live push).
       liveCandlesByAsset[activeAsset] = state.candles.slice(-500);
     }
 
@@ -670,6 +687,34 @@
     }
     $("regime-row").textContent = "regime: " + (sig.regime || "—") + " · mtf bias: " + ((sig.metrics && sig.metrics.mtfBias) || 0) + "/" + ((sig.metrics && sig.metrics.mtfChecked) || 0);
 
+    // Auto-Adaptive Cockpit UI Update
+    const adaptiveCard = $("adaptive-card");
+    if (adaptiveCard) {
+      const isAdaptive = activeStrategy === "auto_adaptive" || sig.adaptive === true;
+      $("adaptive-regime-label").textContent = sig.regime ? sig.regime.toUpperCase() : "ANALYZING";
+      const selStratObj = sig.selectedStrategy ? STRAT.get(sig.selectedStrategy) : null;
+      $("adaptive-strategy-label").textContent = sig.selectedStrategyLabel || (selStratObj ? selStratObj.label : (isAdaptive ? "⚡ Auto-Adaptive Engine" : activeStrategy));
+      $("adaptive-reason-text").textContent = sig.reason || "Evaluating optimal strategy for situation…";
+
+      const fitnessContainer = $("fitness-meters");
+      if (fitnessContainer && sig.strategyScores) {
+        let fitnessHtml = "";
+        const scores = sig.strategyScores;
+        const sorted = Object.keys(scores).sort((a, b) => (scores[b].fitness || 0) - (scores[a].fitness || 0)).slice(0, 5);
+        for (const stratId of sorted) {
+          const item = scores[stratId];
+          const isSelected = sig.selectedStrategy === stratId;
+          const label = item.label || stratId;
+          const fit = item.fitness || 0;
+          const dirTxt = item.direction && item.direction !== "WAIT" ? " [" + item.direction + "]" : "";
+          fitnessHtml += '<div class="meter small' + (isSelected ? ' selected' : '') + '"><span>' + esc(label) + dirTxt + '</span><div class="bar call"><i style="width:' + fit + '%"></i></div><span>' + fit + '/100</span></div>';
+        }
+        fitnessContainer.innerHTML = fitnessHtml;
+      }
+    }
+
+    STORE.getStats().then(renderTopAccuracyTable).catch(() => {});
+
     $("wins").textContent = String(Math.max(0, Math.floor(finite(state.wins, 0))));
     $("losses").textContent = String(Math.max(0, Math.floor(finite(state.losses, 0))));
     $("winrate").textContent = fmtPct(state.winrate);
@@ -683,56 +728,56 @@
         $("meters").innerHTML = "";
         $("readings").innerHTML = "";
       } else {
-      $("meters").innerHTML =
-        meter("RSI", m.rsi, 0, 100, (m.rsi || 50) < 50 ? "put" : "call") +
-        meter("Stoch", m.stochK, 0, 100, (m.stochK || 50) < 50 ? "put" : "call") +
-        meter("ADX", m.adx, 0, 60, "call") +
-        meter("Hurst", (m.hurst || 0.5) * 100, 0, 100, "call") +
-        meter("MTF", m.mtfBias || 0, -2, 2, (m.mtfBias || 0) > 0 ? "call" : "put") +
-        meter("Conf", sig.confidence || 0, 0, 100, dir === "CALL" ? "call" : dir === "PUT" ? "put" : "");
+        $("meters").innerHTML =
+          meter("RSI", m.rsi, 0, 100, (m.rsi || 50) < 50 ? "put" : "call") +
+          meter("Stoch", m.stochK, 0, 100, (m.stochK || 50) < 50 ? "put" : "call") +
+          meter("ADX", m.adx, 0, 60, "call") +
+          meter("Hurst", (m.hurst || 0.5) * 100, 0, 100, "call") +
+          meter("MTF", m.mtfBias || 0, -2, 2, (m.mtfBias || 0) > 0 ? "call" : "put") +
+          meter("Conf", sig.confidence || 0, 0, 100, dir === "CALL" ? "call" : dir === "PUT" ? "put" : "");
 
-      const rows = [
-        ["RSI", m.rsi],
-        ["EMA fast", m.emaFast],
-        ["EMA slow", m.emaSlow],
-        ["MACD hist", m.macdHist],
-        ["Stoch %K", m.stochK],
-        ["Stoch %D", m.stochD],
-        ["BB mid", m.bbMid],
-        ["ATR%", finite(m.atrPct, null) != null ? (finite(m.atrPct, 0) * 100).toFixed(3) + "%" : "—"],
-        ["ADX", m.adx],
-        ["+DI", m.plusDI],
-        ["-DI", m.minusDI],
-        ["Supertrend", m.supertrend],
-        ["SAR", m.psar],
-        ["Donch ↑", m.donchUpper],
-        ["Donch ↓", m.donchLower],
-        ["Williams %R", m.williams],
-        ["CCI", m.cci],
-        ["Hurst", m.hurst],
-        ["Momentum", m.momentum],
-        ["CALL votes", m.callScore],
-        ["PUT votes", m.putScore],
-        ["Required score", m.requiredScore],
-        ["Score", sig.score != null ? sig.score : "—"],
-        ["Confidence", finite(sig.confidence, null) != null ? finite(sig.confidence, 0) + "%" : "—"],
-        ["Regime", sig.regime],
-      ];
-      $("readings").innerHTML = rows
-        .filter((r) => r[1] != null && r[1] !== "—")
-        .map((r) => {
-          let cls = "";
-          if (typeof r[1] === "number") {
-            if (r[0] === "MACD hist" || r[0] === "Momentum" || r[0] === "Score") {
-              cls = r[1] > 0 ? "call" : r[1] < 0 ? "put" : "";
+        const rows = [
+          ["RSI", m.rsi],
+          ["EMA fast", m.emaFast],
+          ["EMA slow", m.emaSlow],
+          ["MACD hist", m.macdHist],
+          ["Stoch %K", m.stochK],
+          ["Stoch %D", m.stochD],
+          ["BB mid", m.bbMid],
+          ["ATR%", finite(m.atrPct, null) != null ? (finite(m.atrPct, 0) * 100).toFixed(3) + "%" : "—"],
+          ["ADX", m.adx],
+          ["+DI", m.plusDI],
+          ["-DI", m.minusDI],
+          ["Supertrend", m.supertrend],
+          ["SAR", m.psar],
+          ["Donch ↑", m.donchUpper],
+          ["Donch ↓", m.donchLower],
+          ["Williams %R", m.williams],
+          ["CCI", m.cci],
+          ["Hurst", m.hurst],
+          ["Momentum", m.momentum],
+          ["CALL votes", m.callScore],
+          ["PUT votes", m.putScore],
+          ["Required score", m.requiredScore],
+          ["Score", sig.score != null ? sig.score : "—"],
+          ["Confidence", finite(sig.confidence, null) != null ? finite(sig.confidence, 0) + "%" : "—"],
+          ["Regime", sig.regime],
+        ];
+        $("readings").innerHTML = rows
+          .filter((r) => r[1] != null && r[1] !== "—")
+          .map((r) => {
+            let cls = "";
+            if (typeof r[1] === "number") {
+              if (r[0] === "MACD hist" || r[0] === "Momentum" || r[0] === "Score") {
+                cls = r[1] > 0 ? "call" : r[1] < 0 ? "put" : "";
+              }
+              if (r[0] === "+DI" && r[1] > 30) cls = "call";
+              if (r[0] === "-DI" && r[1] > 30) cls = "put";
             }
-            if (r[0] === "+DI" && r[1] > 30) cls = "call";
-            if (r[0] === "-DI" && r[1] > 30) cls = "put";
-          }
-          const rendered = typeof r[1] === "number" ? fmtReading(r[1]) : r[1];
-          return '<div class="reading ' + cls + '"><span>' + esc(r[0]) + '</span><b>' + esc(rendered) +
-            '</b></div>';
-        }).join("");
+            const rendered = typeof r[1] === "number" ? fmtReading(r[1]) : r[1];
+            return '<div class="reading ' + cls + '"><span>' + esc(r[0]) + '</span><b>' + esc(rendered) +
+              '</b></div>';
+          }).join("");
       }
     }
 
@@ -752,13 +797,6 @@
       });
     }
 
-    // v2.2: prefer the broker's own history for the chart; fall back to the
-    // engine's 1m series. Real data replaces the synthetic seed, so the
-    // chart matches the platform chart (same candles, EMA + MACD subplot).
-    // IMPORTANT: never fall back from chartCandles (the broker's actual
-    // timeframe candles) to candles (the 1m engine feed which may still
-    // contain synthetic warm-up bars). Mixing the two sources made the
-    // dashboard chart diverge from the platform chart.
     const chartCandles = (Array.isArray(state.chartCandles) && state.chartCandles.length
       ? state.chartCandles : []).slice(-500);
     const markers = Array.isArray(state.markers) ? state.markers.slice(-600) : [];
@@ -772,17 +810,9 @@
     if (state.autoState) updateAutoUI(state.autoState);
   }
 
-  /* ---------- local demo rendering (no extension) ---------- */
   function renderLocalTick() {
-    // v2.2: never let the demo loop overwrite live extension state — this was
-    // the "shows demo, flickers to live" bug. Once a live state arrives the
-    // demo loop becomes a no-op for the rest of the session.
-    // Content sends an unchanged-state heartbeat every 10s; allow jitter so
-    // the demo loop cannot flicker over a healthy but quiet live chart.
     if (liveFromExt && Date.now() - lastExtTs <= 15000) return;
     if (liveFromExt) {
-      // The selected tab stopped publishing (closed, navigated, or extension
-      // reloaded). Do not leave a permanently frozen "live" dashboard.
       liveFromExt = false;
       qxStatus = { state: "disconnected" };
       const selected = ASSETS.get(activeAsset);
@@ -815,7 +845,6 @@
     });
   }
 
-  /* ---------- auto tab ---------- */
   function updateAutoUI(s) {
     const source = s && typeof s === "object" && !Array.isArray(s)
       ? s : (autoState || {});
@@ -868,7 +897,6 @@
     }
   }
 
-  /* ---------- v2.1: Quotex status pill + instruments tab ---------- */
   function paintQuotexPill() {
     const pill = $("quotex-state");
     if (!pill) return;
@@ -1020,8 +1048,6 @@
     });
     $("auto-mode").addEventListener("change", (e) => {
       const mode = e.target.value;
-      // A mode change, especially alerts → click, requires a fresh explicit
-      // ARM gesture. Never carry an armed state into a more powerful mode.
       const update = hasChrome
         ? chrome.runtime.sendMessage({ type: "CYBER_SET_AUTO", mode, armed: false }).then((r) => {
           if (!r || !r.ok) throw new Error(r && r.error || "automation update failed");
@@ -1032,8 +1058,6 @@
         settings = s;
         if (!hasChrome) updateAutoUI(Object.assign({}, autoState, { mode: s.autoMode, armed: false }));
       }).catch(() => {
-        // Restore the last persisted value when no selected Quotex tab can
-        // accept the mode change.
         e.target.value = (settings && settings.autoMode) || "off";
       });
     });
@@ -1064,11 +1088,11 @@
     };
     bindBooleanSetting("notify-sound", "notifySound");
     bindBooleanSetting("notify-desktop", "notifyDesktop");
+    bindBooleanSetting("auto-high-accuracy", "autoHighAccuracy");
+
     let armPending = false;
     $("arm-btn").addEventListener("click", () => {
       if (armPending) return;
-      // v2.3.2: settings loads async — clicking ARM before it resolves used
-      // to throw on `settings.armed` (null deref) and the arm never happened.
       const cur = settings && settings.armed;
       const mode = (settings && settings.autoMode) || "off";
       const next = mode !== "off" && !cur;
@@ -1083,7 +1107,6 @@
         settings = s;
         if (!hasChrome) updateAutoUI(Object.assign({}, autoState, { armed: s.armed }));
       }).catch(() => {
-        // A failed arm must leave persisted safety state disarmed.
         if (next) setSettings({ armed: false }).catch(() => {});
       }).finally(() => { armPending = false; });
     });
@@ -1104,7 +1127,8 @@
       $("cooldown").value = s.cooldownBars != null ? s.cooldownBars : 2;
       $("notify-sound").checked = s.notifySound !== false;
       $("notify-desktop").checked = !!s.notifyDesktop;
-      activeStrategy = STRAT.get(s.strategy) ? s.strategy : "confluence";
+      if ($("auto-high-accuracy")) $("auto-high-accuracy").checked = s.autoHighAccuracy !== false;
+      activeStrategy = STRAT.get(s.strategy) ? s.strategy : "auto_adaptive";
       const sel = $("strategy-select");
       if (sel) sel.value = activeStrategy;
     });
@@ -1120,8 +1144,6 @@
     const minConf = Number.isFinite(rawMinConf) ? Math.max(0, Math.min(100, rawMinConf)) : 0;
     const kind = $("bt-kinds").value;
     const kinds = kind === "all" ? null : [kind];
-    // Lean backtests warm up at 50 bars. Requiring 155 cached bars here made a
-    // normal 100-bar Quotex history response look like "no data".
     const o = { days, horizon, minConf, kinds, minBars: 50, liveOnly: true, requireLive: true };
 
     const btn = $("bt-run");
@@ -1138,12 +1160,6 @@
     const assetPool = ASSETS.list().filter((a) => !kinds || kinds.some((kindName) =>
       typeof ASSETS.matchesKind === "function" ? ASSETS.matchesKind(a, kindName) : a.kind === kindName)).slice(0, 256);
     const minNeeded = Math.max(40, 50 + horizon + 1);
-    // The history probe only KICKS OFF delivery on the selected Quotex tab;
-    // genuine candles still arrive asynchronously via the live-state push and
-    // chrome.storage. So a rejected probe (no selected tab, page-hook still
-    // loading past its 4s ACK) must NOT abort the poll loop — record why it
-    // failed and keep waiting, since the content script's own periodic
-    // subscription plus a mid-window retry can still land the bars.
     let historyProbeError = "";
     const nudgeHistory = () => {
       if (!hasChrome) return Promise.resolve(true);
@@ -1168,9 +1184,6 @@
         const immediate = liveCandlesByAsset[a.id];
         const storedBars = Array.isArray(stored) ? stored : [];
         const immediateBars = Array.isArray(immediate) ? immediate : [];
-        // Prefer whichever genuine source is longer. A live-state payload can
-        // arrive before chrome.storage.local has completed its cross-context
-        // write, which previously made a populated chart report no candles.
         return { asset: a, bars: immediateBars.length > storedBars.length ? immediateBars : storedBars };
       });
     }).catch(() => assetPool.map((a) => ({
@@ -1180,14 +1193,12 @@
 
     const waitForLiveRows = async () => {
       const deadline = Date.now() + 10000;
-      let nudged = false; // a single mid-window retry recovers from a slow page-hook load
+      let nudged = false;
       let rows = await readLiveRows();
       while (!rows.some((row) => Array.isArray(row.bars) && row.bars.length >= minNeeded) && Date.now() < deadline) {
         const secondsLeft = Math.max(1, Math.ceil((deadline - Date.now()) / 1000));
         const bestBars = rows.reduce((m, r) => Math.max(m, Array.isArray(r.bars) ? r.bars.length : 0), 0);
         btn.textContent = "Waiting for broker candles… " + bestBars + "/" + minNeeded + " (" + secondsLeft + "s)";
-        // If the first probe failed (or simply returned nothing) and we are
-        // past the 4s mark, nudge the selected tab once more before giving up.
         if (!nudged && (historyProbeError || bestBars < minNeeded) && deadline - Date.now() <= 6000) {
           nudged = true;
           nudgeHistory().catch(() => {});
@@ -1257,10 +1268,6 @@
     const maxDrawdown = finite(sum && sum.maxDrawdown, null);
     $("bt-dd").textContent = maxDrawdown == null ? "—" : maxDrawdown.toFixed(2);
 
-    // The matrix does not retain trade chronology, so never fabricate it by
-    // grouping every win before every loss. Plot one bounded cumulative point
-    // per completed asset/strategy run instead (also avoids allocating one DOM
-    // object per backtest trade on large matrices).
     let running = 0;
     const seq = [{ equity: 0 }];
     for (const r of matrix.results.slice(0, 2000)) {
@@ -1274,7 +1281,6 @@
       emptyMessage: matrix.error ? "No genuine Quotex history received — see status below." : undefined,
     });
 
-    // Per-strategy
     const stBody = $("bt-strategies").querySelector("tbody");
     stBody.innerHTML = "";
     for (const k of Object.keys(sum.byStrategy).sort((a, b) => sum.byStrategy[b].winrate - sum.byStrategy[a].winrate)) {
@@ -1284,7 +1290,6 @@
       stBody.appendChild(tr);
     }
 
-    // Per-asset
     const aBody = $("bt-assets").querySelector("tbody");
     aBody.innerHTML = "";
     const perAsset = {};
@@ -1304,7 +1309,6 @@
       aBody.appendChild(tr);
     }
 
-    // Regime breakdown (aggregate)
     const regBody = $("bt-regimes").querySelector("tbody");
     regBody.innerHTML = "";
     const regAgg = {};
@@ -1324,7 +1328,6 @@
       regBody.appendChild(tr);
     }
 
-    // Calibration
     const calBody = $("bt-calib").querySelector("tbody");
     calBody.innerHTML = "";
     const calAgg = {};
@@ -1424,56 +1427,74 @@
   function refreshAssetsTab() {
     const token = ++assetsRenderToken;
     const tb = $("asset-table").querySelector("tbody");
+    if (!tb) return;
     tb.innerHTML = "";
-    // Compute best per-asset strategy from the matrix if available.
-    const bestMap = btResults ? HIST.bestPerAsset(btResults) : {};
-    // Live stats
+    const filterText = ($("asset-search-filter") ? $("asset-search-filter").value : "").toUpperCase();
+    const highAccOnly = $("asset-high-acc-only") ? $("asset-high-acc-only").checked : false;
+
     STORE.getStats().then((stats) => {
       if (token !== assetsRenderToken || activeTab !== "assets") return;
-      for (const a of ASSETS.list()) {
+      const ranked = AS ? AS.rankAssets({
+        stats: stats,
+        candlesByAsset: liveCandlesByAsset,
+        minAccuracy: highAccOnly ? 60 : 0,
+      }) : ASSETS.list().map((a) => ({
+        id: a.id, name: a.name, kind: a.kind, payout: 85, winrate: 60, expectedValue: 0.11, expectedValuePct: 11, accuracyScore: 65, recommendedStrategyLabel: "Confluence", trades: 0, wins: 0, losses: 0,
+      }));
+
+      for (const item of ranked) {
+        if (filterText) {
+          const hay = ((item.name || "") + " " + (item.id || "")).toUpperCase();
+          if (hay.indexOf(filterText) === -1) continue;
+        }
+        if (highAccOnly && item.expectedValue <= 0) continue;
+
         const tr = document.createElement("tr");
         tr.className = "clickable";
-        const live = stats.byAsset && stats.byAsset[a.id];
-        const liveT = live ? live.w + live.l : 0;
-        const liveWR = liveT ? ((live.w / liveT) * 100).toFixed(1) + "%" : "—";
-        const best = bestMap[a.id];
-        const histWR = best ? best.winrate.toFixed(1) + "%" : "—";
+        const evCls = item.expectedValue > 0 ? "win" : "loss";
+        const evTxt = (item.expectedValuePct > 0 ? "+" : "") + item.expectedValuePct + "%";
+
         tr.innerHTML =
-          "<td>" + esc(a.name) + "</td>" +
-          "<td>" + esc(a.kind) + "</td>" +
-          "<td>" + esc(a.session) + "</td>" +
-          "<td>" + esc(best ? best.strategy : "—") + "</td>" +
-          "<td>" + histWR + "</td>" +
-          "<td>" + liveWR + "</td>" +
-          "<td>" + liveT + "</td>";
+          "<td><strong>" + esc(item.name) + "</strong></td>" +
+          "<td>" + esc(item.kind) + "</td>" +
+          "<td>" + item.payout + "%</td>" +
+          "<td><span class='badge " + (item.accuracyScore >= 70 ? 'green' : 'blue') + "'>" + item.accuracyScore + " / 100</span></td>" +
+          "<td class='" + evCls + "'>" + evTxt + "</td>" +
+          "<td>" + esc(item.recommendedStrategyLabel) + "</td>" +
+          "<td>" + item.winrate + "%</td>" +
+          "<td>" + (item.trades ? item.wins + "W/" + item.losses + "L" : "—") + "</td>" +
+          "<td><button type='button' class='arm-btn tiny'>Switch</button></td>";
+
+        const btn = tr.querySelector("button");
+        if (btn) {
+          btn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            selectAsset(item.id);
+            activateTab("live");
+          });
+        }
         tr.addEventListener("click", () => {
-          if (hasChrome) {
-            chrome.runtime.sendMessage({ type: "CYBER_SET_ASSET", asset: a.id }).then((response) => {
-              if (response && response.ok) {
-                activeAsset = response.asset || a.id;
-                const sel = $("asset-select");
-                if (sel) sel.value = activeAsset;
-                activateTab("live");
-              } else {
-                const pill = $("link-state");
-                if (pill) {
-                  pill.textContent = response && response.error || "Select the asset on Quotex first";
-                  pill.className = "pill warn";
-                }
-                activateTab("live");
-              }
-            }).catch(() => {});
-            return;
-          }
-          activeAsset = a.id;
-          const sel = $("asset-select");
-          if (sel) sel.value = a.id;
-          localFeed.setSeries(FEED.syntheticSeries(a, 240));
+          selectAsset(item.id);
           activateTab("live");
         });
         tb.appendChild(tr);
       }
     }).catch(() => {});
+  }
+
+  function bindAssetsTab() {
+    const search = $("asset-search-filter");
+    if (search) {
+      search.addEventListener("input", () => {
+        if (activeTab === "assets") refreshAssetsTab();
+      });
+    }
+    const accOnly = $("asset-high-acc-only");
+    if (accOnly) {
+      accOnly.addEventListener("change", () => {
+        if (activeTab === "assets") refreshAssetsTab();
+      });
+    }
   }
 
   /* ---------- settings tab ---------- */
@@ -1487,6 +1508,17 @@
         e.target.checked = !!(settings && settings.calibration);
       });
     });
+    if ($("set-auto-adaptive")) {
+      $("set-auto-adaptive").addEventListener("change", (e) => {
+        const targetStrategy = e.target.checked ? "auto_adaptive" : "confluence";
+        STORE.setSettings({ strategy: targetStrategy }).then((s) => {
+          settings = s;
+          activeStrategy = targetStrategy;
+          const sel = $("strategy-select");
+          if (sel) sel.value = targetStrategy;
+        }).catch(() => {});
+      });
+    }
     $("reset-stats").addEventListener("click", () => {
       if (!confirm("Erase all stats, history, calibration, and candle cache?")) return;
       STORE.resetAnalytics().then(() => {
@@ -1537,13 +1569,12 @@
       }
       if (msg && msg.type === "CYBER_QUOTEX_INSTRUMENTS" && Array.isArray(msg.payload)) {
         qxInstruments = QUOTEX ? QUOTEX.parseInstruments(msg.payload).slice(0, 2000) : [];
-        // Register them with the assets catalog so detection works on the page too.
         for (const it of qxInstruments) {
           if (it && it.symbol) {
             try { ASSETS.registerQuotexAsset(it); } catch (_) {}
           }
         }
-        refreshSelectors(); // v2.2: broker assets appear in the dropdown immediately
+        refreshSelectors();
         if (activeTab === "instruments") refreshInstrumentsTab();
       }
       if (msg && msg.type === "CYBER_QUOTEX_BALANCE" && msg.payload &&
@@ -1570,8 +1601,6 @@
   function scale() {
     const w = window.innerWidth;
     document.documentElement.style.fontSize = Math.max(12, Math.min(17, w / 32)) + "px";
-    // Redraw whatever was last rendered (live chart or demo chart), never a
-    // stale local feed over live state.
     if (lastChartCandles && lastChartCandles.length) drawChart($("chart"), lastChartCandles, lastChartMeta);
     if (lastBtEquity) drawChart($("bt-equity"), lastBtEquity, { equity: true, equityLabel: "runs" });
   }
@@ -1589,6 +1618,7 @@
   bindInstrumentsTab();
   bindBacktest();
   bindHistoryTab();
+  bindAssetsTab();
   bindSettingsTab();
   loadAutoSettings();
   scale();

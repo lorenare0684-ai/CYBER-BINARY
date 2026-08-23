@@ -7,6 +7,24 @@
   "use strict";
 
   const STRATEGIES = {
+    "auto_adaptive": {
+      label: "⚡ Auto-Adaptive (Best Strategy for Situation)",
+      blurb: "Dynamically evaluates market regime, volatility, and strategy hit-rates to auto-select the optimal strategy for the current bar.",
+      params: {
+        rsiPeriod: 14, rsiBuy: 42, rsiSell: 58,
+        emaFast: 8, emaSlow: 21,
+        macdFast: 12, macdSlow: 26, macdSignal: 9,
+        stochK: 14, stochD: 3, stochOs: 22, stochOb: 78,
+        bbPeriod: 20, bbMult: 2,
+        atrPeriod: 14, minAtrPct: 0.00010,
+        minScore: 3, lookback: 3,
+      },
+      weights: {
+        emaTrend: 2, emaCross: 2, rsiPull: 1, macd: 1, stoch: 1, bb: 1,
+        adxTrend: 2, supertrend: 2, psar: 1, vwap: 1, mtfAlign: 2,
+        hurst: 1, williams: 1, cci: 1, donchianBreak: 2,
+      },
+    },
     "confluence": {
       label: "Balanced Confluence",
       blurb: "Multi-indicator agreement, rejects most bars. Default.",
@@ -113,6 +131,96 @@
         emaTrend: 2, emaCross: 2, rsiPull: 1, macd: 1, stoch: 1, bb: 1,
         adxTrend: 1, supertrend: 1, psar: 1, vwap: 0, mtfAlign: 1,
         hurst: 0, williams: 1, cci: 1, donchianBreak: 1,
+      },
+    },
+    "squeeze": {
+      label: "Volatility Squeeze & Expansion",
+      blurb: "Identifies Bollinger Band compression inside Keltner Channels followed by aggressive momentum expansion.",
+      params: {
+        rsiPeriod: 14, rsiBuy: 48, rsiSell: 52,
+        emaFast: 6, emaSlow: 18,
+        macdFast: 8, macdSlow: 21, macdSignal: 5,
+        stochK: 14, stochD: 3, stochOs: 25, stochOb: 75,
+        bbPeriod: 20, bbMult: 1.8,
+        atrPeriod: 14, minAtrPct: 0.00010,
+        minScore: 3, lookback: 3,
+      },
+      weights: {
+        emaTrend: 2, emaCross: 2, rsiPull: 0, macd: 3, stoch: 1, bb: 3,
+        adxTrend: 3, supertrend: 2, psar: 1, vwap: 2, mtfAlign: 2,
+        hurst: 2, williams: 1, cci: 1, donchianBreak: 3,
+      },
+    },
+    "ribbon": {
+      label: "EMA Ribbon Alignment",
+      blurb: "Multiple EMA stack alignment (Fast / Medium / Slow) + ADX trend confirmation.",
+      params: {
+        rsiPeriod: 14, rsiBuy: 45, rsiSell: 55,
+        emaFast: 5, emaSlow: 21,
+        macdFast: 12, macdSlow: 26, macdSignal: 9,
+        stochK: 14, stochD: 3, stochOs: 25, stochOb: 75,
+        bbPeriod: 20, bbMult: 2,
+        atrPeriod: 14, minAtrPct: 0.00015,
+        minScore: 3, lookback: 4,
+      },
+      weights: {
+        emaTrend: 4, emaCross: 3, rsiPull: 1, macd: 2, stoch: 0, bb: 0,
+        adxTrend: 3, supertrend: 3, psar: 2, vwap: 2, mtfAlign: 3,
+        hurst: 1, williams: 0, cci: 0, donchianBreak: 1,
+      },
+    },
+    "reversal": {
+      label: "Extreme Reversal / Rejection",
+      blurb: "High-probability counter-trend reversals at extreme oversold/overbought levels.",
+      params: {
+        rsiPeriod: 10, rsiBuy: 25, rsiSell: 75,
+        emaFast: 8, emaSlow: 21,
+        macdFast: 12, macdSlow: 26, macdSignal: 9,
+        stochK: 8, stochD: 3, stochOs: 15, stochOb: 85,
+        bbPeriod: 20, bbMult: 2.2,
+        atrPeriod: 14, minAtrPct: 0.00010,
+        minScore: 3, lookback: 2,
+      },
+      weights: {
+        emaTrend: 0, emaCross: 0, rsiPull: 3, macd: 1, stoch: 3, bb: 4,
+        adxTrend: 0, supertrend: 0, psar: 1, vwap: 1, mtfAlign: 0,
+        hurst: 2, williams: 3, cci: 3, donchianBreak: 0,
+      },
+    },
+    "momentum_pulse": {
+      label: "Momentum Pulse",
+      blurb: "Captures rapid price momentum thrusts using MACD histogram acceleration and Parabolic SAR.",
+      params: {
+        rsiPeriod: 10, rsiBuy: 50, rsiSell: 50,
+        emaFast: 5, emaSlow: 15,
+        macdFast: 6, macdSlow: 19, macdSignal: 5,
+        stochK: 10, stochD: 3, stochOs: 20, stochOb: 80,
+        bbPeriod: 20, bbMult: 2,
+        atrPeriod: 14, minAtrPct: 0.00015,
+        minScore: 3, lookback: 3,
+      },
+      weights: {
+        emaTrend: 2, emaCross: 2, rsiPull: 1, macd: 4, stoch: 1, bb: 1,
+        adxTrend: 2, supertrend: 3, psar: 3, vwap: 2, mtfAlign: 2,
+        hurst: 1, williams: 2, cci: 2, donchianBreak: 2,
+      },
+    },
+    "choppy_range": {
+      label: "Choppy Range Bound",
+      blurb: "Oscillator mean reversion for sideways/ranging markets with VWAP and Bollinger support.",
+      params: {
+        rsiPeriod: 14, rsiBuy: 35, rsiSell: 65,
+        emaFast: 10, emaSlow: 24,
+        macdFast: 12, macdSlow: 26, macdSignal: 9,
+        stochK: 14, stochD: 3, stochOs: 20, stochOb: 80,
+        bbPeriod: 20, bbMult: 1.8,
+        atrPeriod: 14, minAtrPct: 0.00008,
+        minScore: 3, lookback: 2,
+      },
+      weights: {
+        emaTrend: 0, emaCross: 0, rsiPull: 3, macd: 1, stoch: 3, bb: 3,
+        adxTrend: 0, supertrend: 0, psar: 0, vwap: 3, mtfAlign: 0,
+        hurst: 2, williams: 2, cci: 2, donchianBreak: 0,
       },
     },
   };

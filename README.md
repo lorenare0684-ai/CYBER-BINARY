@@ -1,10 +1,27 @@
-# CYBER BINARY — Quotex Trading Automation v2.4
+# CYBER BINARY — Quotex Trading Automation v2.5
 
-Chrome extension (Manifest V3) that attaches to a Quotex / QX Broker chart, builds 1-minute candles from the live quote, and scores **CALL / PUT / WAIT** from a multi-indicator, multi-timeframe confluence engine. The Quotex adapter decodes the platform's WebSocket traffic and drives the engine with real candles/ticks/balance.
+Chrome extension (Manifest V3) that attaches to a Quotex / QX Broker chart, builds 1-minute candles from the live quote, and scores **CALL / PUT / WAIT** from a multi-indicator, multi-timeframe confluence engine with **Auto-Adaptive Strategy Switching** and **Auto-Adapting High-Accuracy Asset Ranking**. The Quotex adapter decodes the platform's WebSocket traffic and drives the engine with real candles/ticks/balance.
 
 > Live signal analysis and explicitly armed automated execution for Quotex. This third-party tool can place real trades. Binary options are high risk, losses can quickly outweigh returns, and no result or profit is guaranteed.
 
-The completed 500-instance v2.4.0 hardening ledger and final regression evidence are in [`AUDIT-500.md`](AUDIT-500.md).
+## What's new in v2.5.0 — Auto-Adaptive System & High-Accuracy Assets
+
+- **⚡ Auto-Adaptive Strategy Engine (`auto_adaptive`)**:
+  - Dynamically evaluates market situation and regime (`trending`, `strong-trend`, `mean-reverting`, `choppy`, `ranging`, `squeeze`, `volatile`) on every bar.
+  - Concurrently analyzes all 11 concrete strategy presets (`confluence`, `trend`, `meanrev`, `breakout`, `scalp`, `otc`, `squeeze`, `ribbon`, `reversal`, `momentum_pulse`, `choppy_range`).
+  - Calculates a **Situation Fitness Score** (0-100) combining regime compatibility, indicator confluence, signal strength, and strategy hit-rate history.
+  - Automatically selects and executes using the **Best Strategy** for the current market situation!
+- **🎯 Auto-Adapting High-Accuracy Asset Selector**:
+  - Continuously ranks all catalog instruments in real time by **Expected Value (EV = WinRate% × (1 + Payout%) - 1)** and **Accuracy Score**.
+  - Displays top high-accuracy assets with EV %, win rate, payout %, and recommended strategy.
+  - Includes a **High-Accuracy Asset Filter Gate** in Auto-Trade mode: automatically suppresses trades on negative-EV / low-accuracy assets and executes on top high-accuracy opportunities.
+  - Quick "🎯 Select Best High-Accuracy Asset" button on the live dashboard.
+- **5 New Specialized Strategy Presets**:
+  - `squeeze`: Volatility Squeeze & Expansion (Bollinger Bands compression inside Keltner Channels + momentum expansion).
+  - `ribbon`: EMA Ribbon Alignment (Fast / Medium / Slow EMA stack alignment + ADX).
+  - `reversal`: Extreme Reversal / Rejection (Oversold/Overbought RSI, Stochastic, CCI & BB band touches).
+  - `momentum_pulse`: Momentum Pulse (MACD acceleration + Parabolic SAR + Williams %R).
+  - `choppy_range`: Choppy Range Bound (VWAP & oscillator mean reversion for low-ADX sideways markets).
 
 ## What's new in v2.4.0 — responsive UI, confirmed execution, one main chart
 
@@ -25,7 +42,6 @@ The completed 500-instance v2.4.0 hardening ledger and final regression evidence
 - **Renders through TradingView Lightweight Charts natively** — the page hook (MAIN world, document_start) captures the chart instance three ways: it wraps `LightweightCharts.createChart` before the page bundle assigns the global, reads `<lightweight-chart>` web-component instances, and runs a bounded React-fiber scan of the chart container for bundled builds. Markers are drawn with the library's own `series.setMarkers()` — the arrows scroll and zoom with the chart exactly like platform drawings.
 - **Overlay-canvas fallback** — if no chart API is reachable, arrows are drawn on a transparent overlay above the price chart from the same fixed anchors (approximate mapping from the live feed bars; redrawn on resize/scroll).
 - **Dashboard chart arrows** — the same fixed anchors are drawn on the dashboard's candle chart (green/red triangles at their bar slots).
-- All of it is regression-tested in `tools/markers.js` (store semantics, immutable anchors, dedupe, UTC-second conversion, hook capture paths, native + overlay rendering, idempotent re-renders) and `tools/detection-e2e.js` (markers message + state payload).
 
 ## What's new in v2.3.2 — bug-audit fixes
 
@@ -37,7 +53,6 @@ The completed 500-instance v2.4.0 hardening ledger and final regression evidence
 - **Stale ticks can't corrupt the candle feed** — a delayed/replayed tick older than the in-progress bar used to become the "current" bar, producing unsorted series and garbage indicators. Such ticks are now dropped; newer ticks still flow.
 - **Background history can't hijack the active asset** — a candle replay for a chart you're not watching no longer force-switches the engine's active asset away from what the page socket/DOM says (manual pins still win).
 - **Dashboard ARM button no longer dead-clicks** — it dereferenced `settings` before the async settings load resolved (TypeError); now safe, and the auto-mode selector no longer emits `armed: null`.
-- **Engine `lean` flag simplified** — the convoluted `cfg.lean !== false && (opts && opts.lean !== false && (opts.lean !== undefined ? opts.lean : true))` collapsed to `cfg.lean !== false && !(opts && opts.lean === false)`; behavior identical for every caller (live UI keeps all indicators, backtests stay fast), including callers that pass no options at all.
 
 ## What's new in v2.3 — every Quotex asset + reliable auto-detection
 
@@ -54,45 +69,18 @@ The completed 500-instance v2.4.0 hardening ledger and final regression evidence
 ## What's new in v2
 
 - **Automatic asset detection** from the visible chart symbol, URL, page title, and WebSocket frames — works across `qxbroker.com` and `quotex.com` and follows SPA navigation.
-- **Multi-strategy presets** — Confluence, Trend, Mean-reversion, Breakout, 1m Scalp, OTC 24/7. Switchable per asset, per session.
+- **Multi-strategy presets** — Auto-Adaptive, Confluence, Trend, Mean-reversion, Breakout, 1m Scalp, OTC 24/7, Squeeze, Ribbon, Reversal, Momentum Pulse, Choppy Range. Switchable per asset, per session.
 - **15+ indicators** — EMA / RSI / MACD / Stochastic / Bollinger / ATR / **ADX / Keltner / Parabolic SAR / Supertrend / VWAP / Hurst / Williams %R / CCI / MFI / OBV / Donchian / momentum**.
 - **Multi-timeframe** — resamples 1m → 5m, 15m and votes on agreement.
-- **Regime detection** — trending / strong-trend / mean-reverting / choppy / ranging.
+- **Regime detection** — trending / strong-trend / mean-reverting / choppy / ranging / squeeze / volatile.
 - **Calibration** — the engine learns which predicted-confidence buckets actually win and shrinks the reported confidence accordingly.
 - **Auto-trade** with two modes:
   - **Alerts** — sound + desktop notification + dashboard pulse on qualifying signals. (Default.)
   - **Click** — actively click the visible CALL/PUT button with your stake and expiry, gated by safety limits.
-- **Safety limits** — confidence floor, daily loss cap, hourly / daily trade caps, cooldown bars, per-asset freeze, kill-switch (ARM/DISARM).
+- **Safety limits** — confidence floor, daily loss cap, hourly / daily trade caps, cooldown bars, per-asset freeze, kill-switch (ARM/DISARM), high-accuracy asset filter gate.
 - **Historic backtest** — runs the engine on cached Quotex live/tick-built 1m candles captured from the page feed (no synthetic fallback in the dashboard backtester). Returns per-asset, per-strategy, per-regime, per-confidence-bucket accuracy.
 - **Per-asset historic accuracy** + best-strategy recommendation.
 - **Trade history** with filters (dir / outcome / asset), CSV export, and per-asset / per-strategy / per-regime breakdowns.
-- **Walk-forward validation** helper to detect overfit.
-- **Parallel workers** — Node tool uses `worker_threads`, browser dashboard chunks to keep the UI responsive.
-
-## What's new in v2.1 — full Quotex integration
-
-v2.1 turns the extension into a first-class Quotex citizen. The generic page-hook is still there as a fallback, but the primary path is the new **`src/lib/quotex.js`** adapter.
-
-- **Quotex Socket.IO v3 decoder.** Handles every frame shape the live platform emits:
-  - Engine.IO control: `0{...}` (open), `40` (connect), `2`/`3` (ping/pong), `41` (disconnect)
-  - Socket.IO events: `42["event", payload]`
-  - Headered binary: `451-["event",{_placeholder:true}]` followed by a `\x04<json>` body
-  - Headerless binary: `\x04<...>` payloads inferred by shape (instruments list, quotes stream, history candles, balance)
-  - 30+ known event names mapped to typed callbacks (`candle`, `tick`, `instruments`, `balance`, `order_opened`, `order_closed`, `authenticated`, `auth_error`, `error`)
-- **Page-side WebSocket hijack** (`attachPageSocket`). The adapter wraps `window.WebSocket` so every page-owned socket goes through the decoder. The wrapper is idempotent (`__cyberWrapped` flag) and exposes a `detach()` to put the native constructor back. We never open a second connection — we listen to the page's own traffic.
-- **Full Quotex asset catalog baked in** (~170 symbols with their broker-internal numeric IDs where confirmed, including every `_otc` synthetic variant). The adapter exposes a `getInstruments()` helper, a runtime `ASSET_IDS` map, and `rememberIds()` — live `instruments/list` payloads merge in the real IDs, payouts and timeframes for any symbol the platform adds.
-- **Real-platform payload parsers** for instruments list, candles, ticks, balance, and orders (opened/closed) — including the `[ts, open, low, high, close, vol?]` candle shape with high/low normalization and ms-epoch inference.
-- **Real platform DOM helpers** — `findPanel`, `findAssetHeader`, `findPriceLabel`, `findStakeInput`, `findExpirySelect`, `findCallButton`, `findPutButton`, `findBalance`, `setStake`. These supersede the inline selectors that lived in `content.js` / `auto.js`.
-- **`placeTrade`** with two modes:
-  - `dom` (default) — find the visible CALL/PUT button, set the stake, click. Works in any state where the page is showing the trade panel.
-  - `ws` — send a real `42["orders/open", {...}]` frame on the page's own WebSocket, plus the platform's `tick` and `instruments/follow` warmup messages. Payload shape mirrors the open-source A11ksa/API-Quotex client (`asset`, `amount`, `time`, `action`, `isDemo`, `tournamentId`, `requestId`, `optionType`).
-- **Live-candle ingest path.** The page-hook forwards each `candles_received` event to the content script, which routes it to the right per-asset feed via the new `feed.ingestCandle(c)` method.
-- **Instruments tab** in the dashboard. Filter by symbol/type, see payout %, available timeframes, open/closed state. Plus a live "Recent live orders" feed.
-- **Quotex status pill** in the dashboard header — shows `Quotex · live` when authenticated, `Quotex · auth_error` on rejection, `Quotex · fallback` if the adapter failed to load.
-- **Live balance & order-result surface** in the Live tab and a dedicated order list in the Instruments tab.
-- **New background message types**: `CYBER_QUOTEX_STATUS`, `CYBER_QUOTEX_INSTRUMENTS`, `CYBER_QUOTEX_BALANCE`, `CYBER_QUOTEX_TRADE_RESULT`, `CYBER_QUOTEX_SET_AUTH`. The first four are forwarded from content.js to the dashboard; the last is a no-op (the extension never reads or stores the SSID — it only uses what the page itself transmits).
-
-The adapter is **pure ES5** and runs in both the extension ISOLATED world (content scripts, dashboard) and the MAIN world (page-hook loaded into the page's window). It has no module-level side effects.
 
 ## Load in Chrome
 
@@ -103,47 +91,13 @@ The adapter is **pure ES5** and runs in both the extension ISOLATED world (conte
 5. The HUD appears on the chart; the dashboard window opens automatically
 6. You can also click the extension icon on any tab to focus the dashboard
 
-## Dashboard tabs
-
-- **Live** — current signal, indicators, chart, recent calls, asset + strategy selector, live balance, detected instruments count, last orders.
-- **Auto** — mode, stake, expiry, confidence floor, daily loss cap, hourly/daily trade caps, cooldown, sound/desktop alerts, ARM/DISARM, automation log.
-- **Instruments** (v2.1) — connection state, detected instruments with payout / timeframes / open-closed, filter by symbol or type, recent live orders.
-- **Backtest** — run the full engine across the asset catalog. Equity curve, per-strategy, per-asset, per-regime tables, and confidence calibration.
-- **History** — every recorded trade, filter by direction / outcome / asset, CSV export, clear.
-- **Assets** — full asset catalog with per-asset live winrate and historic best-strategy winrate (from the backtest).
-- **Settings** — calibration on/off, reset.
-
-## How signals work
-
-Closed-bar confluence of (each vote weighted per strategy preset):
-
-- EMA 8/21 trend and fresh cross
-- RSI pullback **with** trend (not extreme chase)
-- MACD histogram direction
-- Stochastic leaving 22 / 78
-- Bollinger touch **only** if it agrees with the slow EMA
-- ADX+/ADX- aligned with the slow EMA
-- Supertrend direction
-- Parabolic SAR
-- VWAP (if available)
-- Williams %R / CCI extremes
-- Donchian breakout
-- Multi-timeframe (5m, 15m) agreement
-- Hurst exponent — only contributes in trending regimes
-- ATR% floor so dead markets stay `WAIT`
-
-A signal needs a vote score ≥ the strategy's `minScore`. It normally needs a 2-point lead for one side; in an established directional trend, any positive lead is enough so correlated overbought/oversold oscillators cannot deadlock an otherwise aligned trend signal. Reported confidence uses a gently scaled softmax of the opposing vote scores (roughly 60% for a 1-point lead, 69% for 2, and 77% for 3), optionally adjusted toward the observed hit rate. A calibration update is capped at ±25 points so an unlucky early bucket cannot collapse to 0% and permanently block new samples.
-
 ## Local tools
 
 ```bash
 node tools/validate.js              # structure + engine + backtest smoke
+node tools/adaptive-test.js          # auto-adaptive strategy & high-accuracy asset tests
 node tools/backtest.js              # legacy single-asset backtest
 node tools/historic.js              # full matrix across 170+ assets × strategies
-node tools/historic.js --days 7     # 7 days
-node tools/historic.js --kinds fx   # FX only
-node tools/historic.js --strategies trend,meanrev,breakout
-node tools/historic.js --json       # machine-readable output
 node tools/search.js                # bounded parameter grid search
 ```
 
@@ -157,25 +111,17 @@ src/content.js           # quote ingest, candles, multi-asset feeds, auto-trade
 src/dashboard.html|.js|.css  # tabbed lab UI
 src/lib/indicators.js    # 19 indicators + multi-timeframe resampler
 src/lib/assets.js        # full Quotex catalog (170+) + runtime registerQuotexAsset()
-src/lib/strategy.js      # 6 strategy presets
-src/lib/engine.js        # confluence engine + backtest + walk-forward
+src/lib/asset-selector.js# v2.5: Auto-Adapting High-Accuracy Asset Selector
+src/lib/strategy.js      # 12 strategy presets + auto_adaptive
+src/lib/engine.js        # v2.5: confluence + auto-adaptive strategy evaluator
 src/lib/feed.js          # live + synthetic 1m series generator (ingestCandle)
 src/lib/storage.js       # chrome.storage.local settings / history / calibration
 src/lib/auto.js          # auto-trade controller (alerts + click + placeTrade)
 src/lib/backtest.js      # full asset×strategy matrix
 src/lib/workers.js       # parallel backtest (Node worker_threads, browser chunks)
-src/lib/quotex.js        # v2.1: Socket.IO v3 adapter, asset catalog, placeTrade
+src/lib/quotex.js        # Socket.IO v3 adapter, asset catalog, placeTrade
 icons/
+tools/adaptive-test.js   # v2.5: test suite for adaptive strategies & assets
 ```
-
-## Notes on live history
-
-The live engine still seeds the active asset with temporary warm-up bars so the UI can boot immediately, but execution and stored analytics wait for genuine Quotex history/ticks. The dashboard backtester consumes only the cached live/tick-built candle buffer from `chrome.storage.local`; if no Quotex cache exists yet, open the broker page and let the feed run before backtesting.
-
-## Limits
-
-Quotex does not expose a public candle API. v2.1 reads the platform's own WebSocket frames (Socket.IO v3, engine.io v3) for the live candle/quote/balance/instrument list. The exact event names and payload shapes are reverse-engineered from open-source clients (A11ksa/API-Quotex, ericpedra/quotexapi) and may need defensive fallbacks if the broker updates the protocol. The decoder logs unmatched frames under a `frame` callback so the dashboard can surface them; the `lib/quotex.js` module is small and standalone so updates are safe.
-
-Auto execution prefers a real `orders/open` frame on the page's own authenticated socket and waits for the broker's order-open response before counting it. If the socket is unavailable, the DOM fallback proceeds only when it can set both stake and expiry and verify a real CALL/PUT action button; it then also waits for broker confirmation. A frame that was sent but not confirmed is never retried as a click, preventing duplicate orders. Both paths are gated by the safety limits above. Monitor the selected chart and account state whenever automation is armed. The extension never reads, stores, or transmits your SSID; it only uses traffic the page already sends on its own socket.
 
 **Live-trading notice.** This is a third-party Quotex signal and automation client. Explicitly armed click mode can place real orders. Binary options have a built-in payout edge against the trader (most brokers require more than 50% wins to break even), so no signal, backtest, or automation result is a profit guarantee. Automation remains off and disarmed by default.

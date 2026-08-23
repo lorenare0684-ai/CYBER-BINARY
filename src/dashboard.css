@@ -97,7 +97,7 @@ h2 {
   background: transparent;
   color: var(--muted);
   padding: 8px 10px;
-  border-radius: 9px;
+  border-radius: 99px;
   font-size: 12px;
   font-weight: 600;
   cursor: pointer;
@@ -373,6 +373,86 @@ button {
   .dir { font-size: 32px; }
 }
 
+/* Card & Auto-Adaptive Cockpit */
+.card {
+  background: linear-gradient(145deg, rgba(7, 17, 31, 0.88), rgba(14, 10, 28, 0.76));
+  border: 1px solid rgba(0, 229, 255, 0.16);
+  border-radius: 14px;
+  padding: 12px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  box-shadow: 0 0 0 1px rgba(0, 229, 255, 0.05), 0 18px 50px rgba(0, 0, 0, 0.28);
+}
+.card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.card-header h3 {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 700;
+  color: #7ff5ff;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.badge {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 3px 8px;
+  border-radius: 99px;
+  background: rgba(0, 229, 255, 0.12);
+  color: #7ff5ff;
+  border: 1px solid rgba(0, 229, 255, 0.25);
+  text-transform: uppercase;
+}
+.badge.green {
+  background: rgba(61, 255, 154, 0.12);
+  color: #3dff9a;
+  border-color: rgba(61, 255, 154, 0.3);
+}
+.badge.blue {
+  background: rgba(74, 163, 255, 0.12);
+  color: #4aa3ff;
+  border-color: rgba(74, 163, 255, 0.3);
+}
+.adaptive-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+}
+.adaptive-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.dim-text {
+  color: var(--muted);
+  font-size: 11px;
+}
+.fitness-meters {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 6px;
+}
+.meter.selected {
+  font-weight: 700;
+  color: var(--call);
+}
+.arm-btn.tiny {
+  padding: 4px 8px;
+  font-size: 10px;
+  border-radius: 6px;
+}
+.arm-btn.small {
+  padding: 6px 10px;
+  font-size: 11px;
+}
+
 /* v2.4.1 cyberpunk adaptive cockpit */
 html, body {
   background:
@@ -437,9 +517,6 @@ h1 {
 }
 .arm-btn { background: linear-gradient(135deg, #ff2d55, #7b1748); border-color: rgba(255, 93, 122, 0.5); }
 .arm-btn.armed { background: linear-gradient(135deg, #16ff9d, #087d58); border-color: rgba(61, 255, 154, 0.55); }
-/* Keep every table as one table formatting context. Making the table itself a
-   block and its thead/tbody separate tables lets each section calculate
-   different column widths, so body values appear under the wrong headers. */
 .table { display: table; table-layout: auto; }
 .table thead { display: table-header-group; }
 .table tbody { display: table-row-group; }
