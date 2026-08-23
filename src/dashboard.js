@@ -1415,6 +1415,37 @@
 
   function bindBacktest() {
     $("bt-run").addEventListener("click", runBacktest);
+    const exportBtn = $("bt-export");
+    if (exportBtn) exportBtn.addEventListener("click", () => {
+      const origLabel = exportBtn.textContent;
+      STORE.load().then((snapshot) => {
+        const candles = snapshot && snapshot.candles && typeof snapshot.candles === "object" && !Array.isArray(snapshot.candles)
+          ? snapshot.candles : {};
+        const assets = Object.keys(candles).filter((k) => Array.isArray(candles[k]) && candles[k].length);
+        const bars = assets.reduce((n, k) => n + candles[k].length, 0);
+        const payload = {
+          exportedAt: new Date().toISOString(),
+          source: "CYBER BINARY cached live Quotex 1m candles",
+          totalAssets: assets.length,
+          totalBars: bars,
+          candles,
+        };
+        const blob = new Blob([JSON.stringify(payload)], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "cyber-binary-candles-" + new Date().toISOString().replace(/[:.]/g, "-").slice(0, 16) + ".json";
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+        exportBtn.textContent = assets.length
+          ? "Exported " + assets.length + " assets / " + bars + " bars"
+          : "No live candle cache yet — open Quotex first";
+        setTimeout(() => { exportBtn.textContent = origLabel; }, 3000);
+      }).catch(() => {
+        exportBtn.textContent = "Export failed";
+        setTimeout(() => { exportBtn.textContent = origLabel; }, 3000);
+      });
+    });
   }
 
   /* ---------- history tab ---------- */

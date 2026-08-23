@@ -2,21 +2,23 @@
 "use strict";
 
 /**
- * High-Accuracy 80+ regression.
+ * High-Accuracy 80+ verification.
  *
- * The `high_accuracy` preset gates signals to trending regimes with 90+
- * confluence (engine `regimeFilter` + `minConfidence`). This tool proves,
- * on the deterministic full-catalog backtest, that:
+ * Two modes:
  *
- *   1. coverage stays complete (every catalog asset produces rows);
- *   2. the aggregate win rate clears 80% with a large trade sample;
- *   3. the gates only ever SUPPRESS signals — an ungated twin of the same
- *      strategy fires strictly more often on the identical series;
- *   4. ungated scalp on the same data sits well below the gated rate, so
- *      the accuracy comes from the gates, not from a lucky seed.
+ *   node tools/accuracy.js
+ *     Deterministic SIMULATOR verification (default). Proves the engine's
+ *     gated behaviour: coverage, >=80% WR floor, suppression-only gates,
+ *     live-path gate reasons. The numbers pin ENGINE behaviour, not markets.
  *
- * Simulated data: this pins the ENGINE's behaviour, not live-market
- * performance. Live win rate is not guaranteed to match.
+ *   node tools/accuracy.js --candles cyber-binary-candles-….json [--horizon 8]
+ *     REAL-DATA report. Re-runs the identical gated-vs-ungated comparison on
+ *     real Quotex 1m candles exported from the dashboard ("Export live
+ *     candles"). Real candles are used exclusively — no synthetic padding —
+ *     so the printed win rates are whatever the real data says. Nothing is
+ *     asserted about the win rate itself: only engine-integrity checks
+ *     (gates suppress, never flip) can fail. Interpret with the payout
+ *     breakeven line the report prints.
  */
 const fs = require("fs");
 const path = require("path");
@@ -45,6 +47,7 @@ const FEED = sandbox.self.CYBER_FEED;
 const STRAT = sandbox.self.CYBER_STRATEGIES;
 
 // 0) preset registered and carries its gates
+function syntheticVerification() {
 const preset = STRAT.get("high_accuracy");
 check("high_accuracy preset registered", !!preset && preset.label.indexOf("High-Accuracy") === 0);
 check("preset gates are regime+trend and 90+ confidence",
@@ -113,5 +116,90 @@ for (let i = 200; i < 1440; i += 7) {
 check("live path surfaces gate reasons", gateReasonSeen);
 check("live path never fabricates signals", !gatedSignalLeaked);
 
-console.log(failed ? "\n" + failed + " ACCURACY FAILURE(S)" : "\nhigh-accuracy preset: " + winrate.toFixed(2) + "% WR over " + total + " full-catalog trades — all checks pass");
-process.exit(failed ? 1 : 0);
+console.log(failed ? "\n" + failed + " ACCURACY FAILURE(S)" : "\nhigh-accuracy preset: " + winrate.toFixed(2) + "% WR over " + total + " full-catalog SIMULATED trades — all checks pass");
+}
+
+/**
+ * REAL-DATA mode: identical gated-vs-ungated comparison on exported real
+ * Quotex candles. Live-only series (no synthetic padding). Reports win
+ * rates as measured; asserts only engine integrity.
+ */
+function realDataReport(file, horizon) {
+  let parsed;
+  try { parsed = JSON.parse(fs.readFileSync(path.resolve(file), "utf8")); }
+  catch (e) { console.error("FAIL candle file unreadable: " + e.message); process.exit(1); }
+  const rawCandles = parsed && typeof parsed === "object"
+    ? (parsed.candles && typeof parsed.candles === "object" ? parsed.candles : parsed)
+    : null;
+  if (!rawCandles || typeof rawCandles !== "object" || Array.isArray(rawCandles)) {
+    console.error("FAIL candle file must be an object of assetId -> bar array (dashboard export shape)");
+    process.exit(1);
+  }
+  const cachedByAsset = Object.create(null);
+  let totalBars = 0;
+  for (const id of Object.keys(rawCandles).slice(0, 256)) {
+    const rows = rawCandles[id];
+    if (!Array.isArray(rows) || rows.length < 60) continue; // engine needs >=40 usable bars + horizon
+    cachedByAsset[id] = rows;
+    totalBars += rows.length;
+  }
+  const assetIds = Object.keys(cachedByAsset);
+  if (!assetIds.length) {
+    console.error("FAIL no asset in the file has >= 60 candles — let the extension collect more live data first");
+    process.exit(1);
+  }
+  console.log("real candle cache: " + assetIds.length + " assets, " + totalBars + " bars, horizon " + horizon + "m, live-only (no synthetic data)");
+  if (parsed && parsed.exportedAt) console.log("exported: " + parsed.exportedAt);
+
+  const rows = [];
+  let gW = 0, gL = 0, uW = 0, uL = 0;
+  for (const id of assetIds) {
+    const asset = ASSETS.get(id) || ASSETS.ensureRegistered(id) || { id, basePrice: 1, vol: 0.0001 };
+    const series = HIST.getSeries(asset, { days: 31, cachedByAsset, liveOnly: true });
+    if (series.length < 60) continue;
+    const gated = ENGINE.backtest(series, { strategy: "high_accuracy", horizon, minConf: 0 });
+    const twin = ENGINE.backtest(series, { strategy: "high_accuracy", horizon, minConf: 0,
+      params: { regimeFilter: [], minConfidence: 0 } });
+    gW += gated.wins; gL += gated.losses;
+    uW += twin.wins; uL += twin.losses;
+    rows.push({ id, bars: series.length, gn: gated.total, gwr: gated.winrate, un: twin.total, uwr: twin.winrate });
+  }
+  console.log("\nasset                 bars   gated(n/WR)        ungated(n/WR)");
+  for (const r of rows) {
+    console.log(r.id.padEnd(20) + String(r.bars).padStart(6) +
+      "   " + (r.gn + " / " + (r.gn ? r.gwr.toFixed(1) : "—") + "%").padEnd(16) +
+      "  " + (r.un + " / " + (r.un ? r.uwr.toFixed(1) : "—") + "%"));
+  }
+  const gn = gW + gL, un = uW + uL;
+  const gwr = gn ? (gW / gn) * 100 : 0;
+  const uwr = un ? (uW / un) * 100 : 0;
+  console.log("\nAGGREGATE  gated:     " + gn + " trades  " + gwr.toFixed(2) + "% WR");
+  console.log("AGGREGATE  ungated:   " + un + " trades  " + uwr.toFixed(2) + "% WR");
+  // Engine-integrity checks that must hold on ANY data.
+  check("gates suppress on real data (gated trades <= ungated)", gn <= un, gn + " vs " + un);
+  let monotone = true;
+  for (const r of rows) if (r.gn > r.un) monotone = false;
+  check("gates never add trades on any single asset", monotone);
+
+  console.log("\ninterpretation:");
+  console.log("  - payout 85% breakeven = 54.05% WR · payout 80% = 55.56% · payout 92% = 52.08%");
+  console.log("  - this is measured on " + gn + " real trades (" + totalBars + " real bars); past real data still does not guarantee future results");
+  console.log("  - gated sample is smaller by design — selectivity trades frequency for quality");
+  process.exit(failed ? 1 : 0);
+}
+
+// ---- dispatch ----
+const argv = process.argv.slice(2);
+let candleFile = "";
+let horizon = 8;
+for (let i = 0; i < argv.length; i++) {
+  if (argv[i] === "--candles" && argv[i + 1]) candleFile = argv[++i];
+  else if (argv[i] === "--horizon" && argv[i + 1]) {
+    const n = Math.floor(Number(argv[i + 1]));
+    if (Number.isFinite(n) && n >= 1 && n <= 1440) horizon = n; else i++;
+  }
+}
+if (candleFile) realDataReport(candleFile, horizon);
+else syntheticVerification();
+
+if (failed) { console.error("\n" + failed + " ACCURACY FAILURE(S)"); process.exit(1); }

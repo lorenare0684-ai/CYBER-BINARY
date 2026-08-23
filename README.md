@@ -4,6 +4,12 @@ Chrome extension (Manifest V3) that attaches to a Quotex / QX Broker chart, buil
 
 > Live signal analysis and explicitly armed automated execution for Quotex. This third-party tool can place real trades. Binary options are high risk, losses can quickly outweigh returns, and no result or profit is guaranteed.
 
+## What's new in v2.6.3 — Real-Candle Backtesting
+
+- **"Export live candles"** button on the Backtest tab: downloads the extension's cached real Quotex 1m candles (up to 5,000 bars per asset actually streamed while charts were open) as JSON.
+- **Real-data verification mode**: `node tools/accuracy.js --candles <export.json> [--horizon 8]` re-runs the identical gated-vs-ungated comparison using ONLY the exported real candles — no synthetic padding — and prints per-asset and aggregate win rates, suppression-integrity checks, and payout breakeven lines. The win rate is reported, never asserted: real data says what it says.
+- Clarity: the 97.13% figure from v2.6.2 is simulator-measured (no live broker data was available in that environment). The regime+confidence gates remain the design either way — they only suppress signals, and the real-data report shows exactly what they do on your own candles.
+
 ## What's new in v2.6.2 — High-Accuracy 80+ Preset
 
 - **New `high_accuracy` strategy preset — 97.1% backtest win rate across the full 174-asset catalog (72,116 trades, 1 day, 8m expiry)**. It combines two engine-level signal gates:
