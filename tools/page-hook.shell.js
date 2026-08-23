@@ -386,6 +386,10 @@
       while (time >= 1e14) time /= 1000;
       var sec = Math.floor(time >= 1e11 ? time / 1000 : time);
       if (!Number.isSafeInteger(sec) || sec <= 0) return null;
+      // Post-normalization epoch sanity (2000-01-01 … 2100-01-01 UTC), the
+      // same floor src/lib/markers.js applies — garbage epochs must never
+      // project an arrow onto the chart.
+      if (sec < 946684800 || sec > 4102444800) return null;
       var period = markerPeriod();
       return Math.floor(sec / period) * period;
     }
