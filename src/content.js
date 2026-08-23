@@ -59,7 +59,7 @@
   let lastWsPeriod = 60;         // authoritative MAIN chart timeframe
   let activeFeed = createFeedFor(activeAsset);
   let autoController = null;
-  let currentStrategy = "confluence";
+  let currentStrategy = "auto_adaptive";
   let runtimeSettings = null;
   let attached = false;
   let dashOpened = false;
@@ -499,7 +499,7 @@
   async function loadSettingsAndArmAuto() {
     const s = await STORE.getSettings();
     runtimeSettings = s;
-    currentStrategy = STRAT.get(s.strategy) ? s.strategy : "confluence";
+    currentStrategy = STRAT.get(s.strategy) ? s.strategy : "auto_adaptive";
     refreshCalCache();
     // Keep local settings/calibration snapshots fresh after this context
     // writes. canTrade() still reloads storage before every real action.

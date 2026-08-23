@@ -340,7 +340,7 @@ async function storageSanitizeTest() {
 
   STORE.DEFAULTS.settings.strategy = "mutated";
   await STORE.reset();
-  check("exported defaults cannot mutate internal reset defaults", (await STORE.getSettings()).strategy === "confluence");
+  check("exported defaults cannot mutate internal reset defaults", (await STORE.getSettings()).strategy === "auto_adaptive");
 }
 
 async function candleMatchingTest() {

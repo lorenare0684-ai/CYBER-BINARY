@@ -237,6 +237,17 @@
       if (confidence < (s.minConfidence || 0)) {
         return { ok: false, reason: `Low confidence (${confidence})` };
       }
+      if (s.autoHighAccuracy && root.CYBER_ASSET_SELECTOR && signal.asset) {
+        try {
+          const evalRes = root.CYBER_ASSET_SELECTOR.evaluateAsset(
+            { id: signal.asset },
+            { stats: await safeStorage().getStats() }
+          );
+          if (evalRes && evalRes.expectedValue < 0) {
+            return { ok: false, reason: `Filtered by High-Accuracy Asset Gate (${signal.asset} EV: ${evalRes.expectedValuePct}%)` };
+          }
+        } catch (_) {}
+      }
       // Cooldown — enforced unconditionally (v2.3: the old check depended on
       // signal.metrics.closeTime which the engine never sets, so cooldown was
       // skipped entirely and auto mode spammed one trade per 500ms tick).
