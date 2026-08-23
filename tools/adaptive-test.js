@@ -121,8 +121,15 @@ function testAssetSelector() {
   check("Asset evaluation computes Expected Value and Accuracy Score",
     typeof top.expectedValue === "number" && typeof top.accuracyScore === "number");
 
-  const highAcc = AS.getHighAccuracyAssets({ minAccuracy: 50 });
-  check("getHighAccuracyAssets filters assets with min accuracy threshold", Array.isArray(highAcc) && highAcc.length > 0);
+  const highAccNoEvidence = AS.getHighAccuracyAssets({ minAccuracy: 50 });
+  check("getHighAccuracyAssets returns nothing with zero evidence (v2.6.8: no fabricated recommendations)",
+    Array.isArray(highAccNoEvidence) && highAccNoEvidence.length === 0);
+  const highAcc = AS.getHighAccuracyAssets({
+    minAccuracy: 30,
+    stats: { byAsset: { EURUSD_otc: { w: 20, l: 5 } } }, // measured 80% — real evidence
+  });
+  check("getHighAccuracyAssets returns evidenced assets",
+    Array.isArray(highAcc) && highAcc.length > 0 && highAcc.some((x) => x.id === "EURUSD_otc"));
 
   const best = AS.getBestAsset();
   check("getBestAsset returns top high accuracy asset", best && best.id === top.id);

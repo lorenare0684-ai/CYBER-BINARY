@@ -4,6 +4,20 @@ Chrome extension (Manifest V3) that attaches to a Quotex / QX Broker chart, buil
 
 > Live signal analysis and explicitly armed automated execution for Quotex. This third-party tool can place real trades. Binary options are high risk, losses can quickly outweigh returns, and no result or profit is guaranteed.
 
+## What's new in v2.6.8 — Auto-Adaptive & Best-Asset Fixes
+
+**Auto-adaptive router:**
+- Removed the +1000 "any signal beats every WAIT" bias: a marginal CALL/PUT from a poorly-matched strategy can no longer outrank a correctly-abstaining strategy. Fitness decides; firing adds a tiebreak-scale bonus.
+- Regime sit-out: choppy and squeeze regimes (measured 48-53% WR, below the 54.05% breakeven at 85% payout) now hold WAIT with the reason "Adaptive regime filter (choppy/squeeze sit-out)".
+- The gated `high_accuracy` preset is now an adaptive candidate, so the router can select the 80+ path in trending regimes.
+
+**Best-asset auto-detection:**
+- Evidence-based ranking: a measured asset (even a weak 55%) always outranks an asset with zero data; unevidenced assets are never "recommended" — the old fabricated 60-63% priors made every unknown pair look tradeable with positive EV.
+- `getBestAsset` never returns a closed market anymore (auto-trade used to fail every placement on it).
+- The per-asset evaluation pass is ~12x cheaper (one confluence analysis instead of a full adaptive evaluation per asset), and the dashboard no longer lets synthetic demo candles feed the ranker.
+
+New regression suite: `node tools/selector-test.js` (11 checks). Backtest baseline (57.03%) and accuracy (97.13%) unchanged.
+
 ## What's new in v2.6.7 — Real Quotex Capture Tool
 
 - **`tools/capture-quotex.js`**: a Playwright script you run ON YOUR MACHINE to capture genuine Quotex candles with a demo account. It injects the extension's actual protocol decoder (src/page-hook.js) into a real Chromium, logs in (auto-fill or manual headed mode), subscribes 1m history for the assets you name, and writes the standard export file plus a diagnostics block with raw WebSocket frame samples.

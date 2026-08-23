@@ -40,12 +40,18 @@
 
   const CONCRETE_STRATEGIES = [
     "sniper", "turbo_trend", "institutional_flow", "confluence", "trend",
-    "breakout", "scalp", "otc", "squeeze", "ribbon", "momentum_pulse"
+    "breakout", "scalp", "otc", "squeeze", "ribbon", "momentum_pulse",
+    "high_accuracy"
   ];
 
   // Regimes detectRegime() can emit — anything else ("unknown") is never
   // allowed through a regime filter.
   const REGIME_NAMES = ["squeeze", "trending", "strong-trend", "mean-reverting", "choppy", "ranging"];
+
+  // v2.6.8: regimes the adaptive router refuses to trade. Full-catalog
+  // sweeps measured choppy at ~53% and squeeze at ~48% win rate — below the
+  // 54.05% breakeven at 85% payout. Sitting out is the accuracy-first move.
+  const ADAPTIVE_SIT_OUT_REGIMES = ["choppy", "squeeze"];
 
   /**
    * High-accuracy signal gates. A preset (or explicit opts.params) may set
@@ -291,7 +297,13 @@
         regimeBonus,
       };
 
-      const effectiveFitness = hasSignal ? rawFitness + 1000 : rawFitness;
+      // v2.6.8: a fired signal is worth a tiebreak-scale bonus, NOT an
+      // absolute +1000 override. The old bias made ANY marginal CALL/PUT
+      // beat EVERY correctly-abstaining strategy, so auto-adaptive actively
+      // selected the most trigger-happy strategy in quiet markets — the
+      // opposite of accuracy-first. Fitness now decides; firing adds a mild
+      // preference (stacked with signalBonus inside rawFitness: 50 total).
+      const effectiveFitness = rawFitness + (hasSignal ? 25 : 0);
       if (effectiveFitness > bestScore) {
         bestScore = effectiveFitness;
         bestStrategy = stratId;
@@ -307,14 +319,23 @@
     const stratObj = STRAT && STRAT[bestStrategy];
     const bestLabel = stratObj ? stratObj.label : bestStrategy;
 
+    const sitOut = ADAPTIVE_SIT_OUT_REGIMES.indexOf(regime) !== -1;
+    if (sitOut && bestResult && bestResult.direction !== "WAIT") {
+      bestResult = Object.assign({}, bestResult, {
+        direction: "WAIT", ready: true, confidence: 0, score: 0,
+      });
+    }
+
     return Object.assign({}, bestResult, {
       adaptive: true,
       selectedStrategy: bestStrategy,
       selectedStrategyLabel: bestLabel,
       strategyScores: scores,
-      reason: bestResult.direction === "WAIT"
-        ? `Auto-adapted '${bestLabel}' [${regime}]: No confluence`
-        : `Auto-adapted '${bestLabel}' for ${regime} regime (Fitness: ${scores[bestStrategy] ? scores[bestStrategy].fitness : 0}/100) · ${bestResult.reason || ""}`,
+      reason: sitOut
+        ? `Adaptive regime filter (choppy/squeeze sit-out; current ${regime})`
+        : bestResult.direction === "WAIT"
+          ? `Auto-adapted '${bestLabel}' [${regime}]: No confluence`
+          : `Auto-adapted '${bestLabel}' for ${regime} regime (Fitness: ${scores[bestStrategy] ? scores[bestStrategy].fitness : 0}/100) · ${bestResult.reason || ""}`,
     });
   }
 
@@ -374,7 +395,13 @@
         regimeBonus,
       };
 
-      const effectiveFitness = hasSignal ? rawFitness + 1000 : rawFitness;
+      // v2.6.8: a fired signal is worth a tiebreak-scale bonus, NOT an
+      // absolute +1000 override. The old bias made ANY marginal CALL/PUT
+      // beat EVERY correctly-abstaining strategy, so auto-adaptive actively
+      // selected the most trigger-happy strategy in quiet markets — the
+      // opposite of accuracy-first. Fitness now decides; firing adds a mild
+      // preference (stacked with signalBonus inside rawFitness: 50 total).
+      const effectiveFitness = rawFitness + (hasSignal ? 25 : 0);
       if (effectiveFitness > bestScore) {
         bestScore = effectiveFitness;
         bestStrategy = stratId;
@@ -390,14 +417,23 @@
     const stratObj = STRAT && STRAT[bestStrategy];
     const bestLabel = stratObj ? stratObj.label : bestStrategy;
 
+    const sitOut = ADAPTIVE_SIT_OUT_REGIMES.indexOf(regime) !== -1;
+    if (sitOut && bestResult && bestResult.direction !== "WAIT") {
+      bestResult = Object.assign({}, bestResult, {
+        direction: "WAIT", ready: true, confidence: 0, score: 0,
+      });
+    }
+
     return Object.assign({}, bestResult, {
       adaptive: true,
       selectedStrategy: bestStrategy,
       selectedStrategyLabel: bestLabel,
       strategyScores: scores,
-      reason: bestResult.direction === "WAIT"
-        ? `Auto-adapted '${bestLabel}' [${regime}]: No confluence`
-        : `Auto-adapted '${bestLabel}' for ${regime} regime (Fitness: ${scores[bestStrategy] ? scores[bestStrategy].fitness : 0}/100)`,
+      reason: sitOut
+        ? `Adaptive regime filter (choppy/squeeze sit-out; current ${regime})`
+        : bestResult.direction === "WAIT"
+          ? `Auto-adapted '${bestLabel}' [${regime}]: No confluence`
+          : `Auto-adapted '${bestLabel}' for ${regime} regime (Fitness: ${scores[bestStrategy] ? scores[bestStrategy].fitness : 0}/100)`,
     });
   }
 

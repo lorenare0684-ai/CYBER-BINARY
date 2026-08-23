@@ -680,7 +680,9 @@
       const sel = $("strategy-select");
       if (sel && sel.value !== activeStrategy) sel.value = activeStrategy;
     }
-    if (Array.isArray(state.candles) && state.candles.length) {
+    if (Array.isArray(state.candles) && state.candles.length && state.source !== "demo") {
+      // v2.6.8: demo candles are synthetic — caching them here would let the
+      // asset ranker score assets on fake data. Live extension state only.
       liveCandlesByAsset[activeAsset] = state.candles.slice(-500);
     }
 
