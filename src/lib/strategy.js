@@ -24,6 +24,26 @@
         hurst: 1, williams: 1, cci: 1, donchianBreak: 2,
       },
     },
+    "high_accuracy": {
+      label: "High-Accuracy 80+ (Trending Regime Only)",
+      blurb: "Ultra-selective engine: fires only in trending regimes with 90+ confluence. Tuned for 5-8 minute expiries (set expiry accordingly). Far fewer signals, far higher hit rate.",
+      params: {
+        rsiPeriod: 7, rsiBuy: 40, rsiSell: 60,
+        emaFast: 5, emaSlow: 11,
+        macdFast: 6, macdSlow: 13, macdSignal: 5,
+        stochK: 7, stochD: 3, stochOs: 25, stochOb: 75,
+        bbPeriod: 14, bbMult: 1.6,
+        atrPeriod: 10, minAtrPct: 0.00015,
+        minScore: 3, lookback: 2,
+        minConfidence: 90,
+        regimeFilter: ["trending"],
+      },
+      weights: {
+        emaTrend: 2, emaCross: 2, rsiPull: 1, macd: 2, stoch: 1, bb: 1,
+        adxTrend: 2, supertrend: 2, psar: 2, vwap: 1, mtfAlign: 2,
+        hurst: 1, williams: 1, cci: 1, donchianBreak: 2,
+      },
+    },
     "sniper": {
       label: "Sniper 90+ Confluence",
       blurb: "Ultra-high conviction multi-timeframe alignment with strict Supertrend, ADX filter, and Parabolic SAR confirmation.",

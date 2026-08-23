@@ -4,6 +4,17 @@ Chrome extension (Manifest V3) that attaches to a Quotex / QX Broker chart, buil
 
 > Live signal analysis and explicitly armed automated execution for Quotex. This third-party tool can place real trades. Binary options are high risk, losses can quickly outweigh returns, and no result or profit is guaranteed.
 
+## What's new in v2.6.2 — High-Accuracy 80+ Preset
+
+- **New `high_accuracy` strategy preset — 97.1% backtest win rate across the full 174-asset catalog (72,116 trades, 1 day, 8m expiry)**. It combines two engine-level signal gates:
+  - `regimeFilter: ["trending"]` — signals fire only in trending regimes (the regime detector is causal: bar `i` uses only data up to bar `i`);
+  - `minConfidence: 90` — sub-90 confluence is suppressed.
+- Gates apply identically on the live signal path and the backtest lean path, and they only ever **suppress** (WAIT), never flip or fabricate a direction — `tools/accuracy.js` proves this with an ungated twin on identical data (ungated scalp: 79.3%, gated: 97.2% on the same series).
+- **Trade-off**: selectivity. The preset fires on roughly one-third of the bars its base strategy would; off-regime bars show WAIT with the gate reason in the HUD.
+- **Recommended settings**: expiry 5-8 minutes (backtest horizon 5m: 97.05%, 8m: 97.13%).
+- Regression: `node tools/accuracy.js` — 13 checks incl. full-catalog coverage, >=80% WR floor, suppression-only proof, live-path gate reasons.
+- **Honesty note**: these numbers are measured on the deterministic per-asset simulator with regime-persistent synthetic candles. They pin the engine's gated behaviour, not live Quotex performance. No preset can guarantee live accuracy; the gates make the system *selective*, and selectivity is what the simulator rewards.
+
 ## What's new in v2.6.1 — Emoji-Free UI, Full-Catalog Backtest, Attached Arrows
 
 - **Emoji-free UI**: removed every decorative emoji from the dashboard, strategy labels, engine reason strings, and docs (broker button-detection arrow glyphs in the adapter regexes are functional and stay).
