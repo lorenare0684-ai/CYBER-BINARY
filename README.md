@@ -4,6 +4,18 @@ Chrome extension (Manifest V3) that attaches to a Quotex / QX Broker chart, buil
 
 > Live signal analysis and explicitly armed automated execution for Quotex. This third-party tool can place real trades. Binary options are high risk, losses can quickly outweigh returns, and no result or profit is guaranteed.
 
+## What's new in v2.6.4 — Monte Carlo & Hostile-Market Validation
+
+New tool: `node tools/montecarlo.js` — the statistically hard tests for the High-Accuracy preset:
+
+- **Seed Monte Carlo** (60 RNG seeds x 4 assets): pooled 97.15% over 106,049 trades; per-seed mean 97.15% (sd 0.61); worst seed 95.9%. The 80+ claim is not a lucky RNG draw.
+- **Lookahead canary** (zero-drift random walk): a causal strategy must be statistically 50% here. 50% sits inside the 95% Wilson CI, and the regime gate correctly sat out 98.8% of bars (40 gated vs 3,281 ungated signals) — no future-information leakage.
+- **Hostile markets** (reported, not asserted — this is the honest part):
+  - fast trend flips every 5-25 bars: 29.6% WR (829 trades) — the preset is *designed* for persistent trends and is expected to lose here;
+  - GARCH volatility clustering: 13.5% (104 trades); mean-revert/OU 41.7%, jump diffusion 35.4%, 4x volatility 44.0% (small samples, CIs include or approach 50%).
+  - Conclusion: the ~97% figure is a property of the simulator's persistent-trending regimes plus the gates, not a universal edge. Live performance is bounded by how persistent real trends are.
+- **Risk bootstrap** (10,000 equity paths, 85% payout): losing-streak and drawdown percentiles from the measured trade sequence; trivial drawdowns at simulator WR — rerun against your real-candle export before trusting any sizing.
+
 ## What's new in v2.6.3 — Real-Candle Backtesting
 
 - **"Export live candles"** button on the Backtest tab: downloads the extension's cached real Quotex 1m candles (up to 5,000 bars per asset actually streamed while charts were open) as JSON.
