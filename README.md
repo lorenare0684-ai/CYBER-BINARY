@@ -132,7 +132,7 @@ Closed-bar confluence of (each vote weighted per strategy preset):
 - Hurst exponent — only contributes in trending regimes
 - ATR% floor so dead markets stay `WAIT`
 
-A signal needs a vote score ≥ the strategy's `minScore` and a 2-point lead for one side. The reported confidence is a softmax of the opposing vote scores, optionally shrunk by observed hit rate.
+A signal needs a vote score ≥ the strategy's `minScore`. It normally needs a 2-point lead for one side; in an established directional trend, any positive lead is enough so correlated overbought/oversold oscillators cannot deadlock an otherwise aligned trend signal. The reported confidence is a softmax of the opposing vote scores, optionally shrunk by observed hit rate.
 
 ## Local tools
 

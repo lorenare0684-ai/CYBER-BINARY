@@ -377,6 +377,45 @@ const putSignal = sandbox.self.CYBER_ENGINE.analyze(directionalSeries(-1), { str
 if (!callSignal || callSignal.direction !== "CALL") { console.error("engine CALL coverage failed", callSignal && callSignal.direction); failed++; }
 if (!putSignal || putSignal.direction !== "PUT") { console.error("engine PUT coverage failed", putSignal && putSignal.direction); failed++; }
 
+// A strong trend often has several correlated oscillators briefly voting the
+// other way. A one-point winning margin must not leave the live engine stuck
+// at score/confidence zero in that regime.
+function trendingPullbackSeries() {
+  const out = [];
+  let state = 1;
+  let px = 1;
+  const random = () => {
+    state = (state * 1664525 + 1013904223) >>> 0;
+    return state / 4294967296;
+  };
+  for (let i = 0; i < 260; i++) {
+    const drift = i > 180 ? 0.0005 : 0.00008;
+    let change = drift + (random() - 0.45) * 0.0005;
+    if (i === 259) change = -0.00003;
+    const next = px * (1 + change);
+    const pad = px * (0.00008 + random() * 0.00008);
+    out.push({
+      time: i * 60000,
+      open: px,
+      high: Math.max(px, next) + pad,
+      low: Math.min(px, next) - pad,
+      close: next,
+    });
+    px = next;
+  }
+  return out;
+}
+const trendPullbackSignal = sandbox.self.CYBER_ENGINE.analyze(trendingPullbackSeries(), {
+  strategy: "scalp", lean: false,
+});
+if (!trendPullbackSignal || trendPullbackSignal.regime !== "trending" ||
+    trendPullbackSignal.direction !== "CALL" || trendPullbackSignal.score <= 0 ||
+    trendPullbackSignal.confidence <= 0 || trendPullbackSignal.metrics.callScore !== 4 ||
+    trendPullbackSignal.metrics.putScore !== 3) {
+  console.error("trending one-point vote lead must generate a signal", trendPullbackSignal);
+  failed++;
+}
+
 // Backtest smoke (lean path)
 const r = sandbox.self.CYBER_ENGINE.backtest(candles, { strategy: "confluence", horizon: 3, minBars: 200 });
 if (!r || typeof r.winrate !== "number") { console.error("backtest failed"); failed++; }

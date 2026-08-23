@@ -377,12 +377,18 @@
     // Choppy conditions need two additional independent weight points. The
     // old block documented this veto but did nothing.
     const requiredScore = baseMinScore + (regime === "choppy" ? 2 : 0);
+    // Requiring a full two-point lead in an established directional trend can
+    // deadlock the engine at WAIT: several correlated overbought/oversold
+    // oscillators commonly cast short-lived counter-trend votes together. In
+    // a confirmed trend, let the larger side win by any positive margin while
+    // retaining the stricter lead everywhere else.
+    const requiredLead = regime === "trending" ? 0 : 1;
 
     let direction = "WAIT";
     let score = 0;
-    if (call >= requiredScore && call > put + 1) {
+    if (call >= requiredScore && call > put + requiredLead) {
       direction = "CALL"; score = call;
-    } else if (put >= requiredScore && put > call + 1) {
+    } else if (put >= requiredScore && put > call + requiredLead) {
       direction = "PUT"; score = put;
     }
 
@@ -403,7 +409,7 @@
       regime,
       reason:
         direction === "WAIT"
-          ? "No confluence"
+          ? `No confluence (CALL ${call} · PUT ${put} · need ${requiredScore})`
           : votes.filter((v) => v.dir === direction).map((v) => v.name).join(" · "),
       votes,
       metrics: {
@@ -436,6 +442,7 @@
         callScore: call,
         putScore: put,
         requiredScore,
+        requiredLead,
       },
     };
   }
@@ -571,9 +578,10 @@
     const rawMin = numberValue(cfg.minScore);
     const baseMin = rawMin != null ? Math.max(0, rawMin) : DEFAULTS.minScore;
     const required = baseMin + (regime === "choppy" ? 2 : 0);
+    const requiredLead = regime === "trending" ? 0 : 1;
     let direction = "WAIT", score = 0;
-    if (call >= required && call > put + 1) { direction = "CALL"; score = call; }
-    else if (put >= required && put > call + 1) { direction = "PUT"; score = put; }
+    if (call >= required && call > put + requiredLead) { direction = "CALL"; score = call; }
+    else if (put >= required && put > call + requiredLead) { direction = "PUT"; score = put; }
     let confidence = 0;
     if (direction !== "WAIT") {
       const probs = TA.softmaxProbs(call, put);
