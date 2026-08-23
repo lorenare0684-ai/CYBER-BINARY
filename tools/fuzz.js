@@ -248,6 +248,7 @@ async function asyncProbes() {
   });
   ctrl.setMode("click");
   ctrl.setArmed(true);
+  ctrl.setAccountInfo({ isDemo: true, balance: 1000, currency: "USD" });
   const barTime = Date.now();
   const hostileSignals = [
     null, {},

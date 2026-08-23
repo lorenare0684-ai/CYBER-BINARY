@@ -174,6 +174,14 @@ h2 {
   box-shadow: inset 0 0 45px rgba(0, 229, 255, 0.04), 0 22px 60px rgba(0,0,0,.36);
 }
 .chart-wrap canvas { display: block; width: 100%; height: auto; }
+.account-line {
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  color: #7fd1c8;
+  margin-top: 6px;
+}
+.account-line.live { color: #ff6b6b; font-weight: 700; }
+.account-line.demo { color: #7fd1c8; }
 .demo-badge {
   position: absolute;
   top: 10px;

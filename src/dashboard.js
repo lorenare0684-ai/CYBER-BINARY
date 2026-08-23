@@ -46,6 +46,7 @@
   const recentAutoLogKeys = new Set();
   const recentAutoLogOrder = [];
   const liveCandlesByAsset = Object.create(null);
+  let lastLiveBalance = null; // v2.6.9: { isDemo, balance, currency, at } from extension state
 
   function tfLabel(sec) {
     if (!sec) return "1m";
@@ -686,6 +687,16 @@
       liveCandlesByAsset[activeAsset] = state.candles.slice(-500);
     }
 
+    if (state.balance && typeof state.balance === "object") {
+      const b = state.balance;
+      lastLiveBalance = {
+        isDemo: typeof b.isDemo === "boolean" ? b.isDemo : null,
+        balance: Number(b.balance),
+        currency: typeof b.currency === "string" ? b.currency : "USD",
+        at: Date.now(),
+      };
+      renderAccountLine(lastLiveBalance);
+    }
     const sig = state.signal && typeof state.signal === "object" ? state.signal : {};
     const history = Array.isArray(state.history) ? state.history.filter((h) => h && typeof h === "object").slice(0, 100) : [];
     const dir = sig.direction === "CALL" || sig.direction === "PUT" ? sig.direction : "WAIT";
@@ -879,6 +890,27 @@
     });
   }
 
+  /** v2.6.9: live/demo account readout with balance. Falls back to the
+   * extension state's last balance event when the controller has none. */
+  function renderAccountLine(account) {
+    const el = $("auto-account");
+    if (!el) return;
+    let info = account;
+    if (!info || (info.isDemo == null && info.balance == null)) {
+      const b = lastLiveBalance;
+      if (b) info = { isDemo: b.isDemo, balance: b.balance, currency: b.currency, at: b.at || 0 };
+    }
+    if (!info || (info.isDemo == null && (info.balance == null || !Number.isFinite(Number(info.balance))))) {
+      el.className = "account-line";
+      el.textContent = "Account: unknown — waiting for a balance event";
+      return;
+    }
+    const mode = info.isDemo === false ? "LIVE" : info.isDemo === true ? "DEMO" : "unknown";
+    const bal = Number.isFinite(Number(info.balance)) ? " · " + Number(info.balance).toFixed(2) + " " + (info.currency || "USD") : "";
+    el.className = "account-line " + (info.isDemo === false ? "live" : "demo");
+    el.textContent = "Account: " + mode + bal + (mode === "LIVE" ? " — real money at risk" : "");
+  }
+
   function updateAutoUI(s) {
     const source = s && typeof s === "object" && !Array.isArray(s)
       ? s : (autoState || {});
@@ -905,6 +937,7 @@
       modeSelect.value = mode;
     }
 
+    renderAccountLine(s.account || null);
     $("auto-mode-label").textContent = mode.toUpperCase();
     $("auto-hero").dataset.dir = mode === "click" ? "CALL" : mode === "alerts" ? "WAIT" : "PUT";
     $("auto-reason").textContent = autoState.armed
@@ -1129,6 +1162,15 @@
     bindNumberSetting("loss-cap", "dailyLossCap");
     bindNumberSetting("profit-cap", "dailyProfitCap");
     bindNumberSetting("cooldown", "cooldownBars");
+    bindNumberSetting("stake-percent", "stakePercent");
+    bindNumberSetting("min-balance", "minBalance");
+    for (const pair of [["account-mode", "accountMode"], ["stake-mode", "stakeMode"]]) {
+      const el = $(pair[0]);
+      if (!el) continue;
+      el.addEventListener("change", () => {
+        setSettings({ [pair[1]]: el.value }).then((saved) => { el.value = saved[pair[1]]; }).catch(() => {});
+      });
+    }
     const bindBooleanSetting = (id, key) => {
       const el = $(id);
       if (!el) return;
@@ -1177,6 +1219,10 @@
       $("loss-cap").value = s.dailyLossCap != null ? s.dailyLossCap : 30;
       $("profit-cap").value = s.dailyProfitCap != null ? s.dailyProfitCap : 0;
       $("cooldown").value = s.cooldownBars != null ? s.cooldownBars : 2;
+      $("account-mode").value = s.accountMode === "live" || s.accountMode === "any" ? s.accountMode : "demo";
+      $("stake-mode").value = s.stakeMode === "percent" ? "percent" : "fixed";
+      $("stake-percent").value = s.stakePercent != null ? s.stakePercent : 1;
+      $("min-balance").value = s.minBalance != null ? s.minBalance : 0;
       $("notify-sound").checked = s.notifySound !== false;
       $("notify-desktop").checked = !!s.notifyDesktop;
       if ($("auto-high-accuracy")) $("auto-high-accuracy").checked = s.autoHighAccuracy !== false;

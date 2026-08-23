@@ -778,6 +778,20 @@
     return QUOTEX.parseInstruments(value).slice(0, 2000);
   }
 
+  /** v2.6.9: push the detected account (demo/live + balance) into the
+   * auto-trade controller so the account-mode gate and percent staking use
+   * live broker facts, never assumptions. */
+  function syncAutoAccount() {
+    if (!autoController || typeof autoController.setAccountInfo !== "function" || !lastBalance) return;
+    try {
+      autoController.setAccountInfo({
+        isDemo: typeof lastBalance.isDemo === "boolean" ? lastBalance.isDemo : null,
+        balance: Number(lastBalance.balance),
+        currency: lastBalance.currency,
+      });
+    } catch (_) {}
+  }
+
   function normalizeBalance(value) {
     return QUOTEX && typeof QUOTEX.parseBalance === "function" ? QUOTEX.parseBalance(value) : null;
   }
@@ -840,6 +854,7 @@
     if (balance) {
       lastBalance = balance;
       try { chrome.runtime.sendMessage({ type: "CYBER_QUOTEX_BALANCE", payload: lastBalance }).catch(() => {}); } catch (_) {}
+      syncAutoAccount();
     }
     if (Array.isArray(snap.orders)) {
       lastOrders = snap.orders.map(normalizeOrderEvent).filter(Boolean).slice(0, 50);
@@ -1160,7 +1175,8 @@
     const qstat = lastQuotexStatus && typeof lastQuotexStatus.state === "string"
       ? "· qx:" + lastQuotexStatus.state.slice(0, 32) : "";
     const balanceNumber = Number(lastBalance && lastBalance.balance);
-    const bal = Number.isFinite(balanceNumber) ? "· bal " + balanceNumber.toFixed(2) : "";
+    const modeTag = lastBalance && lastBalance.isDemo === false ? " LIVE" : (lastBalance && lastBalance.isDemo === true ? " DEMO" : "");
+    const bal = Number.isFinite(balanceNumber) ? "\u00b7 bal " + balanceNumber.toFixed(2) + modeTag : "";
     const metaText =
       (sig && sig.reason ? String(sig.reason).slice(0, 256) + " · " : "") +
       "WR " + wrTxt + " · " +
@@ -1371,6 +1387,7 @@
         if (!balance) break;
         lastBalance = balance;
         try { chrome.runtime.sendMessage({ type: "CYBER_QUOTEX_BALANCE", payload: balance }).catch(() => {}); } catch (_) {}
+        syncAutoAccount();
         break;
       }
       case "instruments": {
@@ -1659,7 +1676,11 @@
     }
     // This executor is automation-only; use the freshly loaded settings so a
     // stake/expiry change during eligibility cannot submit stale values.
-    const stake = Number(s.stake);
+    // v2.6.9: args.stake carries the controller's decision (e.g. a
+    // percent-of-balance computation from seconds ago); prefer it when valid,
+    // otherwise fall back to the freshly loaded settings stake.
+    const argsStake = Number(args.stake);
+    const stake = Number.isFinite(argsStake) && argsStake > 0 && argsStake <= 1000000 ? argsStake : Number(s.stake);
     const expiry = Number(s.expiry);
     if (!Number.isFinite(stake) || stake <= 0 || stake > 1000000) {
       return { ok: false, confirmed: false, error: "stake must be between 0 and 1,000,000" };

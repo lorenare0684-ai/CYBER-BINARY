@@ -4,6 +4,16 @@ Chrome extension (Manifest V3) that attaches to a Quotex / QX Broker chart, buil
 
 > Live signal analysis and explicitly armed automated execution for Quotex. This third-party tool can place real trades. Binary options are high risk, losses can quickly outweigh returns, and no result or profit is guaranteed.
 
+## What's new in v2.6.9 — Auto Live/Demo Account Detection
+
+The auto-trader now knows WHICH account it is touching and how much money is in it:
+
+- **Account mode gate** (default: **Demo only**): every Quotex balance event carries the account type; the controller blocks execution on the wrong account type — a LIVE balance can never be traded until you explicitly set Account to Live/Any, and an unidentified account (no balance event yet) is blocked entirely. Each block names its reason in the automation log.
+- **Balance detection + percent staking**: new Stake mode "% of balance" sizes each order from the live detected balance (0.1–10% per trade, clamped to funds) instead of a fixed amount. The dashboard, HUD and auto panel show `DEMO/LIVE · balance · currency`; LIVE is flagged red with a real-money warning.
+- **Minimum-balance stop**: auto-trade halts when the detected balance drops below your floor (0 disables).
+- Executor now honours the controller's computed stake (so percent sizing survives the fresh-settings reload), and settings persist the four new keys (`accountMode`, `stakeMode`, `stakePercent`, `minBalance`).
+- Tests: 5 new auto-trade probes (demo-default blocks LIVE, any-mode override, 2% of 1000 sends 20, min-balance stop, unknown-account safety) plus fuzzed ledger fixtures.
+
 ## What's new in v2.6.8 — Auto-Adaptive & Best-Asset Fixes
 
 **Auto-adaptive router:**
