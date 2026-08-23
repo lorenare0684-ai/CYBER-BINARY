@@ -43,8 +43,32 @@ const HOUR = 36e5, DAY = 24 * HOUR;
 // Timer ids must be truthy (a falsy id silently disabled flush-on-load).
 let nextTimerId = 1;
 const storageMap = {};
+function applyStoragePatch(patch) {
+  const key = "cyberBinaryV2";
+  const state = storageMap[key] && typeof storageMap[key] === "object"
+    ? JSON.parse(JSON.stringify(storageMap[key])) : {};
+  for (const op of patch || []) {
+    let parent = state;
+    for (let i = 0; i < op.path.length - 1; i++) {
+      const part = op.path[i];
+      if (!parent[part] || typeof parent[part] !== "object" || Array.isArray(parent[part])) parent[part] = {};
+      parent = parent[part];
+    }
+    const leaf = op.path[op.path.length - 1];
+    if (op.remove) delete parent[leaf];
+    else parent[leaf] = JSON.parse(JSON.stringify(op.value));
+  }
+  storageMap[key] = state;
+}
 const chromeStub = {
-  runtime: { id: "t", getURL: (p) => p, sendMessage: () => Promise.resolve({ ok: true }), onMessage: { addListener: () => {} }, lastError: null },
+  runtime: {
+    id: "t", getURL: (p) => p,
+    sendMessage: (msg) => {
+      if (msg && msg.type === "CYBER_STORAGE_PATCH") applyStoragePatch(msg.patch);
+      return Promise.resolve({ ok: true });
+    },
+    onMessage: { addListener: () => {} }, lastError: null,
+  },
   storage: {
     local: {
       get: (key, cb) => {
@@ -54,7 +78,11 @@ const chromeStub = {
         else Object.assign(out, storageMap);
         if (cb) cb(out);
       },
-      set: (obj, cb) => { Object.assign(storageMap, obj); if (cb) cb(); },
+      set: (obj, cb) => {
+        Object.assign(storageMap, obj);
+        if (cb) cb();
+        return Promise.resolve();
+      },
     },
     session: { get: (k, cb) => cb && cb({}), set: () => Promise.resolve() },
   },
@@ -148,6 +176,19 @@ async function dailyResetTest() {
   check("byStrategy updated", three.byStrategy.confluence.w === 2 && three.byStrategy.confluence.l === 1);
   check("byAsset updated", three.byAsset.EURUSD_otc.w === 2 && three.byAsset.EURUSD_otc.l === 1);
   check("byRegime updated", three.byRegime.trending.w === 2 && three.byRegime.trending.l === 1);
+
+  const entryTime = FakeDate.now();
+  const detailed = await STORE.recordTrade({
+    won: true, payout: 0.85, asset: "GBPUSD", dir: "PUT", strategy: "trend",
+    regime: "trending", confidence: 77, entry: 1.25, exit: 1.24,
+    entryTime, expiryTime: entryTime + 180000, exitTime: entryTime + 180500,
+    expiryMinutes: 3,
+  });
+  const h = detailed.history[0];
+  check("trade history keeps entry/expiry/exit times and prices",
+    h.entryTime === entryTime && h.expiryTime === entryTime + 180000 &&
+    h.exitTime === entryTime + 180500 && h.entryPrice === 1.25 && h.exitPrice === 1.24 && h.expiryMinutes === 3,
+    JSON.stringify(h));
 }
 
 // ---------- 3. quotex asString big-frame decode ----------
@@ -196,8 +237,10 @@ function feedTest() {
   feed.ingest(1.001, 1000060);      // still A
   feed.ingest(1.002, 1020000);      // bar B (bucket 1020000) closes A
   const before = feed.series().length; // 2 (A closed + B live)
+  const beforePrice = feed.lastPrice();
   const stale = feed.ingest(1.05, 1010000); // bucket 960000 < B's 1020000 → stale
   check("stale tick (older bucket) dropped", stale === null, "got=" + JSON.stringify(stale && stale.current));
+  check("stale tick cannot overwrite last price", feed.lastPrice() === beforePrice, beforePrice + "→" + feed.lastPrice());
   check("series length unchanged after stale tick", feed.series().length === before, before + "→" + feed.series().length);
   const times = feed.series().map((b) => b.time);
   const sorted = times.every((t, i) => i === 0 || t > times[i - 1]);
@@ -223,9 +266,31 @@ function feedTest() {
   const arr = [];
   for (let i = 0; i < 10; i++) arr.push({ time: 100000 + i * 60, open: 1, high: 1.01, low: 0.99, close: 1 });
   const s3 = f3.setSeries(arr);
-  check("setSeries caps to max+live without evicting newest",
+  check("setSeries caps to max including live without evicting newest",
     s3.length === 3 && s3[2].time === (100000 + 9 * 60) * 1000,
     "len=" + s3.length + " last=" + s3[s3.length - 1].time);
+  const cappedMerge = FEED.createFeed({ tfMs: 60000, max: 3 });
+  cappedMerge.mergeCandles(arr);
+  check("mergeCandles cap includes the current bar", cappedMerge.series().length === 3);
+  const cappedSeed = FEED.createFeed({ tfMs: 60000, max: 3 });
+  cappedSeed.seedHistory(3, 1);
+  check("seedHistory cap includes the current bar", cappedSeed.series().length === 3);
+
+  let malformedFeedSafe = true;
+  try {
+    const malformed = FEED.createFeed({ tfMs: Symbol("tf"), max: Symbol("max") });
+    malformedFeedSafe = malformed.ingest(Symbol("price"), Symbol("time")) === null &&
+      malformed.mergeCandles([{ time: Symbol("time"), open: Symbol("open"), close: 1 }]).closed === null &&
+      malformed.forceClose(Symbol("time")) === null && malformed.pruneBefore(Symbol("time")) === 0;
+    malformed.seedHistory(Symbol("count"), Symbol("price"));
+    const synthetic = FEED.syntheticSeries({
+      id: "MALFORMED", basePrice: Symbol("base"), vol: Symbol("vol"),
+      drift: Symbol("drift"), jumpRate: Symbol("jump"),
+    }, 3, { seed: Symbol("seed"), regimePeriod: Symbol("regime"), startTime: Symbol("start") });
+    malformedFeedSafe = malformedFeedSafe && synthetic.length === 3 && synthetic.every((bar) =>
+      Number.isFinite(bar.open) && Number.isFinite(bar.high) && Number.isFinite(bar.low) && Number.isFinite(bar.close));
+  } catch (_) { malformedFeedSafe = false; }
+  check("symbol-valued feed and synthetic inputs fail closed", malformedFeedSafe);
 }
 
 // ---------- 6. calibration adjust ----------
@@ -238,12 +303,53 @@ function calibrationTest() {
   check("calibrationAdjust pulls confidence toward observed 0%", adjHot < 80, "adj=" + adjHot);
 }
 
+async function storageSanitizeTest() {
+  await STORE.setCandles("SAN", [
+    { time: 1700000120, open: 1.2, high: 1.3, low: 1.1, close: 1.25, extra: { huge: true } },
+    { time: 1700000000, open: 1, high: 1.1, low: 0.9, close: 1.05 },
+    { time: 1700000000, open: 2, high: 2.1, low: 1.9, close: 2.05 },
+  ], 3);
+  const candles = await STORE.getCandles("SAN");
+  check("stored candles are sorted, deduplicated, and exact-shaped",
+    candles.length === 2 && candles[0].time < candles[1].time && candles[0].open === 2 &&
+    !Object.prototype.hasOwnProperty.call(candles[1], "extra"), JSON.stringify(candles));
+
+  const protectedTrade = await STORE.recordTrade({
+    won: true, asset: "toString", dir: "CALL", strategy: "valueOf", regime: "constructor",
+    entry: 1, exit: 1.1,
+  });
+  check("prototype-collision breakdown keys are rejected",
+    protectedTrade.history[0].asset === "UNKNOWN" && protectedTrade.history[0].strategy === "confluence");
+
+  storageMap[KEY].automation = Object.assign({}, storageMap[KEY].automation, { unknownBlob: { nested: "discard" } });
+  const automation = await STORE.getAutomation();
+  check("unknown persisted automation fields are discarded", !Object.prototype.hasOwnProperty.call(automation, "unknownBlob"));
+
+  STORE.DEFAULTS.settings.strategy = "mutated";
+  await STORE.reset();
+  check("exported defaults cannot mutate internal reset defaults", (await STORE.getSettings()).strategy === "confluence");
+}
+
+async function resetScopeTest() {
+  await STORE.setAutomation({ tradesToday: 7 });
+  const before = await STORE.getSettings();
+  await STORE.resetStats();
+  const afterSettings = await STORE.getSettings();
+  const afterAutomation = await STORE.getAutomation();
+  const afterStats = await STORE.getStats();
+  check("history-only reset preserves user settings", afterSettings.stake === before.stake && afterSettings.autoMode === before.autoMode);
+  check("history-only reset preserves automation safety ledger", afterAutomation.tradesToday === 7);
+  check("history-only reset clears stats", afterStats.wins === 0 && afterStats.losses === 0 && afterStats.history.length === 0);
+}
+
 async function main() {
   await raceTest();
   await dailyResetTest();
   asStringTest();
   feedTest();
   calibrationTest();
+  await resetScopeTest();
+  await storageSanitizeTest();
   console.log(failed ? "\n" + failed + " FAILURE(S)" : "\nall bug-audit tests pass");
   process.exit(failed ? 1 : 0);
 }

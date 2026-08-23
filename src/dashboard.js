@@ -18,7 +18,9 @@
 
   let activeAsset = "EURUSD";
   let activeStrategy = "confluence";
-  let lastKey = "";
+  let lastDetailsKey = "";
+  let lastHistoryKey = "";
+  let lastChartKey = "";
   let liveFromExt = false;
   let lastExtTs = 0;
   let autoState = null;
@@ -33,6 +35,13 @@
   let qxInstruments = [];
   let qxBalance = null;
   let qxOrders = [];
+  let pendingLiveState = null;
+  let liveRenderQueued = false;
+  let demoTimer = null;
+  let resizeQueued = false;
+  let activeTab = "live";
+  let assetsRenderToken = 0;
+  let historyRenderToken = 0;
 
   function tfLabel(sec) {
     if (!sec) return "1m";
@@ -44,34 +53,88 @@
 
   function $(id) { return document.getElementById(id); }
   function $all(sel) { return document.querySelectorAll(sel); }
+  function esc(value) {
+    return String(value == null ? "" : value).replace(/[&<>"']/g, (ch) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+    })[ch]);
+  }
+  function finite(value, fallback) {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : (fallback == null ? null : fallback);
+  }
+  function fmtMoney(value) {
+    const n = finite(value, null);
+    return n == null ? "" : (n > 0 ? "+" : "") + n.toFixed(2);
+  }
+  function isoTime(value) {
+    if (value == null || value === "") return "";
+    const d = new Date(value);
+    return Number.isFinite(d.getTime()) ? d.toISOString() : "";
+  }
+  function csvCell(value) {
+    if (value == null) return "";
+    let s = String(value);
+    // Prevent spreadsheet formula execution from broker-controlled labels.
+    if (/^[=+\-@]/.test(s) && !/^-?\d+(?:\.\d+)?$/.test(s)) s = "'" + s;
+    s = s.replace(/"/g, '""');
+    return /[",\n]/.test(s) ? '"' + s + '"' : s;
+  }
 
   function fmtPct(n) {
-    if (n == null || Number.isNaN(n)) return "—";
-    return Number(n).toFixed(1) + "%";
+    const x = finite(n, null);
+    return x == null ? "—" : x.toFixed(1) + "%";
   }
   function fmtPx(n) {
-    if (n == null || Number.isNaN(n)) return "—";
-    const x = Number(n);
-    return x >= 20 ? x.toFixed(2) : x.toFixed(5);
+    const x = finite(n, null);
+    if (x == null) return "—";
+    return Math.abs(x) >= 20 ? x.toFixed(2) : x.toFixed(5);
   }
   function fmtTime(ts) {
-    if (!ts) return "—";
+    if (ts == null || ts === "") return "—";
     const d = new Date(ts);
-    return d.toLocaleTimeString();
+    return Number.isFinite(d.getTime()) ? d.toLocaleTimeString() : "—";
   }
   function fmtDate(ts) {
-    if (!ts) return "—";
-    return new Date(ts).toLocaleString();
+    if (ts == null || ts === "") return "—";
+    const d = new Date(ts);
+    return Number.isFinite(d.getTime()) ? d.toLocaleString() : "—";
+  }
+  function fmtDuration(minutes, entryTime, expiryTime) {
+    let mins = Number(minutes);
+    if (!Number.isFinite(mins) && entryTime != null && expiryTime != null) mins = (Number(expiryTime) - Number(entryTime)) / 60000;
+    if (!Number.isFinite(mins) || mins <= 0) return "—";
+    return (Math.round(mins * 10) / 10) + "m";
+  }
+  function tradeOutcome(h) {
+    if (!h || typeof h !== "object") return { label: "UNKNOWN", cls: "" };
+    const hasWon = Object.prototype.hasOwnProperty.call(h, "won");
+    if (h.draw === true || (hasWon && h.won === null)) return { label: "DRAW", cls: "" };
+    if (h.won === true) return { label: "WIN", cls: "win" };
+    if (h.won === false) return { label: "LOSS", cls: "loss" };
+    return { label: "UNKNOWN", cls: "" };
+  }
+  function tradeTimeline(h, includeExit) {
+    h = h || {};
+    const entryTime = h.entryTime != null ? h.entryTime : h.at;
+    const expiryTime = h.expiryTime != null ? h.expiryTime : h.expireAt;
+    const exitTime = h.exitTime != null ? h.exitTime : (includeExit ? h.at : null);
+    const entry = h.entryPrice != null ? h.entryPrice : h.entry;
+    const exit = h.exitPrice != null ? h.exitPrice : h.exit;
+    let text = "Entry " + fmtTime(entryTime) + " @ " + fmtPx(entry);
+    text += " · Expiry " + fmtTime(expiryTime) + " (" + fmtDuration(h.expiryMinutes, entryTime, expiryTime) + ")";
+    if (includeExit || exit != null) text += " · Exit " + fmtTime(exitTime) + " @ " + fmtPx(exit);
+    return text;
   }
 
   function meter(label, value, min, max, side) {
     const span = max - min || 1;
-    const pct = Math.max(0, Math.min(100, ((value - min) / span) * 100));
+    const n = finite(value, null);
+    const pct = n == null ? 0 : Math.max(0, Math.min(100, ((n - min) / span) * 100));
     const cls = side ? "bar " + side : "bar";
     return (
-      '<div class="meter"><span>' + label + '</span>' +
+      '<div class="meter"><span>' + esc(label) + '</span>' +
       '<div class="' + cls + '"><i style="width:' + pct.toFixed(1) + '%"></i></div>' +
-      '<span>' + (value == null || Number.isNaN(value) ? "—" : Number(value).toFixed(1)) + '</span></div>'
+      '<span>' + (n == null ? "—" : n.toFixed(1)) + '</span></div>'
     );
   }
 
@@ -79,23 +142,30 @@
     if (!canvas) return;
     const o = opts || {};
     const parent = canvas.parentElement;
-    const w = Math.max(280, parent.clientWidth);
+    const parentWidth = finite(parent && parent.clientWidth, 0);
+    const viewportWidth = finite(window.innerWidth, 480);
+    const w = Math.max(180, Math.min(4096, parentWidth || viewportWidth));
     const useMacd = o.macd !== false;
     const priceH = Math.max(92, Math.round(w * 0.24));
     const macdH = useMacd ? Math.max(52, Math.round(w * 0.14)) : 0;
     const timeAxisH = 18;
     const h = priceH + macdH + timeAxisH;
-    const dpr = window.devicePixelRatio || 1;
-    canvas.width = Math.floor(w * dpr);
-    canvas.height = Math.floor(h * dpr);
-    canvas.style.width = w + "px";
-    canvas.style.height = h + "px";
+    const rawDpr = finite(window.devicePixelRatio, 1);
+    // Two physical pixels per CSS pixel are visually sharp while avoiding
+    // huge 4× backing buffers that made every live redraw expensive.
+    const dpr = Math.max(1, Math.min(2, rawDpr));
+    const pixelW = Math.floor(w * dpr), pixelH = Math.floor(h * dpr);
+    if (canvas.width !== pixelW) canvas.width = pixelW;
+    if (canvas.height !== pixelH) canvas.height = pixelH;
+    if (canvas.style.width !== w + "px") canvas.style.width = w + "px";
+    if (canvas.style.height !== h + "px") canvas.style.height = h + "px";
     const ctx = canvas.getContext("2d");
+    if (!ctx) return;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, w, h);
     ctx.fillStyle = o.bg || "#0c1422";
     ctx.fillRect(0, 0, w, h);
-    if (!candles || candles.length < 2) {
+    if (!Array.isArray(candles) || candles.length < 2) {
       ctx.fillStyle = "rgba(255,255,255,0.45)";
       ctx.font = "11px system-ui, sans-serif";
       ctx.textAlign = "center";
@@ -104,8 +174,16 @@
     }
     if (o.equity) {
       // Equity curve: simple line
-      const eq = candles;
-      let eqLo = -Math.max(1, Math.abs(eq[0].equity || 0));
+      const eq = candles.map((point) => ({ equity: finite(point && point.equity, null) }))
+        .filter((point) => point.equity != null);
+      if (eq.length < 2) {
+        ctx.fillStyle = "rgba(255,255,255,0.45)";
+        ctx.font = "11px system-ui, sans-serif";
+        ctx.textAlign = "center";
+        ctx.fillText("Waiting for valid equity data…", w / 2, h / 2);
+        return;
+      }
+      let eqLo = -Math.max(1, Math.abs(eq[0].equity));
       let eqHi = Math.max(1, Math.abs(eq[0].equity || 0));
       for (let i = 0; i < eq.length; i++) {
         if (eq[i].equity < eqLo) eqLo = eq[i].equity;
@@ -135,13 +213,45 @@
       ctx.fill();
       ctx.fillStyle = "rgba(255,255,255,0.45)";
       ctx.font = "9px system-ui, sans-serif";
-      ctx.fillText("Equity · " + eq.length + " trades", 8, 12);
+      ctx.fillText("Equity · " + eq.length + " " + (o.equityLabel || "points"), 8, 12);
       return;
     }
     // Chart util: y-map for the price pane.
     const padL = 8, padR = 54;
     const plotW = w - padL - padR;
-    const view = candles.slice(-(o.bars || 100));
+    // Broker batches can arrive newest-first, overlap, or briefly contain an
+    // incomplete malformed row. Normalize again at the render boundary so
+    // candle order/wicks are always correct even during incremental updates.
+    const byTime = new Map();
+    for (const raw of candles) {
+      if (!raw) continue;
+      let time = Number(raw.time);
+      const open = Number(raw.open), close = Number(raw.close);
+      if (!Number.isFinite(time) || !Number.isFinite(open) || !Number.isFinite(close) ||
+          open <= 0 || close <= 0 || open > 1e100 || close > 1e100) continue;
+      while (Math.abs(time) >= 1e14) time /= 1000;
+      if (Math.abs(time) < 1e11) time *= 1000;
+      time = Math.floor(time);
+      if (!Number.isFinite(time) || time <= 0 || time > 8640000000000000) continue;
+      const rawHigh = Number(raw.high), rawLow = Number(raw.low);
+      const validHigh = Number.isFinite(rawHigh) && rawHigh > 0 && rawHigh <= 1e100 ? rawHigh : open;
+      const validLow = Number.isFinite(rawLow) && rawLow > 0 && rawLow <= 1e100 ? rawLow : close;
+      const high = Math.max(validHigh, validLow, open, close);
+      const low = Math.min(validHigh, validLow, open, close);
+      const rawVolume = Number(raw.volume);
+      byTime.set(time, { time, open, high, low, close, volume: Number.isFinite(rawVolume) && rawVolume >= 0 ? Math.min(Number.MAX_VALUE, rawVolume) : 0 });
+    }
+    const normalized = Array.from(byTime.values()).sort((a, b) => a.time - b.time);
+    const requestedBars = Math.floor(Number(o.bars));
+    const barCount = Number.isFinite(requestedBars) && requestedBars >= 2 ? Math.min(500, requestedBars) : 100;
+    const view = normalized.slice(-barCount);
+    if (view.length < 2) {
+      ctx.fillStyle = "rgba(255,255,255,0.45)";
+      ctx.font = "11px system-ui, sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText("Waiting for valid broker candles…", w / 2, h / 2);
+      return;
+    }
     let lo = Infinity, hi = -Infinity;
     for (let i = 0; i < view.length; i++) {
       lo = Math.min(lo, view[i].low);
@@ -150,7 +260,8 @@
     const pad = (hi - lo) * 0.08 || 0.0001;
     lo -= pad; hi += pad;
     const yPrice = (p) => priceH - ((p - lo) / (hi - lo)) * (priceH - 10) - 5;
-    const xFor = (i) => padL + (i / Math.max(1, view.length - 1)) * plotW;
+    const bw = plotW / view.length;
+    const xFor = (i) => padL + (i + 0.5) * bw;
 
     // Grid + right-side price axis
     ctx.strokeStyle = "rgba(255,255,255,0.07)";
@@ -167,7 +278,6 @@
     }
 
     // Candles + EMA overlays
-    const bw = plotW / view.length;
     let emaFast = null, emaSlow = null;
     if (self.CYBER_TA) {
       const closes = view.map((c) => c.close);
@@ -176,7 +286,7 @@
     }
     for (let i = 0; i < view.length; i++) {
       const c = view[i];
-      const x = padL + i * bw + bw / 2;
+      const x = xFor(i);
       const yH = yPrice(c.high), yL = yPrice(c.low);
       const yO = yPrice(c.open), yC = yPrice(c.close);
       const up = c.close >= c.open;
@@ -207,21 +317,36 @@
     // v2.3.3: non-repainting signal arrows. Anchors are fixed (bar time +
     // price); each arrow is drawn at its anchor's bar slot, so it never
     // moves as later candles arrive.
-    if (o.markers && o.markers.length) {
+    if (Array.isArray(o.markers) && o.markers.length) {
       for (let mi = 0; mi < o.markers.length; mi++) {
         const mk = o.markers[mi];
-        if (!mk || mk.time == null || mk.price == null) continue;
+        if (!mk || mk.time == null || mk.price == null || (mk.dir !== "CALL" && mk.dir !== "PUT")) continue;
+        let markerTime = Number(mk.time), markerPrice = Number(mk.price);
+        if (!Number.isFinite(markerTime) || !Number.isFinite(markerPrice) || markerPrice <= 0 || markerPrice > 1e100) continue;
+        while (Math.abs(markerTime) >= 1e14) markerTime /= 1000;
+        if (Math.abs(markerTime) < 1e11) markerTime *= 1000;
+        markerTime = Math.floor(markerTime);
+        if (markerTime <= 0 || markerTime > 8640000000000000) continue;
         // find the bar index for this marker's time (times are ascending)
         let idx = -1;
         let lo2 = 0, hi2 = view.length - 1;
         while (lo2 <= hi2) {
           const mid = (lo2 + hi2) >> 1;
-          if (view[mid].time === mk.time) { idx = mid; break; }
-          if (view[mid].time < mk.time) lo2 = mid + 1; else hi2 = mid - 1;
+          if (view[mid].time === markerTime) { idx = mid; break; }
+          if (view[mid].time < markerTime) lo2 = mid + 1; else hi2 = mid - 1;
         }
-        if (idx < 0) continue;
-        const mx = padL + idx * bw + bw / 2;
-        const my = yPrice(mk.price);
+        if (idx < 0) {
+          const insertion = lo2;
+          const left = insertion > 0 ? insertion - 1 : -1;
+          const right = insertion < view.length ? insertion : -1;
+          if (left >= 0 && right >= 0) idx = markerTime - view[left].time <= view[right].time - markerTime ? left : right;
+          else idx = left >= 0 ? left : right;
+          const typicalGap = view.length > 1 ? Math.max(1, view[view.length - 1].time - view[view.length - 2].time) : 60000;
+          if (idx < 0 || Math.abs(view[idx].time - markerTime) > typicalGap) continue;
+        }
+        const mx = xFor(idx);
+        const my = yPrice(markerPrice);
+        if (!Number.isFinite(my) || my < -12 || my > priceH + 12) continue;
         const s = 7;
         ctx.fillStyle = mk.dir === "PUT" ? "#ff5d7a" : "#3dff9a";
         ctx.beginPath();
@@ -282,7 +407,7 @@
       const mw = plotW / view.length;
       for (let i = 0; i < m.hist.length; i++) {
         if (m.hist[i] == null) continue;
-        const x = padL + i * mw + mw / 2;
+        const x = xFor(i);
         const v = m.hist[i];
         ctx.fillStyle = v >= 0 ? "rgba(61,255,154,0.85)" : "rgba(255,93,122,0.85)";
         ctx.fillRect(x - Math.max(1, mw * 0.28), Math.min(y0, yMacd(v)), Math.max(2, mw * 0.56), Math.max(1, Math.abs(y0 - yMacd(v))));
@@ -297,7 +422,7 @@
         let started = false;
         for (let i = 0; i < arr.length; i++) {
           if (arr[i] == null) continue;
-          const x = padL + i * mw + mw / 2;
+          const x = xFor(i);
           const y = yMacd(arr[i]);
           if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
         }
@@ -319,9 +444,14 @@
 
   /* ---------- tab routing ---------- */
   function activateTab(name) {
+    if (typeof name !== "string" || !Array.from($all(".tab-pane")).some((p) => p.dataset.pane === name)) return;
+    activeTab = name;
+    if (name !== "assets") assetsRenderToken++;
+    if (name !== "history") historyRenderToken++;
     $all(".tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === name));
     $all(".tab-pane").forEach((p) => p.classList.toggle("active", p.dataset.pane === name));
     if (name === "assets") refreshAssetsTab();
+    if (name === "history") refreshHistoryTab();
     if (name === "settings") refreshSettingsTab();
     if (name === "instruments") refreshInstrumentsTab();
     if (name === "backtest") {} // lazy
@@ -387,49 +517,135 @@
   }
 
   /* ---------- live rendering ---------- */
+  function jsonKey(value) {
+    try { return JSON.stringify(value); } catch (_) { return ""; }
+  }
+
+  function normalizeOrderEvent(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value) || !QUOTEX) return null;
+    const kind = value.kind === "opened" || value.kind === "closed" ? value.kind : null;
+    const source = value.data && typeof value.data === "object" && !Array.isArray(value.data) ? value.data : null;
+    if (!kind || !source) return null;
+    const data = kind === "opened" ? QUOTEX.parseOrderOpened(source) : QUOTEX.parseOrderClosed(source);
+    return data ? { kind, data } : null;
+  }
+
+  function orderKey(order) {
+    const d = order && order.data || {};
+    const identity = d.id || d.requestId || "";
+    const at = d.openTime || d.closeTime || "";
+    return identity || at
+      ? String(order && order.kind || "") + ":" + identity + ":" + at
+      : String(order && order.kind || "") + ":" + jsonKey(d);
+  }
+
+  function mergeOrders(values) {
+    const seen = new Set();
+    const out = [];
+    for (const value of Array.isArray(values) ? values : []) {
+      const order = normalizeOrderEvent(value);
+      if (!order) continue;
+      const key = orderKey(order);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(order);
+      if (out.length >= 50) break;
+    }
+    return out;
+  }
+
+  function chartStateKey(candles, period, markers) {
+    if (!Array.isArray(candles)) return "";
+    // Incremental FNV-1a avoids repeatedly concatenating a very large key
+    // string (candles + markers) on every live-state push.
+    let hash = 2166136261;
+    const mix = (value) => {
+      const s = String(value == null ? "" : value);
+      for (let i = 0; i < s.length; i++) hash = Math.imul(hash ^ s.charCodeAt(i), 16777619);
+      hash = Math.imul(hash ^ 124, 16777619);
+    };
+    mix(period || 60);
+    mix(candles.length);
+    for (let i = 0; i < candles.length; i++) {
+      const c = candles[i] || {};
+      mix(c.time); mix(c.open); mix(c.high); mix(c.low); mix(c.close);
+    }
+    const safeMarkers = Array.isArray(markers) ? markers : [];
+    mix(safeMarkers.length);
+    for (let i = 0; i < safeMarkers.length; i++) {
+      const m = safeMarkers[i] || {};
+      mix(m.time); mix(m.price); mix(m.dir);
+    }
+    return String(hash >>> 0) + "|" + candles.length + "|" + safeMarkers.length;
+  }
+
   function renderLive(state) {
+    if (!state || typeof state !== "object" || Array.isArray(state)) return;
     // v2.1: surface the platform state if the content script attached it.
-    if (state && state.quotex) {
-      if (state.quotex.status) qxStatus = state.quotex.status;
-      if (state.quotex.balance) qxBalance = state.quotex.balance;
-      if (Array.isArray(state.quotex.lastOrders) && state.quotex.lastOrders.length) {
-        qxOrders = state.quotex.lastOrders.concat(qxOrders).slice(0, 50);
+    if (state && state.quotex && typeof state.quotex === "object" && !Array.isArray(state.quotex)) {
+      if (state.quotex.status && typeof state.quotex.status === "object" && !Array.isArray(state.quotex.status)) {
+        qxStatus = {
+          state: typeof state.quotex.status.state === "string" ? state.quotex.status.state.slice(0, 64) : "unknown",
+          url: state.quotex.status.url == null ? null : String(state.quotex.status.url).slice(0, 256),
+        };
+      }
+      if (state.quotex.balance) qxBalance = QUOTEX ? QUOTEX.parseBalance(state.quotex.balance) : null;
+      if (Array.isArray(state.quotex.lastOrders)) {
+        qxOrders = mergeOrders(state.quotex.lastOrders.concat(qxOrders));
       }
     }
     paintQuotexPill();
 
     $("link-state").textContent = state.attached
-      ? "Live · " + (state.source || "chart")
+      ? (state.primary === false ? "Secondary chart" : "Main · " + (state.source || "chart"))
       : "Demo feed";
     $("link-state").className = "pill " + (state.attached ? "ok" : "dim");
 
     if (state.asset) $("asset").textContent = state.asset;
     if (state.price != null) $("price").textContent = fmtPx(state.price);
-    if (state.assetId) {
-      activeAsset = state.assetId;
-      const sel = $("asset-select");
-      if (sel && sel.value !== activeAsset) sel.value = activeAsset;
+    if (typeof state.assetId === "string" && state.assetId) {
+      const stateAsset = ASSETS.get(state.assetId.slice(0, 96));
+      if (stateAsset) {
+        activeAsset = stateAsset.id;
+        const sel = $("asset-select");
+        if (sel && sel.value !== activeAsset) sel.value = activeAsset;
+      }
     }
-    if (state.strategy) {
-      activeStrategy = state.strategy;
+    if (typeof state.strategy === "string" && state.strategy && STRAT.get(state.strategy.slice(0, 64))) {
+      activeStrategy = state.strategy.slice(0, 64);
       const sel = $("strategy-select");
       if (sel && sel.value !== activeStrategy) sel.value = activeStrategy;
     }
 
-    const sig = state.signal || {};
-    const dir = sig.direction || "WAIT";
+    const sig = state.signal && typeof state.signal === "object" ? state.signal : {};
+    const history = Array.isArray(state.history) ? state.history.filter((h) => h && typeof h === "object").slice(0, 100) : [];
+    const dir = sig.direction === "CALL" || sig.direction === "PUT" ? sig.direction : "WAIT";
     $("dir").textContent = dir;
     $("hero").dataset.dir = dir;
     $("reason").textContent = sig.reason || "Collecting candles…";
+    const timing = $("signal-timing");
+    if (timing) {
+      const currentCall = (state.pending && typeof state.pending === "object" ? state.pending : null) || history[0] || {
+        entryTime: sig.entryTime != null ? sig.entryTime : sig.time,
+        entryPrice: sig.entryPrice != null ? sig.entryPrice : (sig.metrics && sig.metrics.close),
+      };
+      timing.textContent = tradeTimeline(currentCall, !!(currentCall.exit != null || currentCall.exitPrice != null));
+    }
     $("regime-row").textContent = "regime: " + (sig.regime || "—") + " · mtf bias: " + ((sig.metrics && sig.metrics.mtfBias) || 0) + "/" + ((sig.metrics && sig.metrics.mtfChecked) || 0);
 
-    $("wins").textContent = String(state.wins || 0);
-    $("losses").textContent = String(state.losses || 0);
+    $("wins").textContent = String(Math.max(0, Math.floor(finite(state.wins, 0))));
+    $("losses").textContent = String(Math.max(0, Math.floor(finite(state.losses, 0))));
     $("winrate").textContent = fmtPct(state.winrate);
     $("accuracy").textContent = fmtPct(state.accuracy);
 
-    const m = sig.metrics;
-    if (m) {
+    const m = sig.metrics && typeof sig.metrics === "object" ? sig.metrics : null;
+    const detailsKey = jsonKey([dir, sig.confidence, sig.score, sig.regime, m]);
+    if (detailsKey !== lastDetailsKey) {
+      lastDetailsKey = detailsKey;
+      if (!m) {
+        $("meters").innerHTML = "";
+        $("readings").innerHTML = "";
+      } else {
       $("meters").innerHTML =
         meter("RSI", m.rsi, 0, 100, (m.rsi || 50) < 50 ? "put" : "call") +
         meter("Stoch", m.stochK, 0, 100, (m.stochK || 50) < 50 ? "put" : "call") +
@@ -446,7 +662,7 @@
         ["Stoch %K", m.stochK],
         ["Stoch %D", m.stochD],
         ["BB mid", m.bbMid],
-        ["ATR%", m.atrPct ? (m.atrPct * 100).toFixed(3) + "%" : "—"],
+        ["ATR%", finite(m.atrPct, null) != null ? (finite(m.atrPct, 0) * 100).toFixed(3) + "%" : "—"],
         ["ADX", m.adx],
         ["+DI", m.plusDI],
         ["-DI", m.minusDI],
@@ -458,8 +674,8 @@
         ["CCI", m.cci],
         ["Hurst", m.hurst],
         ["Momentum", m.momentum],
-        ["Score", m.score != null ? m.score : "—"],
-        ["Confidence", sig.confidence + "%"],
+        ["Score", sig.score != null ? sig.score : "—"],
+        ["Confidence", finite(sig.confidence, null) != null ? finite(sig.confidence, 0) + "%" : "—"],
         ["Regime", sig.regime],
       ];
       $("readings").innerHTML = rows
@@ -473,21 +689,27 @@
             if (r[0] === "+DI" && r[1] > 30) cls = "call";
             if (r[0] === "-DI" && r[1] > 30) cls = "put";
           }
-          return '<div class="reading ' + cls + '"><span>' + r[0] + '</span><b>' +
-            (typeof r[1] === "number" ? (Math.abs(r[1]) < 0.001 ? r[1].toExponential(2) : r[1].toFixed(4)) : r[1]) +
+          const rendered = typeof r[1] === "number"
+            ? (Number.isFinite(r[1]) ? (Math.abs(r[1]) < 0.001 ? r[1].toExponential(2) : r[1].toFixed(4)) : "—")
+            : r[1];
+          return '<div class="reading ' + cls + '"><span>' + esc(r[0]) + '</span><b>' + esc(rendered) +
             '</b></div>';
         }).join("");
+      }
     }
 
     const ul = $("history");
-    if (ul) {
+    const historyKey = jsonKey(history);
+    if (ul && historyKey !== lastHistoryKey) {
+      lastHistoryKey = historyKey;
       ul.innerHTML = "";
-      (state.history || []).forEach((h) => {
+      history.forEach((h) => {
         const li = document.createElement("li");
+        const outcome = tradeOutcome(h);
         li.innerHTML =
-          '<span class="' + (h.won ? "win" : "loss") + '">' + (h.won ? "WIN" : "LOSS") + '</span>' +
-          '<span class="meta">' + (h.dir || "") + " · " + (h.asset || "—") + " · conf " + (h.confidence || 0) + "% · " + fmtTime(h.at) + '</span>' +
-          '<span class="' + (h.won ? "win" : "loss") + '">' + (h.pnl != null ? (h.pnl > 0 ? "+" : "") + h.pnl.toFixed(2) : "") + '</span>';
+          '<span class="' + outcome.cls + '">' + outcome.label + '</span>' +
+          '<span class="meta">' + esc(h.dir || "") + " · " + esc(h.asset || "—") + " · conf " + esc(finite(h.confidence, 0)) + "%<br>" + esc(tradeTimeline(h, true)) + '</span>' +
+          '<span class="' + outcome.cls + '">' + esc(fmtMoney(h.pnl)) + '</span>';
         ul.appendChild(li);
       });
     }
@@ -495,11 +717,14 @@
     // v2.2: prefer the broker's own history for the chart; fall back to the
     // engine's 1m series. Real data replaces the synthetic seed, so the
     // chart matches the platform chart (same candles, EMA + MACD subplot).
-    const chartCandles = (state.chartCandles && state.chartCandles.length)
-      ? state.chartCandles : state.candles;
-    if (chartCandles && chartCandles.length) {
-      lastChartCandles = chartCandles.slice();
-      lastChartMeta = { timeframe: tfLabel(state.chartPeriod || 60), markers: state.markers };
+    const chartCandles = (Array.isArray(state.chartCandles) && state.chartCandles.length
+      ? state.chartCandles : (Array.isArray(state.candles) ? state.candles : [])).slice(-500);
+    const markers = Array.isArray(state.markers) ? state.markers.slice(-600) : [];
+    const nextChartKey = chartStateKey(chartCandles, state.chartPeriod, markers);
+    if (nextChartKey !== lastChartKey) {
+      lastChartKey = nextChartKey;
+      lastChartCandles = chartCandles.slice(-500);
+      lastChartMeta = { timeframe: tfLabel(state.chartPeriod || 60), markers };
       drawChart($("chart"), lastChartCandles, lastChartMeta);
     }
     if (state.autoState) updateAutoUI(state.autoState);
@@ -510,9 +735,21 @@
     // v2.2: never let the demo loop overwrite live extension state — this was
     // the "shows demo, flickers to live" bug. Once a live state arrives the
     // demo loop becomes a no-op for the rest of the session.
-    if (liveFromExt) return;
+    // Content sends an unchanged-state heartbeat every 10s; allow jitter so
+    // the demo loop cannot flicker over a healthy but quiet live chart.
+    if (liveFromExt && Date.now() - lastExtTs <= 15000) return;
+    if (liveFromExt) {
+      // The selected tab stopped publishing (closed, navigated, or extension
+      // reloaded). Do not leave a permanently frozen "live" dashboard.
+      liveFromExt = false;
+      qxStatus = { state: "disconnected" };
+      const selected = ASSETS.get(activeAsset);
+      if (selected) localFeed.setSeries(FEED.syntheticSeries(selected, 240));
+      lastChartKey = "";
+      paintQuotexPill();
+    }
     const last = localFeed.lastPrice() || 1.0854;
-    const ev = localFeed.ingest(FEED.demoTick(last), Date.now());
+    localFeed.ingest(FEED.demoTick(last), Date.now());
     const series = localFeed.series();
     const strat = STRAT.get(activeStrategy) || STRAT.defaults();
     const sig = ENG.analyze(series, { strategy: activeStrategy, params: strat.params, weights: strat.weights, lean: false });
@@ -538,24 +775,42 @@
 
   /* ---------- auto tab ---------- */
   function updateAutoUI(s) {
-    autoState = s || autoState || { mode: "off", armed: false, tradesToday: 0, tradesHour: 0, dailyPnl: 0, lastTrade: null };
-    const mode = (autoState.mode || "off");
+    const source = s && typeof s === "object" && !Array.isArray(s)
+      ? s : (autoState || {});
+    const mode = source.mode === "alerts" || source.mode === "click" ? source.mode : "off";
+    const rawLastTrade = source.lastTrade && typeof source.lastTrade === "object" && !Array.isArray(source.lastTrade)
+      ? source.lastTrade : null;
+    autoState = {
+      mode,
+      armed: mode !== "off" && source.armed === true,
+      tradesToday: Math.max(0, Math.min(100000, Math.floor(finite(source.tradesToday, 0)))),
+      tradesHour: Math.max(0, Math.min(100000, Math.floor(finite(source.tradesHour, 0)))),
+      dailyPnl: Math.max(-1000000000, Math.min(1000000000, finite(source.dailyPnl, 0))),
+      lastTrade: rawLastTrade ? {
+        dir: rawLastTrade.dir === "CALL" || rawLastTrade.dir === "PUT" ? rawLastTrade.dir : "",
+        asset: typeof rawLastTrade.asset === "string" ? rawLastTrade.asset.slice(0, 96) : "",
+        at: finite(rawLastTrade.at, 0),
+        entryTime: finite(rawLastTrade.entryTime, 0),
+        expiryTime: finite(rawLastTrade.expiryTime, 0),
+      } : null,
+    };
     $("auto-mode-label").textContent = mode.toUpperCase();
     $("auto-hero").dataset.dir = mode === "click" ? "CALL" : mode === "alerts" ? "WAIT" : "PUT";
     $("auto-reason").textContent = autoState.armed
       ? (mode === "click"
-        ? "Auto-click ARMED — placing trades on qualifying signals."
+        ? "Execution ARMED — broker-confirmed orders on qualifying signals."
         : mode === "alerts"
-          ? "Alerts ARMED — will beep &amp; notify on qualifying signals."
+          ? "Alerts ARMED — will beep & notify on qualifying signals."
           : "Mode is off but auto is armed. Pick alerts or click.")
       : "Auto-trade is off. Pick a mode and arm it.";
     $("trades-today").textContent = String(autoState.tradesToday || 0);
     $("trades-hour").textContent = String(autoState.tradesHour || 0);
-    const pnl = autoState.dailyPnl || 0;
+    const pnl = finite(autoState.dailyPnl, 0);
     $("daily-pnl").textContent = (pnl > 0 ? "+" : "") + pnl.toFixed(2);
     $("daily-pnl").className = pnl > 0 ? "win" : pnl < 0 ? "loss" : "";
     $("last-trade").textContent = autoState.lastTrade
-      ? (autoState.lastTrade.dir + " " + (autoState.lastTrade.asset || "") + " · " + fmtTime(autoState.lastTrade.at))
+      ? (autoState.lastTrade.dir + " " + (autoState.lastTrade.asset || "") + " · " +
+        fmtTime(autoState.lastTrade.entryTime || autoState.lastTrade.at) + " → " + fmtTime(autoState.lastTrade.expiryTime))
       : "—";
 
     const armBtn = $("arm-btn");
@@ -621,8 +876,9 @@
     $("qx-instr-count").textContent = String(list.length);
     $("qx-open-count").textContent = String(counts.open);
     $("qx-otc-count").textContent = String(counts.otc);
-    $("qx-balance").textContent = qxBalance && qxBalance.balance != null
-      ? Number(qxBalance.balance).toFixed(2) + (qxBalance.currency ? " " + qxBalance.currency : "")
+    const balanceValue = qxBalance ? finite(qxBalance.balance, null) : null;
+    $("qx-balance").textContent = balanceValue != null
+      ? balanceValue.toFixed(2) + (qxBalance.currency ? " " + qxBalance.currency : "")
       : "—";
 
     const hero = $("qx-conn");
@@ -642,15 +898,15 @@
     const tb = $("qx-instr-table").querySelector("tbody");
     tb.innerHTML = "";
     filtered.sort((a, b) => (b.payout || 0) - (a.payout || 0));
-    for (const it of filtered) {
+    for (const it of filtered.slice(0, 500)) {
       const tr = document.createElement("tr");
       const tfs = (it.timeframes || []).map((t) => QUOTEX.KNOWN_TIMEFRAMES[t] || t + "s").slice(0, 6).join(", ");
       tr.innerHTML =
-        "<td>" + (it.symbol || "—") + "</td>" +
-        "<td>" + (it.name || "—") + "</td>" +
-        "<td>" + (it.type || "—") + "</td>" +
-        "<td>" + (it.payout ? it.payout + "%" : "—") + "</td>" +
-        "<td>" + (tfs || "—") + "</td>" +
+        "<td>" + esc(it.symbol || "—") + "</td>" +
+        "<td>" + esc(it.name || "—") + "</td>" +
+        "<td>" + esc(it.type || "—") + "</td>" +
+        "<td>" + (finite(it.payout, null) != null ? esc(finite(it.payout, 0)) + "%" : "—") + "</td>" +
+        "<td>" + esc(tfs || "—") + "</td>" +
         "<td class='" + (it.isOpen ? "win" : "loss") + "'>" + (it.isOpen ? "OPEN" : "closed") + "</td>";
       tb.appendChild(tr);
     }
@@ -663,22 +919,36 @@
         const data = o.data || {};
         const won = data.win === true;
         const lost = data.loss === true;
-        li.innerHTML =
-          '<span class="' + (won ? "win" : lost ? "loss" : "") + '">' + (o.kind || "order").toUpperCase() + '</span>' +
-          '<span class="meta">' + (data.dir || data.direction || "") + " · " + (data.asset || "—") + " · " +
+        const orderText = (data.dir || data.direction || "") + " · " + (data.asset || "—") + " · " +
           (data.amount != null ? data.amount + "$" : "") + " · " +
-          (data.profit != null ? (data.profit > 0 ? "+" : "") + data.profit + "$" : "") + '</span>';
+          (data.profit != null ? (Number(data.profit) > 0 ? "+" : "") + data.profit + "$" : "") +
+          "\nEntry " + fmtTime(data.openTime) + " @ " + fmtPx(data.openPrice) +
+          " · Expiry " + fmtTime(data.expiryTime != null ? data.expiryTime : data.closeTime) +
+          (data.status === "CLOSED" ? " · Exit " + fmtTime(data.closeTime) + " @ " + fmtPx(data.closePrice) : "");
+        li.innerHTML =
+          '<span class="' + (won ? "win" : lost ? "loss" : "") + '">' + esc(String(o.kind || "order").toUpperCase()) + '</span>' +
+          '<span class="meta">' + esc(orderText).replace("\n", "<br>") + '</span>';
         ol.appendChild(li);
       }
     }
   }
 
   function bindInstrumentsTab() {
-    const onChange = () => refreshInstrumentsTab();
-    ["qx-filter", "qx-kind", "qx-open-only"].forEach((id) => {
-      const el = $(id);
-      if (el) el.addEventListener("input", onChange);
+    let filterTimer = null;
+    const filter = $("qx-filter");
+    if (filter) filter.addEventListener("input", () => {
+      if (filterTimer) clearTimeout(filterTimer);
+      filterTimer = setTimeout(() => {
+        filterTimer = null;
+        if (activeTab === "instruments") refreshInstrumentsTab();
+      }, 100);
     });
+    for (const id of ["qx-kind", "qx-open-only"]) {
+      const el = $(id);
+      if (el) el.addEventListener("change", () => {
+        if (activeTab === "instruments") refreshInstrumentsTab();
+      });
+    }
   }
 
   function appendAutoLog(entry) {
@@ -688,37 +958,86 @@
     const cls = entry.level === "trade" || entry.level === "alert" ? "win"
       : entry.level === "error" ? "loss" : "";
     li.innerHTML =
-      '<span class="' + cls + '">' + (entry.level || "log").toUpperCase() + '</span>' +
-      '<span class="meta">' + fmtTime(entry.at) + '</span>' +
-      '<span>' + entry.msg + '</span>';
+      '<span class="' + cls + '">' + esc(String(entry.level || "log").toUpperCase()) + '</span>' +
+      '<span class="meta">' + esc(fmtTime(entry.at)) + '</span>' +
+      '<span>' + esc(entry.msg || "") + '</span>';
     ul.prepend(li);
     while (ul.children.length > 50) ul.removeChild(ul.lastChild);
   }
 
   function bindAutoTab() {
-    const setSettings = (patch) => {
-      STORE.setSettings(patch).then((s) => { settings = s; });
+    const setSettings = (patch) => STORE.setSettings(patch).then((s) => {
+      settings = s;
+      return s;
+    });
+    $("auto-mode").addEventListener("change", (e) => {
+      const mode = e.target.value;
+      // A mode change, especially alerts → click, requires a fresh explicit
+      // ARM gesture. Never carry an armed state into a more powerful mode.
+      const update = hasChrome
+        ? chrome.runtime.sendMessage({ type: "CYBER_SET_AUTO", mode, armed: false }).then((r) => {
+          if (!r || !r.ok) throw new Error(r && r.error || "automation update failed");
+          return STORE.getSettings();
+        })
+        : setSettings({ autoMode: mode, armed: false });
+      update.then((s) => {
+        settings = s;
+        if (!hasChrome) updateAutoUI(Object.assign({}, autoState, { mode: s.autoMode, armed: false }));
+      }).catch(() => {
+        // Restore the last persisted value when no selected Quotex tab can
+        // accept the mode change.
+        e.target.value = (settings && settings.autoMode) || "off";
+      });
+    });
+    const bindNumberSetting = (id, key) => {
+      const el = $(id);
+      el.addEventListener("change", () => {
+        const patch = { [key]: Number(el.value) };
+        setSettings(patch).then((saved) => { el.value = saved[key]; }).catch(() => {
+          if (settings && settings[key] != null) el.value = settings[key];
+        });
+      });
     };
-    $("auto-mode").addEventListener("change", (e) => setSettings({ autoMode: e.target.value, armed: e.target.value !== "off" ? !!(settings && settings.armed) : false }));
-    $("min-confidence").addEventListener("change", (e) => setSettings({ minConfidence: Number(e.target.value) || 0 }));
-    $("stake").addEventListener("change", (e) => setSettings({ stake: Number(e.target.value) || 1 }));
-    $("expiry").addEventListener("change", (e) => setSettings({ expiry: Number(e.target.value) || 3 }));
-    $("max-hour").addEventListener("change", (e) => setSettings({ maxTradesPerHour: Number(e.target.value) || 0 }));
-    $("max-day").addEventListener("change", (e) => setSettings({ maxTradesPerDay: Number(e.target.value) || 0 }));
-    $("loss-cap").addEventListener("change", (e) => setSettings({ dailyLossCap: Number(e.target.value) || 0 }));
-    $("profit-cap").addEventListener("change", (e) => setSettings({ dailyProfitCap: Number(e.target.value) || 0 }));
-    $("cooldown").addEventListener("change", (e) => setSettings({ cooldownBars: Number(e.target.value) || 0 }));
-    $("notify-sound").addEventListener("change", (e) => setSettings({ notifySound: e.target.checked }));
-    $("notify-desktop").addEventListener("change", (e) => setSettings({ notifyDesktop: e.target.checked }));
+    bindNumberSetting("min-confidence", "minConfidence");
+    bindNumberSetting("stake", "stake");
+    bindNumberSetting("expiry", "expiry");
+    bindNumberSetting("max-hour", "maxTradesPerHour");
+    bindNumberSetting("max-day", "maxTradesPerDay");
+    bindNumberSetting("loss-cap", "dailyLossCap");
+    bindNumberSetting("profit-cap", "dailyProfitCap");
+    bindNumberSetting("cooldown", "cooldownBars");
+    const bindBooleanSetting = (id, key) => {
+      const el = $(id);
+      el.addEventListener("change", () => {
+        setSettings({ [key]: el.checked }).then((saved) => { el.checked = !!saved[key]; }).catch(() => {
+          el.checked = !!(settings && settings[key]);
+        });
+      });
+    };
+    bindBooleanSetting("notify-sound", "notifySound");
+    bindBooleanSetting("notify-desktop", "notifyDesktop");
+    let armPending = false;
     $("arm-btn").addEventListener("click", () => {
+      if (armPending) return;
       // v2.3.2: settings loads async — clicking ARM before it resolves used
       // to throw on `settings.armed` (null deref) and the arm never happened.
       const cur = settings && settings.armed;
-      const next = !cur;
       const mode = (settings && settings.autoMode) || "off";
-      setSettings({ armed: next });
-      if (hasChrome) chrome.runtime.sendMessage({ type: "CYBER_SET_AUTO", mode, armed: next }).catch(() => {});
-      else updateAutoUI(Object.assign({}, autoState, { armed: next }));
+      const next = mode !== "off" && !cur;
+      armPending = true;
+      const update = hasChrome
+        ? chrome.runtime.sendMessage({ type: "CYBER_SET_AUTO", mode, armed: next }).then((r) => {
+          if (!r || !r.ok) throw new Error(r && r.error || "arming failed");
+          return STORE.getSettings();
+        })
+        : setSettings({ armed: next });
+      update.then((s) => {
+        settings = s;
+        if (!hasChrome) updateAutoUI(Object.assign({}, autoState, { armed: s.armed }));
+      }).catch(() => {
+        // A failed arm must leave persisted safety state disarmed.
+        if (next) setSettings({ armed: false }).catch(() => {});
+      }).finally(() => { armPending = false; });
     });
     $("test-sound").addEventListener("click", () => AUTO.playBeep("CALL"));
   }
@@ -727,17 +1046,17 @@
     STORE.getSettings().then((s) => {
       settings = s;
       $("auto-mode").value = s.autoMode || "off";
-      $("min-confidence").value = s.minConfidence || 65;
-      $("stake").value = s.stake || 1;
-      $("expiry").value = s.expiry || 3;
-      $("max-hour").value = s.maxTradesPerHour || 12;
-      $("max-day").value = s.maxTradesPerDay || 60;
-      $("loss-cap").value = s.dailyLossCap || 30;
-      $("profit-cap").value = s.dailyProfitCap || 0;
-      $("cooldown").value = s.cooldownBars || 2;
+      $("min-confidence").value = s.minConfidence != null ? s.minConfidence : 65;
+      $("stake").value = s.stake != null ? s.stake : 1;
+      $("expiry").value = s.expiry != null ? s.expiry : 3;
+      $("max-hour").value = s.maxTradesPerHour != null ? s.maxTradesPerHour : 12;
+      $("max-day").value = s.maxTradesPerDay != null ? s.maxTradesPerDay : 60;
+      $("loss-cap").value = s.dailyLossCap != null ? s.dailyLossCap : 30;
+      $("profit-cap").value = s.dailyProfitCap != null ? s.dailyProfitCap : 0;
+      $("cooldown").value = s.cooldownBars != null ? s.cooldownBars : 2;
       $("notify-sound").checked = s.notifySound !== false;
       $("notify-desktop").checked = !!s.notifyDesktop;
-      activeStrategy = s.strategy || "confluence";
+      activeStrategy = STRAT.get(s.strategy) ? s.strategy : "confluence";
       const sel = $("strategy-select");
       if (sel) sel.value = activeStrategy;
     });
@@ -745,9 +1064,12 @@
 
   /* ---------- backtest tab ---------- */
   function runBacktest() {
-    const days = Number($("bt-days").value) || 7;
-    const horizon = Number($("bt-horizon").value) || 3;
-    const minConf = Number($("bt-minconf").value) || 0;
+    const rawDays = Number($("bt-days").value);
+    const rawHorizon = Number($("bt-horizon").value);
+    const rawMinConf = Number($("bt-minconf").value);
+    const days = Number.isFinite(rawDays) ? Math.max(1, Math.min(31, Math.floor(rawDays))) : 7;
+    const horizon = Number.isFinite(rawHorizon) ? Math.max(1, Math.min(60, Math.floor(rawHorizon))) : 3;
+    const minConf = Number.isFinite(rawMinConf) ? Math.max(0, Math.min(100, rawMinConf)) : 0;
     const kind = $("bt-kinds").value;
     const kinds = kind === "all" ? null : [kind];
     const o = { days, horizon, minConf, kinds, minBars: 150 };
@@ -757,15 +1079,23 @@
     const origLabel = btn.textContent;
     btn.textContent = "Starting…";
 
-    const useWorkers = WORKERS && WORKERS.runBrowser;
-    const p = useWorkers
-      ? WORKERS.runBrowser(o).catch((e) => { console.error(e); return { results: [] }; })
-      : new Promise((resolve) => setTimeout(() => resolve(HIST.runMatrix(o)), 30));
-
-    function tick(i, total) {
-      if (total) btn.textContent = "Running " + i + " / " + total + "…";
+    function tick(progress, total) {
+      const i = progress && typeof progress === "object" ? progress.i : progress;
+      const n = progress && typeof progress === "object" ? progress.total : total;
+      if (n) btn.textContent = "Running " + i + " / " + n + "…";
     }
+    const useWorkers = WORKERS && WORKERS.runBrowser;
     if (useWorkers) o.onProgress = tick;
+    let p;
+    try {
+      p = useWorkers
+        ? WORKERS.runBrowser(o)
+        : new Promise((resolve, reject) => setTimeout(() => {
+          try { resolve(HIST.runMatrix(o)); } catch (e) { reject(e); }
+        }, 30));
+    } catch (e) {
+      p = Promise.reject(e);
+    }
 
     p.then((r) => {
       btResults = r;
@@ -779,28 +1109,27 @@
   }
 
   function paintBacktest(matrix, opts) {
-    const sum = HIST.summarize(matrix);
-    $("bt-trades").textContent = String(sum && sum.trades || 0);
+    matrix = matrix && Array.isArray(matrix.results) ? matrix : { results: [] };
+    const sum = HIST.summarize(matrix) || {
+      trades: 0, winrate: 0, pnl: 0, byStrategy: {}, byKind: {},
+    };
+    $("bt-trades").textContent = String(sum.trades || 0);
     $("bt-winrate").textContent = fmtPct(sum && sum.winrate);
     $("bt-pnl").textContent = String(sum && sum.pnl || 0);
     $("bt-dd").textContent = "—";
 
-    // Aggregate equity across all runs
-    const eq = [];
-    let cum = 0;
-    for (const r of matrix.results) {
-      // Re-run to get equity? Use a quick representative.
-    }
-    // Better: re-run with one strategy per asset for equity.
-    // For brevity, synthesize an equity curve from per-asset P&L counts.
+    // The matrix does not retain trade chronology, so never fabricate it by
+    // grouping every win before every loss. Plot one bounded cumulative point
+    // per completed asset/strategy run instead (also avoids allocating one DOM
+    // object per backtest trade on large matrices).
     let running = 0;
-    const seq = [];
-    for (const r of matrix.results) {
-      for (let i = 0; i < r.wins; i++) { running++; seq.push({ equity: running }); }
-      for (let i = 0; i < r.losses; i++) { running--; seq.push({ equity: running }); }
+    const seq = [{ equity: 0 }];
+    for (const r of matrix.results.slice(0, 2000)) {
+      running += finite(r && r.pnl, 0);
+      seq.push({ equity: running });
     }
     lastBtEquity = seq;
-    drawChart($("bt-equity"), seq, { equity: true });
+    drawChart($("bt-equity"), seq, { equity: true, equityLabel: "runs" });
 
     // Per-strategy
     const stBody = $("bt-strategies").querySelector("tbody");
@@ -808,7 +1137,7 @@
     for (const k of Object.keys(sum.byStrategy).sort((a, b) => sum.byStrategy[b].winrate - sum.byStrategy[a].winrate)) {
       const v = sum.byStrategy[k];
       const tr = document.createElement("tr");
-      tr.innerHTML = "<td>" + k + "</td><td>" + v.total + "</td><td class='win'>" + v.wins + "</td><td class='loss'>" + v.losses + "</td><td>" + v.winrate.toFixed(1) + "%</td>";
+      tr.innerHTML = "<td>" + esc(k) + "</td><td>" + finite(v.total, 0) + "</td><td class='win'>" + finite(v.wins, 0) + "</td><td class='loss'>" + finite(v.losses, 0) + "</td><td>" + finite(v.winrate, 0).toFixed(1) + "%</td>";
       stBody.appendChild(tr);
     }
 
@@ -828,7 +1157,7 @@
       const t = v.wins + v.losses;
       const wr = t ? (v.wins / t) * 100 : 0;
       const tr = document.createElement("tr");
-      tr.innerHTML = "<td>" + (v.name || k) + "</td><td>" + t + "</td><td class='" + (wr >= 55 ? "win" : wr <= 45 ? "loss" : "") + "'>" + wr.toFixed(1) + "%</td><td>" + v.pnl + "</td><td>" + v.dd + "</td>";
+      tr.innerHTML = "<td>" + esc(v.name || k) + "</td><td>" + t + "</td><td class='" + (wr >= 55 ? "win" : wr <= 45 ? "loss" : "") + "'>" + wr.toFixed(1) + "%</td><td>" + finite(v.pnl, 0) + "</td><td>" + finite(v.dd, 0) + "</td>";
       aBody.appendChild(tr);
     }
 
@@ -837,7 +1166,7 @@
     regBody.innerHTML = "";
     const regAgg = {};
     for (const r of matrix.results) {
-      for (const reg of Object.keys(r.byRegime)) {
+      for (const reg of Object.keys(r.byRegime || {})) {
         if (!regAgg[reg]) regAgg[reg] = { wins: 0, losses: 0 };
         regAgg[reg].wins += r.byRegime[reg].wins;
         regAgg[reg].losses += r.byRegime[reg].losses;
@@ -848,7 +1177,7 @@
       const t = v.wins + v.losses;
       const wr = t ? (v.wins / t) * 100 : 0;
       const tr = document.createElement("tr");
-      tr.innerHTML = "<td>" + k + "</td><td>" + t + "</td><td class='" + (wr >= 55 ? "win" : wr <= 45 ? "loss" : "") + "'>" + wr.toFixed(1) + "%</td>";
+      tr.innerHTML = "<td>" + esc(k) + "</td><td>" + t + "</td><td class='" + (wr >= 55 ? "win" : wr <= 45 ? "loss" : "") + "'>" + wr.toFixed(1) + "%</td>";
       regBody.appendChild(tr);
     }
 
@@ -857,7 +1186,7 @@
     calBody.innerHTML = "";
     const calAgg = {};
     for (const r of matrix.results) {
-      for (const c of r.calibration) {
+      for (const c of (r.calibration || [])) {
         if (!calAgg[c.bucket]) calAgg[c.bucket] = { w: 0, l: 0 };
         calAgg[c.bucket].w += c.wins;
         calAgg[c.bucket].l += c.losses;
@@ -879,34 +1208,37 @@
 
   /* ---------- history tab ---------- */
   function refreshHistoryTab() {
+    const token = ++historyRenderToken;
     STORE.getStats().then((stats) => {
+      if (token !== historyRenderToken || activeTab !== "history") return;
       const dir = $("hist-dir").value;
       const out = $("hist-outcome").value;
       const asset = $("hist-asset").value;
       const list = (stats.history || []).filter((h) => {
         if (dir !== "all" && h.dir !== dir) return false;
-        if (out === "win" && !h.won) return false;
-        if (out === "loss" && h.won) return false;
+        if (out === "win" && h.won !== true) return false;
+        if (out === "loss" && h.won !== false) return false;
         if (asset !== "all" && h.asset !== asset) return false;
         return true;
       });
-      const w = list.filter((h) => h.won).length;
-      const l = list.length - w;
+      const w = list.filter((h) => h.won === true).length;
+      const l = list.filter((h) => h.won === false).length;
       $("hist-count").textContent = list.length;
       $("hist-wins").textContent = w;
       $("hist-losses").textContent = l;
-      $("hist-wr").textContent = list.length ? ((w / list.length) * 100).toFixed(1) + "%" : "—";
+      $("hist-wr").textContent = w + l ? ((w / (w + l)) * 100).toFixed(1) + "%" : "—";
       const ul = $("hist-list");
       ul.innerHTML = "";
       for (const h of list.slice(0, 100)) {
         const li = document.createElement("li");
+        const outcome = tradeOutcome(h);
         li.innerHTML =
-          '<span class="' + (h.won ? "win" : "loss") + '">' + (h.won ? "WIN" : "LOSS") + '</span>' +
-          '<span class="meta">' + h.dir + " · " + (h.asset || "—") + " · conf " + (h.confidence || 0) + "% · " + (h.regime || "—") + " · " + fmtDate(h.at) + '</span>' +
-          '<span class="' + (h.won ? "win" : "loss") + '">' + (h.pnl != null ? (h.pnl > 0 ? "+" : "") + h.pnl.toFixed(2) : "") + '</span>';
+          '<span class="' + outcome.cls + '">' + outcome.label + '</span>' +
+          '<span class="meta">' + esc(h.dir || "") + " · " + esc(h.asset || "—") + " · conf " + esc(finite(h.confidence, 0)) + "% · " + esc(h.regime || "—") + "<br>" + esc(tradeTimeline(h, true)) + '</span>' +
+          '<span class="' + outcome.cls + '">' + esc(fmtMoney(h.pnl)) + '</span>';
         ul.appendChild(li);
       }
-    });
+    }).catch(() => {});
   }
   function bindHistoryTab() {
     $("hist-dir").addEventListener("change", refreshHistoryTab);
@@ -914,11 +1246,24 @@
     $("hist-asset").addEventListener("change", refreshHistoryTab);
     $("hist-export").addEventListener("click", () => {
       STORE.getStats().then((s) => {
-        const rows = [["at", "asset", "dir", "won", "entry", "exit", "confidence", "regime", "strategy", "pnl"]];
+        const rows = [["entry_time", "expiry_time", "exit_time", "expiry_minutes", "asset", "dir", "outcome", "won", "entry_price", "exit_price", "confidence", "regime", "strategy", "pnl"]];
         for (const h of (s.history || [])) {
-          rows.push([new Date(h.at).toISOString(), h.asset, h.dir, h.won ? 1 : 0, h.entry, h.exit, h.confidence, h.regime, h.strategy, h.pnl]);
+          const entryTime = h.entryTime != null ? h.entryTime : h.at;
+          const outcome = tradeOutcome(h).label;
+          rows.push([
+            isoTime(entryTime),
+            isoTime(h.expiryTime),
+            isoTime(h.exitTime),
+            h.expiryMinutes,
+            h.asset, h.dir,
+            outcome,
+            outcome === "DRAW" || outcome === "UNKNOWN" ? "" : outcome === "WIN" ? 1 : 0,
+            h.entryPrice != null ? h.entryPrice : h.entry,
+            h.exitPrice != null ? h.exitPrice : h.exit,
+            h.confidence, h.regime, h.strategy, h.pnl,
+          ]);
         }
-        const csv = rows.map((r) => r.map((v) => v == null ? "" : String(v).replace(/"/g, '""')).map((v) => /[",\n]/.test(v) ? '"' + v + '"' : v).join(",")).join("\n");
+        const csv = rows.map((r) => r.map(csvCell).join(",")).join("\n");
         const blob = new Blob([csv], { type: "text/csv" });
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
@@ -928,18 +1273,20 @@
     });
     $("hist-clear").addEventListener("click", () => {
       if (!confirm("Clear all history and stats?")) return;
-      STORE.reset().then(() => refreshHistoryTab());
+      STORE.resetStats().then(() => refreshHistoryTab()).catch(() => {});
     });
   }
 
   /* ---------- assets tab ---------- */
   function refreshAssetsTab() {
+    const token = ++assetsRenderToken;
     const tb = $("asset-table").querySelector("tbody");
     tb.innerHTML = "";
     // Compute best per-asset strategy from the matrix if available.
     const bestMap = btResults ? HIST.bestPerAsset(btResults) : {};
     // Live stats
     STORE.getStats().then((stats) => {
+      if (token !== assetsRenderToken || activeTab !== "assets") return;
       for (const a of ASSETS.list()) {
         const tr = document.createElement("tr");
         tr.className = "clickable";
@@ -949,10 +1296,10 @@
         const best = bestMap[a.id];
         const histWR = best ? best.winrate.toFixed(1) + "%" : "—";
         tr.innerHTML =
-          "<td>" + a.name + "</td>" +
-          "<td>" + a.kind + "</td>" +
-          "<td>" + a.session + "</td>" +
-          "<td>" + (best ? best.strategy : "—") + "</td>" +
+          "<td>" + esc(a.name) + "</td>" +
+          "<td>" + esc(a.kind) + "</td>" +
+          "<td>" + esc(a.session) + "</td>" +
+          "<td>" + esc(best ? best.strategy : "—") + "</td>" +
           "<td>" + histWR + "</td>" +
           "<td>" + liveWR + "</td>" +
           "<td>" + liveT + "</td>";
@@ -960,11 +1307,13 @@
           activeAsset = a.id;
           const sel = $("asset-select");
           if (sel) sel.value = a.id;
+          if (hasChrome) chrome.runtime.sendMessage({ type: "CYBER_SET_ASSET", asset: a.id }).catch(() => {});
+          else localFeed.setSeries(FEED.syntheticSeries(a, 240));
           activateTab("live");
         });
         tb.appendChild(tr);
       }
-    });
+    }).catch(() => {});
   }
 
   /* ---------- settings tab ---------- */
@@ -974,34 +1323,60 @@
   }
   function bindSettingsTab() {
     $("set-calibration").addEventListener("change", (e) => {
-      STORE.setSettings({ calibration: e.target.checked });
+      STORE.setSettings({ calibration: e.target.checked }).then((s) => { settings = s; }).catch(() => {
+        e.target.checked = !!(settings && settings.calibration);
+      });
     });
     $("reset-stats").addEventListener("click", () => {
       if (!confirm("Erase all stats, history, calibration, and candle cache?")) return;
-      STORE.reset();
+      STORE.resetAnalytics().then(() => {
+        refreshHistoryTab();
+        refreshSettingsTab();
+      }).catch(() => {});
     });
   }
 
   /* ---------- auto message wiring ---------- */
+  function scheduleLiveRender(state) {
+    pendingLiveState = state;
+    if (liveRenderQueued) return;
+    liveRenderQueued = true;
+    const run = () => {
+      liveRenderQueued = false;
+      const next = pendingLiveState;
+      pendingLiveState = null;
+      if (next) renderLive(next);
+    };
+    if (typeof requestAnimationFrame === "function") requestAnimationFrame(run);
+    else setTimeout(run, 16);
+  }
+
   if (hasChrome) {
     chrome.runtime.onMessage.addListener((msg) => {
-      if (msg && msg.type === "CYBER_STATE_PUSH" && msg.payload) {
+      if (msg && msg.type === "CYBER_STATE_PUSH" && msg.payload &&
+          typeof msg.payload === "object" && !Array.isArray(msg.payload)) {
         liveFromExt = true; lastExtTs = Date.now();
-        renderLive(msg.payload);
+        scheduleLiveRender(msg.payload);
       }
-      if (msg && msg.type === "CYBER_AUTO_STATE" && msg.payload) {
+      if (msg && msg.type === "CYBER_AUTO_STATE" && msg.payload &&
+          typeof msg.payload === "object" && !Array.isArray(msg.payload)) {
         updateAutoUI(msg.payload);
       }
-      if (msg && msg.type === "CYBER_AUTO_LOG" && msg.payload) {
+      if (msg && msg.type === "CYBER_AUTO_LOG" && msg.payload &&
+          typeof msg.payload === "object" && !Array.isArray(msg.payload)) {
         appendAutoLog(msg.payload);
       }
-      if (msg && msg.type === "CYBER_QUOTEX_STATUS" && msg.payload) {
-        qxStatus = msg.payload || qxStatus;
+      if (msg && msg.type === "CYBER_QUOTEX_STATUS" && msg.payload &&
+          typeof msg.payload === "object" && !Array.isArray(msg.payload)) {
+        qxStatus = {
+          state: typeof msg.payload.state === "string" ? msg.payload.state.slice(0, 64) : "unknown",
+          url: msg.payload.url == null ? null : String(msg.payload.url).slice(0, 256),
+        };
         paintQuotexPill();
-        refreshInstrumentsTab();
+        if (activeTab === "instruments") refreshInstrumentsTab();
       }
       if (msg && msg.type === "CYBER_QUOTEX_INSTRUMENTS" && Array.isArray(msg.payload)) {
-        qxInstruments = msg.payload;
+        qxInstruments = QUOTEX ? QUOTEX.parseInstruments(msg.payload).slice(0, 2000) : [];
         // Register them with the assets catalog so detection works on the page too.
         for (const it of qxInstruments) {
           if (it && it.symbol) {
@@ -1009,23 +1384,24 @@
           }
         }
         refreshSelectors(); // v2.2: broker assets appear in the dropdown immediately
-        refreshInstrumentsTab();
+        if (activeTab === "instruments") refreshInstrumentsTab();
       }
-      if (msg && msg.type === "CYBER_QUOTEX_BALANCE" && msg.payload) {
-        qxBalance = msg.payload;
-        refreshInstrumentsTab();
+      if (msg && msg.type === "CYBER_QUOTEX_BALANCE" && msg.payload &&
+          typeof msg.payload === "object" && !Array.isArray(msg.payload)) {
+        qxBalance = QUOTEX ? QUOTEX.parseBalance(msg.payload) : null;
+        if (activeTab === "instruments") refreshInstrumentsTab();
       }
-      if (msg && msg.type === "CYBER_QUOTEX_TRADE_RESULT" && msg.payload) {
-        qxOrders.unshift(msg.payload);
-        if (qxOrders.length > 50) qxOrders.length = 50;
-        refreshInstrumentsTab();
+      if (msg && msg.type === "CYBER_QUOTEX_TRADE_RESULT" && msg.payload &&
+          typeof msg.payload === "object" && !Array.isArray(msg.payload)) {
+        qxOrders = mergeOrders([msg.payload].concat(qxOrders));
+        if (activeTab === "instruments") refreshInstrumentsTab();
       }
     });
     chrome.runtime.sendMessage({ type: "CYBER_GET_STATE" }, (res) => {
       if (chrome.runtime.lastError) return;
       if (res && res.payload) {
         liveFromExt = true; lastExtTs = Date.now();
-        renderLive(res.payload);
+        scheduleLiveRender(res.payload);
       }
     });
   }
@@ -1037,9 +1413,15 @@
     // Redraw whatever was last rendered (live chart or demo chart), never a
     // stale local feed over live state.
     if (lastChartCandles && lastChartCandles.length) drawChart($("chart"), lastChartCandles, lastChartMeta);
-    if (lastBtEquity) drawChart($("bt-equity"), lastBtEquity, { equity: true });
+    if (lastBtEquity) drawChart($("bt-equity"), lastBtEquity, { equity: true, equityLabel: "runs" });
   }
-  window.addEventListener("resize", scale);
+  window.addEventListener("resize", () => {
+    if (resizeQueued) return;
+    resizeQueued = true;
+    const run = () => { resizeQueued = false; scale(); };
+    if (typeof requestAnimationFrame === "function") requestAnimationFrame(run);
+    else setTimeout(run, 16);
+  }, { passive: true });
 
   refreshSelectors();
   bindSelectors();
@@ -1051,10 +1433,10 @@
   loadAutoSettings();
   scale();
   paintQuotexPill();
-  refreshInstrumentsTab();
+  if (activeTab === "instruments") refreshInstrumentsTab();
 
   // Local demo loop
   localFeed.setSeries(FEED.syntheticSeries(ASSETS.get("EURUSD"), 240));
   renderLocalTick();
-  setInterval(renderLocalTick, 1500);
+  demoTimer = setInterval(renderLocalTick, 1500);
 })();

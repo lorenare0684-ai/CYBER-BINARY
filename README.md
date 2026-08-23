@@ -1,8 +1,21 @@
-# CYBER BINARY — Quotex Signal Lab v2.3
+# CYBER BINARY — Quotex Signal Lab v2.4
 
 Chrome extension (Manifest V3) that attaches to a Quotex / QX Broker chart, builds 1-minute candles from the live quote, and scores **CALL / PUT / WAIT** from a multi-indicator, multi-timeframe confluence engine. The Quotex adapter decodes the platform's WebSocket traffic and drives the engine with real candles/ticks/balance.
 
 > Educational market analysis only. Not a broker. Not financial advice. Binary options have a built-in payout edge against the trader — nothing here is a profit guarantee.
+
+The completed 500-instance v2.4.0 hardening ledger and final regression evidence are in [`AUDIT-500.md`](AUDIT-500.md).
+
+## What's new in v2.4.0 — responsive UI, confirmed execution, one main chart
+
+- **No more multi-chart/multi-tab mimicry** — quote and history fan-out updates each asset's own feed but cannot select it. Only an explicit main-chart socket event changes the dashboard asset. The background owns one selected Quotex tab, and both content scripts are top-frame-only, so secondary tabs/iframes cannot trade or overwrite dashboard state.
+- **No more open-chart icon clicks** — CALL/PUT matching now requires exact direction tokens or a credible green/red action-button pair. Broad `up` substring and positional fallbacks were removed (they could interpret `popup` as UP/CALL).
+- **Confirmed trade execution** — auto mode uses the page's authenticated WebSocket first, sends the correct Quotex contract shape (OTC duration + `optionType=100`; regular market absolute expiry + `optionType=1`), and counts a trade only after `s_orders/open` confirms it. A sent-but-unconfirmed order is never retried with a DOM click.
+- **Hard async anti-spam lock** — only one order can be in flight, processed signal keys remain deduped across asset/direction churn, and only the primary tab may execute.
+- **Complete call lifecycle** — Live, History, recent broker orders, and CSV export include expiry duration/time plus entry and exit times/prices.
+- **Correct, stable dashboard candles** — broker batches are merged per asset + timeframe, sorted, deduped, OHLC envelopes are validated, incremental batches no longer replace the entire chart, and candle/EMA/MACD x-coordinates align.
+- **Faster UI** — expensive closed-bar analysis is cached once per bar, state pushes are throttled, dashboard rendering is animation-frame coalesced, and marker updates happen only when a new marker is added.
+- **Both directions are covered** — regression tests assert bullish data emits **CALL** and bearish data emits **PUT**.
 
 ## What's new in v2.3.3 — non-repainting signal arrows on the Quotex chart
 
@@ -35,7 +48,7 @@ Chrome extension (Manifest V3) that attaches to a Quotex / QX Broker chart, buil
   - **DOM text-scan fallback** — the modern Quotex UI ships hashed CSS-module class names, so class selectors miss; the extension now scans small visible text nodes against the catalog ("EUR/USD", "EUR/USD OTC", "Bitcoin (OTC)", "S&P 500" …) and picks the most specific match.
   - **History-payload detection** — incoming `history/list/v2` / `chart_notification/get` responses name their asset, another reliable signal.
   - Detection layers in order: socket symbol → adapter DOM helpers → class selectors → text scan → page title → URL.
-- **Trade placement that works on the current UI** — the CALL/PUT button finder now understands the hashed-class DOM: it classifies any visible clickable by its label/aria/class (call/buy/up vs put/sell/down), falls back to green=call / red=put color detection, and only as a last resort to position. The stake input finder scores candidates (hints + trade-panel containment + proximity to the buttons) so it sets the right field, and `placeTrade` still prefers a real `orders/open` WebSocket frame.
+- **Trade placement that works on the current UI** — the CALL/PUT button finder understands hashed-class DOM but still fails closed: it requires exact direction tokens or a credible green/red action-button pair, with no generic positional click fallback. The stake input finder scores candidates (hints + trade-panel containment + proximity to verified buttons), and placement prefers a correlated `orders/open` WebSocket frame.
 - **No more trade spam** — the auto controller now dedups per (asset, closed-bar, direction), so it fires **once per signal**, not once per 500ms tick; `cooldownBars` is enforced unconditionally (the old check read a `metrics.closeTime` field the engine never set, so cooldown silently never fired); and a hard minimum interval (5s, configurable via `settings.minIntervalMs`) prevents double-fires. Auto "alerts" mode no longer floods notifications for the same bar either.
 
 ## What's new in v2
@@ -165,6 +178,6 @@ The historic backtest uses the **same generator** at longer windows (1–14 days
 
 Quotex does not expose a public candle API. v2.1 reads the platform's own WebSocket frames (Socket.IO v3, engine.io v3) for the live candle/quote/balance/instrument list. The exact event names and payload shapes are reverse-engineered from open-source clients (A11ksa/API-Quotex, ericpedra/quotexapi) and may need defensive fallbacks if the broker updates the protocol. The decoder logs unmatched frames under a `frame` callback so the dashboard can surface them; the `lib/quotex.js` module is small and standalone so updates are safe.
 
-The auto-trade click mode is best-effort: it locates the CALL/PUT button by class name and visible text on the current chart, sets the stake input if it can find it, and clicks. The WS mode (opt-in, `args.mode === "ws"`) sends a real `orders/open` frame on the page's own socket. Both modes are gated by the safety limits above. Always confirm on the chart before you act. The extension never reads, stores, or transmits your SSID — for `ws` mode it only uses whatever the page is already transmitting, on the same socket.
+Auto execution prefers a real `orders/open` frame on the page's own authenticated socket and waits for the broker's order-open response before counting it. If the socket is unavailable, the DOM fallback proceeds only when it can set both stake and expiry and verify a real CALL/PUT action button; it then also waits for broker confirmation. A frame that was sent but not confirmed is never retried as a click, preventing duplicate orders. Both paths are gated by the safety limits above. Always confirm on the chart before you act. The extension never reads, stores, or transmits your SSID; it only uses traffic the page already sends on its own socket.
 
 **Disclaimer.** Educational market analysis only. Not a broker. Not financial advice. Binary options have a built-in payout edge against the trader (most brokers require >50% to break even on the headline payout). Nothing here is a profit guarantee. The auto-trade modes are off by default and require explicit arming.

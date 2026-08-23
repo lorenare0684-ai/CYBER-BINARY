@@ -117,17 +117,42 @@
     },
   };
 
+  function own(id) {
+    return typeof id === "string" && Object.prototype.hasOwnProperty.call(STRATEGIES, id)
+      ? STRATEGIES[id] : null;
+  }
+
+  function copy(id, strategy) {
+    return strategy ? {
+      id,
+      label: strategy.label,
+      blurb: strategy.blurb,
+      params: Object.assign({}, strategy.params),
+      weights: Object.assign({}, strategy.weights),
+    } : null;
+  }
+
   function list() {
-    return Object.entries(STRATEGIES).map(([id, s]) => ({ id, ...s }));
+    return Object.keys(STRATEGIES).map((id) => copy(id, STRATEGIES[id]));
   }
 
   function get(id) {
-    return STRATEGIES[id] ? { id, ...STRATEGIES[id] } : null;
+    return copy(id, own(id));
   }
 
   function defaults() {
     return get("confluence");
   }
 
-  root.CYBER_STRATEGIES = { list, get, defaults, STRATEGIES };
+  // Engine internals need the preset table, but neither callers nor accidental
+  // mutations should be able to alter trading behavior for the rest of the
+  // session. Public get/list calls still return independent mutable copies.
+  for (const id of Object.keys(STRATEGIES)) {
+    Object.freeze(STRATEGIES[id].params);
+    Object.freeze(STRATEGIES[id].weights);
+    Object.freeze(STRATEGIES[id]);
+  }
+  Object.freeze(STRATEGIES);
+
+  root.CYBER_STRATEGIES = Object.freeze({ list, get, defaults, STRATEGIES });
 })(typeof self !== "undefined" ? self : globalThis);

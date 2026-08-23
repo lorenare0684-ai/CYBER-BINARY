@@ -10,7 +10,7 @@
     <div class="shell">
       <header class="top">
         <div>
-          <p class="kicker">Quotex signal lab · v2</p>
+          <p class="kicker">Quotex signal lab · v2.4</p>
           <h1>CYBER BINARY</h1>
         </div>
         <div class="top-right">
@@ -47,6 +47,7 @@
         <section class="hero" id="hero" data-dir="WAIT">
           <div class="dir" id="dir">WAIT</div>
           <div class="reason" id="reason">Warming engine…</div>
+          <div class="signal-timing" id="signal-timing">Entry — · Expiry — · Exit —</div>
           <div class="asset-row">
             <span id="asset">—</span>
             <span id="price">—</span>
@@ -101,7 +102,7 @@
             <select id="auto-mode">
               <option value="off">Off</option>
               <option value="alerts">Alerts only</option>
-              <option value="click">Click CALL/PUT</option>
+              <option value="click">Execute CALL/PUT</option>
             </select>
           </label>
           <label class="ctl">
@@ -151,9 +152,10 @@
         </section>
 
         <p class="warn">
-          <strong>Click mode</strong> actively clicks the CALL/PUT button on the visible
-          Quotex chart using your stake and the strategy you selected. It is gated by
-          confidence, daily loss cap, and trade-rate caps. Toggle off at any time.
+          <strong>Execute mode</strong> submits CALL/PUT on the selected main Quotex tab,
+          prefers the authenticated page socket, and requires broker confirmation. Its
+          conservative DOM fallback never clicks unverified chart/menu icons. Confidence,
+          loss, cooldown, and trade-rate caps still apply. Toggle off at any time.
         </p>
       </section>
 

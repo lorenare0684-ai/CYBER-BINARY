@@ -6,7 +6,7 @@
  *   - tools/page-hook.shell.js (MAIN-world WebSocket hook shell)
  *
  * Rebuild after any change to either source file.
- * Generated: 2026-08-22T15:48:04.056Z
+ * Generated: 2026-08-23T05:25:11.351Z
  */
 /* ====================================================================
  * Inlined CYBER_QUOTEX adapter (src/lib/quotex.js).
@@ -119,7 +119,9 @@
   };
 
   // Build reverse index: numeric id -> symbol
-  var ID_TO_SYMBOL = {};
+  var ID_TO_SYMBOL = Object.create(null);
+  var runtimeSymbolCount = 0;
+  var MAX_RUNTIME_SYMBOLS = 1000;
   for (var k in ASSET_IDS) {
     if (Object.prototype.hasOwnProperty.call(ASSET_IDS, k)) {
       ID_TO_SYMBOL[ASSET_IDS[k]] = k;
@@ -135,18 +137,24 @@
   function rememberIds(list) {
     if (!Array.isArray(list)) return 0;
     var added = 0;
-    for (var i = 0; i < list.length; i++) {
+    for (var i = 0; i < list.length && i < 5000; i++) {
       var it = list[i];
-      if (!it || !it.symbol) continue;
+      if (!it || typeof it !== "object" || !it.symbol) continue;
       var sym = normalizeSymbolName(it.symbol);
-      var id = parseInt(it.id, 10) || 0;
-      if (sym && id) {
-        if (!Object.prototype.hasOwnProperty.call(ASSET_IDS, sym) || ASSET_IDS[sym] !== id) {
+      var id = positiveId(it.id);
+      if (!sym) continue;
+      var known = Object.prototype.hasOwnProperty.call(ASSET_IDS, sym);
+      if (!known && runtimeSymbolCount >= MAX_RUNTIME_SYMBOLS) continue;
+      if (!known) runtimeSymbolCount++;
+      if (id) {
+        if (!known || ASSET_IDS[sym] !== id) {
+          var oldId = positiveId(ASSET_IDS[sym]);
+          if (oldId && ID_TO_SYMBOL[oldId] === sym) delete ID_TO_SYMBOL[oldId];
           ASSET_IDS[sym] = id;
           ID_TO_SYMBOL[id] = sym;
           added++;
         }
-      } else if (sym && !Object.prototype.hasOwnProperty.call(ASSET_IDS, sym)) {
+      } else if (!known) {
         // Known symbol, id not (yet) present in the row — keep it listed.
         ASSET_IDS[sym] = 0;
         added++;
@@ -157,7 +165,7 @@
 
   function isQuotexHost(host) {
     if (!host) return false;
-    return /(^|\.)(qxbroker|quotex)\.com$/i.test(host);
+    return /(^|\.)(qxbroker|quotex)\.(?:com|io)$/i.test(host);
   }
 
   function isQuotexPage() {
@@ -192,15 +200,17 @@
    *   {type:"unknown", raw}          anything else we couldn't classify
    * ============================================================ */
   function bytesToStr(u8) {
-    // String.fromCharCode.apply with a huge array throws
-    // "Maximum call stack size exceeded" (>~64k elements), and the
-    // instruments/history binary payloads are often >1MB. Chunk it.
+    // Broker JSON is UTF-8. fromCharCode corrupts non-ASCII instrument names;
+    // prefer TextDecoder and retain a chunked legacy fallback.
+    if (typeof TextDecoder !== "undefined") {
+      try { return new TextDecoder("utf-8").decode(u8); } catch (_) {}
+    }
     var out = "";
     var CHUNK = 0x8000;
     for (var i = 0; i < u8.length; i += CHUNK) {
       out += String.fromCharCode.apply(null, u8.subarray(i, i + CHUNK));
     }
-    return out;
+    try { return decodeURIComponent(escape(out)); } catch (_) { return out; }
   }
 
   function asString(raw) {
@@ -224,6 +234,22 @@
     try { return JSON.parse(s); } catch (_) { return null; }
   }
 
+  function socketArrayPacket(s, offset) {
+    var i = offset;
+    var namespace = null;
+    if (s.charAt(i) === "/") {
+      var comma = s.indexOf(",", i);
+      if (comma < 0) return null;
+      namespace = s.slice(i, comma);
+      i = comma + 1;
+    }
+    var idText = "";
+    while (i < s.length && /\d/.test(s.charAt(i))) { idText += s.charAt(i); i++; }
+    if (s.charAt(i) !== "[") return null;
+    var arr = safeJSON(s.slice(i));
+    return Array.isArray(arr) ? { array: arr, namespace: namespace, id: idText ? Number(idText) : null } : null;
+  }
+
   function decodeFrame(raw) {
     var s = asString(raw);
     if (!s) return null;
@@ -237,7 +263,7 @@
     if (s === "2") return { type: "eio", kind: "ping", raw: s };
     if (s === "3") return { type: "eio", kind: "pong", raw: s };
     // Socket.IO connect ack
-    if (s === "40" || s.indexOf("40") === 0) {
+    if (/^40(?:$|\/|\{)/.test(s)) {
       var p2 = null;
       if (s.length > 2) p2 = safeJSON(s.slice(2));
       return { type: "eio", kind: "connect", payload: p2, raw: s };
@@ -280,21 +306,23 @@
     }
     // 42["event", payload] — Socket.IO event
     if (s.indexOf("42") === 0) {
-      var arr2 = safeJSON(s.slice(2));
+      var packet2 = socketArrayPacket(s, 2);
+      var arr2 = packet2 && packet2.array;
       if (Array.isArray(arr2) && arr2.length >= 1) {
-        return { type: "sio", event: String(arr2[0] || ""), payload: arr2.length > 1 ? arr2[1] : null, raw: s };
+        return { type: "sio", event: String(arr2[0] || ""), payload: arr2.length > 1 ? arr2[1] : null,
+          namespace: packet2.namespace, id: packet2.id, raw: s };
       }
-      return { type: "unknown", raw: s };
+      return { type: "unknown", raw: s.length > 240 ? s.slice(0, 240) + "…" : s };
     }
-    // 43["event", payload] — Socket.IO acknowledgement packet. Quotex-style
-    // servers answer `history/list/v2`, `tick`, `instruments/list` and
-    // `quotes/stream` with ACK packets, so treat them exactly like events.
+    // 43<ackId>["event", payload] — Socket.IO acknowledgement packet.
     if (s.indexOf("43") === 0) {
-      var ack2 = safeJSON(s.slice(2));
+      var ackPacket = socketArrayPacket(s, 2);
+      var ack2 = ackPacket && ackPacket.array;
       if (Array.isArray(ack2) && ack2.length >= 1) {
-        return { type: "sio", ack: true, event: String(ack2[0] || ""), payload: ack2.length > 1 ? ack2[1] : null, raw: s };
+        return { type: "sio", ack: true, event: String(ack2[0] || ""), payload: ack2.length > 1 ? ack2[1] : null,
+          namespace: ackPacket.namespace, id: ackPacket.id, raw: s };
       }
-      return { type: "unknown", raw: s };
+      return { type: "unknown", raw: s.length > 240 ? s.slice(0, 240) + "…" : s };
     }
     // Binary body: byte 0x04 followed by JSON
     if (s.charCodeAt(0) === 4 && s.length > 1) {
@@ -383,27 +411,35 @@
       if (!p.length) return "unknown";
       var first = p[0];
       if (Array.isArray(first) && first.length >= 3) {
-        if (typeof first[0] === "string" && (typeof first[1] === "number" || typeof first[1] === "string") && typeof first[2] === "number") {
+        if (typeof first[0] === "string" && !/^\d+$/.test(first[0].trim()) && normalizeSymbolName(first[0]) &&
+            numberValue(first[1]) != null && numberValue(first[2]) != null) {
           return "quote"; // quotes/stream shape: [symbol, ts, price, ...]
         }
         if (typeof first[0] === "number" && typeof first[1] === "string" && typeof first[2] === "string") {
           return "instruments"; // [id, symbol, name, ...]
         }
+        var n0 = numberValue(first[0]), n1 = numberValue(first[1]), n2 = numberValue(first[2]);
+        if (first.length === 3 && n0 != null && n1 != null && n2 != null &&
+            (ID_TO_SYMBOL[n0] || n1 > 1e9)) {
+          return "quote"; // [assetId, timestamp, price]
+        }
         // Candle rows: [ts, open, low, high, close, ...] or [ts, open, high, low, close, ...]
-        if (typeof first[0] === "number" && typeof first[1] === "number" && typeof first[2] === "number" &&
-            typeof first[3] === "number" && typeof first[4] === "number" && first.length >= 5) {
-          if (first[0] > 1e9) return "candles"; // timestamps far in the past → history batch
+        if (first.length >= 5 && n0 != null && n1 != null && n2 != null &&
+            numberValue(first[3]) != null && numberValue(first[4]) != null) {
+          if (n0 > 1e9) return "candles"; // timestamps far in the past → history batch
         }
       }
       return "unknown";
     }
     if (typeof p === "object") {
       if (("asset" in p || "symbol" in p) && ("history" in p || "candles" in p || "period" in p)) return "candles";
-      if (("instrument" in p && Array.isArray(p.instrument)) || ("instruments" in p && Array.isArray(p.instruments))) return "instruments";
+      if (("instrument" in p && Array.isArray(p.instrument)) ||
+          ("instruments" in p && p.instruments && (Array.isArray(p.instruments) || typeof p.instruments === "object"))) return "instruments";
+      if (Array.isArray(p.tick) || Array.isArray(p.quotes)) return "quote";
       if (("asset" in p || "symbol" in p) && ("price" in p || "value" in p)) return "quote";
       if ("uid" in p && "balance" in p) return "balance";
-      if ("id" in p && ("openPrice" in p || "openTime" in p)) return "order_opened";
-      if ("deals" in p || "ticket" in p) return "order_closed";
+      if ("deals" in p || "ticket" in p || "closePrice" in p || "closeTime" in p || "profit" in p || "netProfit" in p) return "order_closed";
+      if (("id" in p || "requestId" in p) && ("openPrice" in p || "openTime" in p)) return "order_opened";
     }
     return "unknown";
   }
@@ -413,7 +449,52 @@
    *    payload into the engine-friendly shape used by content.js.
    * ============================================================ */
   function normalizeSymbolName(s) {
-    return String(s || "").trim().toUpperCase().replace(/_OTC/g, "_otc");
+    if (typeof s !== "string" && typeof s !== "number") return "";
+    var symbol = String(s).trim().toUpperCase().replace(/_OTC/g, "_otc");
+    if (!symbol || symbol.length > 64 || !/^[A-Z0-9][A-Z0-9._-]*$/i.test(symbol)) return "";
+    return symbol;
+  }
+
+  function numberValue(value) {
+    if (value == null || typeof value === "boolean" ||
+        (typeof value === "string" && !value.trim())) return null;
+    try {
+      var n = Number(value);
+      return Number.isFinite(n) ? n : null;
+    } catch (_) { return null; }
+  }
+
+  function positiveId(value) {
+    var n = numberValue(value);
+    return n != null && Number.isSafeInteger(n) && n > 0 && n <= 1000000000 ? n : 0;
+  }
+
+  function cleanTimeframes(raw) {
+    if (!Array.isArray(raw)) return [];
+    var seen = Object.create(null);
+    var out = [];
+    for (var i = 0; i < raw.length && out.length < 64; i++) {
+      var item = raw[i];
+      var value = item && typeof item === "object"
+        ? (item.time != null ? item.time : (item.value != null ? item.value : (Array.isArray(item) ? item[0] : null)))
+        : item;
+      var n = numberValue(value);
+      if (n == null || n <= 0 || n > 86400) continue;
+      n = Math.floor(n);
+      if (seen[n]) continue;
+      seen[n] = true;
+      out.push(n);
+    }
+    return out.sort(function (a, b) { return a - b; });
+  }
+
+  function brokerBool(value, fallback) {
+    if (value == null) return fallback;
+    if (value === false || value === 0) return false;
+    var s = String(value).trim().toLowerCase();
+    if (s === "false" || s === "0" || s === "closed" || s === "no") return false;
+    if (s === "true" || s === "1" || s === "open" || s === "yes") return true;
+    return !!value;
   }
 
   function parseInstruments(payload) {
@@ -426,36 +507,68 @@
       else if (Array.isArray(payload.data)) list = payload.data;
       else if (Array.isArray(payload.result)) list = payload.result;
       else {
-        // Keyed by symbol: { EURUSD: {...}, ... } — take the first list value.
+        // Keyed by symbol: { EURUSD: {...}, ... } or by category arrays.
+        // Flatten every category; selecting only the first array silently
+        // dropped crypto/stocks whenever forex appeared first.
+        var objectRows = [];
+        var categoryRows = [];
+        var inspectedKeys = 0;
         for (var key in payload) {
-          if (Object.prototype.hasOwnProperty.call(payload, key) && Array.isArray(payload[key])) {
-            list = payload[key];
-            break;
+          if (!Object.prototype.hasOwnProperty.call(payload, key) || inspectedKeys++ >= 5000) continue;
+          if (Array.isArray(payload[key])) {
+            for (var ci = 0; ci < payload[key].length && categoryRows.length < 5000; ci++) categoryRows.push(payload[key][ci]);
+          } else if (payload[key] && typeof payload[key] === "object") {
+            objectRows.push(Object.assign({}, payload[key], { symbol: payload[key].symbol || key }));
           }
         }
+        if (categoryRows.length || objectRows.length) list = categoryRows.concat(objectRows);
       }
     }
     if (!Array.isArray(list)) return [];
     var out = [];
-    for (var i = 0; i < list.length; i++) {
+    var seenSymbols = Object.create(null);
+    for (var i = 0; i < list.length && i < 5000 && out.length < 2000; i++) {
       var row = list[i];
+      if (row && !Array.isArray(row) && typeof row === "object") {
+        var objSymbol = normalizeSymbolName(row.symbol || row.asset || row.code || "");
+        if (!objSymbol) continue;
+        if (seenSymbols[objSymbol]) continue;
+        seenSymbols[objSymbol] = true;
+        var rawTfs = row.timeframes || row.periods || row.times || [];
+        var objTfs = cleanTimeframes(rawTfs);
+        var objPayout = numberValue(row.payout);
+        out.push({
+          id: positiveId(row.id != null ? row.id : row.assetId),
+          symbol: objSymbol,
+          name: String(row.name || row.title || objSymbol).slice(0, 128),
+          type: String(row.type || row.kind || "unknown").slice(0, 32),
+          payout: objPayout != null ? Math.max(0, Math.min(100, objPayout)) : 0,
+          isOpen: brokerBool(row.isOpen != null ? row.isOpen : row.open, true),
+          isOtc: /_otc$/i.test(objSymbol),
+          timeframes: objTfs.length ? objTfs : [60, 120, 180, 300, 600, 900, 1800, 3600],
+        });
+        continue;
+      }
       if (!Array.isArray(row) || row.length < 3) continue;
       // Canonical broker row: [id, symbol, name, type, ..., payout(5), ..., tfs(12), ..., open(14)]
       // Some clients send [symbol, name, id, ...] — detect + reorder.
       var sf = typeof row[0] === "string" &&
         (typeof row[2] === "number" || /^\d+$/.test(String(row[2]))); // symbol-first row
       var id = 0;
-      if (typeof row[0] === "number" || /^\d+$/.test(String(row[0]))) id = parseInt(row[0], 10) || 0;
-      if (!id && sf) id = parseInt(row[2], 10) || 0;
+      if (typeof row[0] === "number" || /^\d+$/.test(String(row[0]))) id = positiveId(row[0]);
+      if (!id && sf) id = positiveId(row[2]);
       var raw_symbol = String(sf ? row[0] : row[1] || "").trim();
       if (!raw_symbol) continue;
       var symbol = normalizeSymbolName(raw_symbol);
-      var name = String(sf ? (row[1] || symbol) : (row[2] || symbol));
-      var type = String(row[3] || "unknown");
-      var payout = parseInt(sf ? row[6] : row[5], 10) || 0;
+      if (!symbol || seenSymbols[symbol]) continue;
+      seenSymbols[symbol] = true;
+      var name = String(sf ? (row[1] || symbol) : (row[2] || symbol)).slice(0, 128);
+      var type = String(row[3] || "unknown").slice(0, 32);
+      var rawPayout = numberValue(sf ? row[6] : row[5]);
+      var payout = rawPayout != null ? Math.max(0, Math.min(100, rawPayout)) : 0;
       var isOpen = true;
       var openIdx = row.length > (sf ? 15 : 14) ? (sf ? 15 : 14) : 14;
-      if (row.length > openIdx) isOpen = !!row[openIdx];
+      if (row.length > openIdx) isOpen = brokerBool(row[openIdx], true);
       var tfs = [];
       // Timeframes can sit at 12/13 (timeframe list) or 15/16 (objects).
       for (var tIdx = 12; tIdx <= 16 && tIdx < row.length; tIdx++) {
@@ -468,6 +581,7 @@
           else if (tf && typeof tf === "object" && "time" in tf) tfs.push(parseInt(tf.time, 10));
         }
       }
+      tfs = cleanTimeframes(tfs);
       out.push({
         id: id,
         symbol: symbol,
@@ -476,7 +590,7 @@
         payout: payout,
         isOpen: isOpen,
         isOtc: /_otc$/i.test(symbol),
-        timeframes: tfs.length ? Array.from(new Set(tfs)).sort(function (a, b) { return a - b; }) : [60, 120, 180, 300, 600, 900, 1800, 3600],
+        timeframes: tfs.length ? tfs : [60, 120, 180, 300, 600, 900, 1800, 3600],
       });
     }
     return out;
@@ -484,16 +598,20 @@
 
   function parseCandles(payload) {
     if (!payload || typeof payload !== "object") return null;
-    var asset = payload.asset || payload.symbol || payload.pair || null;
-    var period = payload.period || payload.timeframe || null;
-    var rows = payload.history || payload.candles || payload.data || null;
+    var body = payload.data && !Array.isArray(payload.data) && typeof payload.data === "object"
+      ? payload.data : payload;
+    var asset = body.asset || body.symbol || body.pair || payload.asset || payload.symbol || payload.pair || null;
+    if (asset != null && /^\d+$/.test(String(asset)) && ID_TO_SYMBOL[Number(asset)]) asset = ID_TO_SYMBOL[Number(asset)];
+    var period = body.period != null ? body.period : (body.timeframe != null ? body.timeframe : (payload.period || payload.timeframe || null));
+    var rows = body.history || body.candles || (Array.isArray(body.data) ? body.data : null) || (Array.isArray(payload.data) ? payload.data : null) || null;
     if (!asset || period == null) {
       // Some servers push {history:[...]} without metadata (headerless flow).
       // Caller should know the requested asset/period; assume 60s here.
       if (Array.isArray(rows) && rows.length) {
         var first = rows[0];
-        if (Array.isArray(first) && first.length >= 5) {
-          return { asset: asset, period: 60, raw: rows };
+        if (asset && Array.isArray(first) && first.length >= 5) {
+          var inferredAsset = normalizeSymbolName(asset);
+          return inferredAsset ? { asset: inferredAsset, period: 60, raw: rows } : null;
         }
       }
       return null;
@@ -501,53 +619,75 @@
     if (typeof period === "object" && period != null) {
       period = period.time != null ? period.time : (period.value != null ? period.value : 60);
     }
-    period = parseInt(period, 10) || 60;
+    period = numberValue(period);
+    period = period != null && period > 0 ? Math.min(86400, Math.floor(period)) : 60;
     if (!Array.isArray(rows)) rows = [];
-    return { asset: String(asset), period: period, raw: rows };
+    asset = normalizeSymbolName(asset);
+    if (!asset) return null;
+    return { asset: asset, period: period, raw: rows };
   }
 
   function normalizeCandles(parsed) {
     if (!parsed || !Array.isArray(parsed.raw)) return [];
-    var out = [];
-    for (var i = 0; i < parsed.raw.length; i++) {
+    var byTime = Object.create(null);
+    var start = Math.max(0, parsed.raw.length - 5000);
+    for (var i = start; i < parsed.raw.length; i++) {
       var row = parsed.raw[i];
-      if (!Array.isArray(row) || row.length < 5) continue;
-      // Format seen: [ts, open, low, high, close, vol?]
-      // Defensive: also accept [ts, open, high, low, close, vol?]
-      var ts = parseFloat(row[0]);
-      var o = parseFloat(row[1]);
-      var a = parseFloat(row[2]);
-      var b = parseFloat(row[3]);
-      var c = parseFloat(row[4]);
-      if (!Number.isFinite(ts) || !Number.isFinite(o) || !Number.isFinite(c)) continue;
-      if (!Number.isFinite(a) || !Number.isFinite(b)) {
-        a = Math.max(o, c); b = Math.min(o, c);
-      } else {
-        var hi = Math.max(a, b), lo = Math.min(a, b);
-        a = hi; b = lo;
+      if (row && !Array.isArray(row) && typeof row === "object") {
+        row = [
+          row.time != null ? row.time : (row.ts != null ? row.ts : row.timestamp),
+          row.open, row.low, row.high, row.close,
+          row.volume != null ? row.volume : row.vol,
+        ];
       }
-      var vol = row.length > 5 && row[5] != null ? parseFloat(row[5]) : 0;
-      // ts is either a unix-seconds value (~1.7e9) or a unix-ms value (~1.7e12).
-      var tMs = ts > 1e12 ? Math.floor(ts) : Math.floor(ts * 1000);
-      out.push({
+      if (!Array.isArray(row) || row.length < 5) continue;
+      // Quotex history rows are [ts, open, low, high, close, vol?]. Some
+      // regions reverse low/high, so derive the envelope from ALL OHLC fields
+      // rather than trusting positions 2/3. This prevents inverted or clipped
+      // candle wicks on the dashboard.
+      var ts = numberValue(row[0]);
+      var o = numberValue(row[1]);
+      var a = numberValue(row[2]);
+      var b = numberValue(row[3]);
+      var c = numberValue(row[4]);
+      if (ts == null || o == null || c == null ||
+          o <= 0 || c <= 0 || o > 1e100 || c > 1e100) continue;
+      var hi = Math.max(o, c);
+      var lo = Math.min(o, c);
+      if (a != null && a > 0 && a <= 1e100) { hi = Math.max(hi, a); lo = Math.min(lo, a); }
+      if (b != null && b > 0 && b <= 1e100) { hi = Math.max(hi, b); lo = Math.min(lo, b); }
+      var rawVol = row.length > 5 && row[5] != null ? numberValue(row[5]) : 0;
+      var vol = rawVol == null ? 0 : rawVol;
+      // Accept unix seconds, milliseconds, microseconds, or nanoseconds consistently.
+      var tMs = toMs(ts);
+      if (!Number.isFinite(tMs) || tMs < 0) continue;
+      byTime[tMs] = {
         time: tMs,
-        open: o, high: a, low: b, close: c,
-        volume: Number.isFinite(vol) ? vol : 0,
-      });
+        open: o, high: hi, low: lo, close: c,
+        volume: Number.isFinite(vol) && vol >= 0 ? Math.min(vol, 1e100) : 0,
+      };
     }
+    var times = Object.keys(byTime).map(Number).sort(function (x, y) { return x - y; });
+    var out = [];
+    for (var j = 0; j < times.length; j++) out.push(byTime[times[j]]);
     return out;
   }
 
   function toMs(ts) {
     if (ts == null) return null;
-    var n = typeof ts === "number" ? ts : parseFloat(ts);
-    if (!Number.isFinite(n)) {
-      var d = Date.parse(String(ts));
-      return Number.isFinite(d) ? d : null;
+    var n = numberValue(ts);
+    if (n == null) {
+      try {
+        var d = Date.parse(String(ts));
+        return Number.isFinite(d) && Math.abs(d) <= 8640000000000000 ? d : null;
+      } catch (_) { return null; }
     }
-    if (n > 1e12) return Math.floor(n);            // already ms
-    if (n > 1e9) return Math.floor(n * 1000);      // unix seconds
-    return Math.floor(n);                          // unknown small value
+    // Repeated division handles both microsecond and nanosecond unix stamps.
+    while (Math.abs(n) >= 1e14) n /= 1000;
+    if (Math.abs(n) >= 1e11) n = Math.floor(n);       // unix milliseconds
+    else if (Math.abs(n) >= 1e9) n = Math.floor(n * 1000); // unix seconds
+    else n = Math.floor(n);                           // relative/test value
+    return Number.isSafeInteger(n) && Math.abs(n) <= 8640000000000000 ? n : null;
   }
 
   function parseQuote(payload) {
@@ -563,95 +703,187 @@
       if (!payload.length) return null;
       var first = Array.isArray(payload[0]) ? payload[0] : payload;
       // [symbol, ts, price, ...]
-      if (typeof first[0] === "string") {
+      if (typeof first[0] === "string" && !/^\d+$/.test(first[0].trim())) {
         symbol = String(first[0]);
         ts = first[1];
-        price = parseFloat(first[2]);
+        price = numberValue(first[2]);
       }
       // [ts, symbol, price]
       if (price == null && typeof first[1] === "string") {
         ts = first[0];
         symbol = String(first[1]);
-        price = parseFloat(first[2]);
+        price = numberValue(first[2]);
       }
-      // [assetId, ts, price] — resolve the numeric broker id to a symbol
-      if (price == null && typeof first[0] === "number" && typeof first[1] === "number" && first.length >= 3) {
-        var byId = ID_TO_SYMBOL[first[0]];
+      // [assetId, ts, price] — resolve the numeric broker id to a symbol.
+      // Some broker regions serialize every tuple field as a string.
+      var numericId = numberValue(first[0]);
+      var numericTs = numberValue(first[1]);
+      if (price == null && numericId != null && numericTs != null && first.length >= 3) {
+        var byId = ID_TO_SYMBOL[numericId];
         if (byId) {
           symbol = byId;
-          ts = first[1];
-          price = parseFloat(first[2]);
-        } else {
-          ts = first[1];
-          price = parseFloat(first[2]);
+          ts = numericTs;
+          price = numberValue(first[2]);
         }
       }
-      // [ts, price] — two-element rows on some streams
-      if (price == null && typeof first[1] === "number" && first.length >= 2) {
+      // [ts, price] — two-element rows on some streams. Headerless quotes
+      // cannot identify an asset here and are therefore rejected below.
+      if (price == null && numericTs != null && first.length === 2) {
         ts = first[0];
-        price = parseFloat(first[1]);
+        price = numericTs;
       }
     } else if (typeof payload === "object") {
       symbol = payload.symbol || payload.asset || payload.pair || null;
       ts = payload.time != null ? payload.time : (payload.ts != null ? payload.ts : null);
-      price = payload.price != null ? parseFloat(payload.price)
-            : payload.value != null ? parseFloat(payload.value)
-            : payload.close != null ? parseFloat(payload.close) : null;
+      price = payload.price != null ? numberValue(payload.price)
+            : payload.value != null ? numberValue(payload.value)
+            : payload.close != null ? numberValue(payload.close) : null;
     }
-    if (!symbol || price == null || !Number.isFinite(price)) return null;
+    var symbolId = numberValue(symbol);
+    if (symbolId != null && /^\d+$/.test(String(symbol).trim()) && ID_TO_SYMBOL[symbolId]) {
+      symbol = ID_TO_SYMBOL[symbolId];
+    }
+    symbol = normalizeSymbolName(symbol);
+    if (!symbol || price == null || !Number.isFinite(price) || price <= 0 || price > 1e100) return null;
     return {
-      symbol: String(symbol),
+      symbol: symbol,
       time: toMs(ts),
       price: price,
-      raw: payload,
     };
+  }
+
+  function parseQuotes(payload) {
+    if (!payload) return [];
+    if (!Array.isArray(payload) && typeof payload === "object") {
+      if (Array.isArray(payload.tick)) return parseQuotes(payload.tick);
+      if (Array.isArray(payload.quotes)) return parseQuotes(payload.quotes);
+    }
+    var out = [];
+    if (Array.isArray(payload) && payload.length &&
+        (Array.isArray(payload[0]) || (payload[0] && typeof payload[0] === "object"))) {
+      var quoteStart = Math.max(0, payload.length - 5000);
+      for (var i = quoteStart; i < payload.length; i++) {
+        var nested = parseQuote(payload[i]);
+        if (nested) out.push(nested);
+      }
+      return out;
+    }
+    var one = parseQuote(payload);
+    if (one) out.push(one);
+    return out;
   }
 
   function parseBalance(payload) {
     if (!payload || typeof payload !== "object") return null;
-    var uid = payload.uid || 0;
-    var bal = payload.balance || payload.amount || 0;
+    var uid = positiveId(payload.uid);
+    var bal = numberValue(payload.balance != null ? payload.balance : (payload.amount != null ? payload.amount : 0));
     return {
-      uid: parseInt(uid, 10) || 0,
-      balance: parseFloat(bal) || 0,
-      currency: payload.currency || "USD",
-      isDemo: payload.isDemo != null ? !!payload.isDemo : (payload.is_demo != null ? !!payload.is_demo : null),
-      accountType: payload.accountType || payload.account_type || null,
-      raw: payload,
+      uid: uid,
+      balance: bal != null && bal >= 0 && bal <= 1e100 ? bal : 0,
+      currency: String(payload.currency || "USD").slice(0, 16),
+      isDemo: payload.isDemo != null ? brokerBool(payload.isDemo, null) : (payload.is_demo != null ? brokerBool(payload.is_demo, null) : null),
+      accountType: payload.accountType || payload.account_type
+        ? String(payload.accountType || payload.account_type).slice(0, 32) : null,
     };
   }
 
+  function orderBody(payload) {
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) return payload;
+    var nested = payload.order || payload.deal || payload.ticket || payload.data;
+    return nested && typeof nested === "object" && !Array.isArray(nested) ? nested : payload;
+  }
+
+  function orderDirection(payload) {
+    var command = numberValue(payload.command);
+    var action = String(payload.action != null ? payload.action : (payload.direction != null ? payload.direction : "")).toLowerCase();
+    if (command === 0 || action === "call" || action === "buy" || action === "up") return "CALL";
+    if (command === 1 || action === "put" || action === "sell" || action === "down") return "PUT";
+    return null;
+  }
+
+  function positiveNumber(value) {
+    var n = numberValue(value);
+    return n != null && n > 0 && n <= 1e100 ? n : 0;
+  }
+
   function parseOrderOpened(payload) {
-    if (!payload || typeof payload !== "object") return null;
-    if (typeof payload === "string") return null; // "OPEN" text ack ignored
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+    payload = orderBody(payload);
+    var openTime = toMs(payload.openTime != null ? payload.openTime : payload.openTimestamp);
+    var closeTime = toMs(payload.closeTime != null ? payload.closeTime : payload.closeTimestamp);
+    var rawDuration = numberValue(payload.duration);
+    var duration = Number.isFinite(rawDuration) && rawDuration > 0 ? Math.min(86400, Math.floor(rawDuration)) : 0;
+    if (!closeTime && openTime != null && duration) closeTime = openTime + duration * 1000;
+    var rawId = payload.id != null ? payload.id : payload.orderId;
+    if (rawId == null && payload.requestId == null && !payload.asset && !payload.symbol) return null;
     return {
-      id: String(payload.id || payload.orderId || ""),
-      requestId: payload.requestId != null ? String(payload.requestId) : null,
-      asset: String(payload.asset || ""),
-      amount: parseFloat(payload.amount) || 0,
-      direction: payload.command === 0 || payload.action === "call" ? "CALL"
-                : payload.command === 1 || payload.action === "put"  ? "PUT" : null,
-      openPrice: parseFloat(payload.openPrice) || 0,
-      openTime: payload.openTime || payload.openTimestamp || null,
-      closeTime: payload.closeTime || payload.closeTimestamp || null,
-      duration: parseInt(payload.duration, 10) || 0,
+      id: rawId != null ? String(rawId).slice(0, 128) : "",
+      requestId: payload.requestId != null ? String(payload.requestId).slice(0, 128) : null,
+      asset: normalizeSymbolName(payload.asset || payload.symbol || ""),
+      amount: positiveNumber(payload.amount),
+      direction: orderDirection(payload),
+      openPrice: positiveNumber(payload.openPrice),
+      openTime: openTime,
+      closeTime: closeTime,
+      expiryTime: closeTime,
+      duration: duration,
       status: "OPEN",
     };
   }
 
   function parseOrderClosed(payload) {
-    if (!payload || typeof payload !== "object") return null;
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+    payload = orderBody(payload);
+    var profit = numberValue(payload.profit);
+    if (profit != null && Math.abs(profit) > 1e100) profit = null;
+    var amount = positiveNumber(payload.amount);
+    var resultText = String(payload.result || payload.status || payload.outcome || "").trim().toLowerCase();
+    var explicitWin = payload.win === true || /^(win|won|success)$/.test(resultText);
+    var explicitLoss = payload.loss === true || /^(loss|lost|lose|failed)$/.test(resultText);
+    var explicitDraw = payload.draw === true || /^(draw|tie|equal|refund|refunded|cancelled|canceled)$/.test(resultText);
+    var explicitNet = numberValue(payload.netProfit != null ? payload.netProfit : payload.net_profit);
+    if (explicitNet != null && Math.abs(explicitNet) > 1e100) explicitNet = null;
+    // Quotex commonly reports gross return in `profit` (zero on loss). Expose
+    // a net value for risk caps while retaining the broker field unchanged.
+    // Missing outcome fields stay UNKNOWN; treating missing profit as zero
+    // fabricated a full-stake loss and froze the asset.
+    var netProfit = null;
+    if (explicitNet != null) netProfit = explicitNet;
+    else if (explicitDraw || (amount > 0 && profit != null && profit === amount)) netProfit = 0;
+    else if (explicitLoss) netProfit = profit != null && profit < 0 ? profit : (amount > 0 ? -amount : null);
+    else if (explicitWin && profit != null) netProfit = amount > 0 && profit >= amount ? profit - amount : profit;
+    else if (profit != null && profit < 0) netProfit = profit;
+    else if (amount > 0 && profit === 0) netProfit = -amount;
+    else if (amount > 0 && profit != null && profit > amount) netProfit = profit - amount;
+    else if (profit != null) netProfit = profit;
+    var draw = explicitDraw || (!explicitWin && !explicitLoss && netProfit === 0);
+    var win = !draw && (explicitWin || (!explicitLoss && netProfit != null && netProfit > 0));
+    var loss = !draw && (explicitLoss || (!explicitWin && netProfit != null && netProfit < 0));
+    var openTime = toMs(payload.openTime != null ? payload.openTime : payload.openTimestamp);
+    var closeTime = toMs(payload.closeTime != null ? payload.closeTime : payload.closeTimestamp);
+    var rawDuration = numberValue(payload.duration);
+    var duration = Number.isFinite(rawDuration) && rawDuration > 0
+      ? Math.min(86400, Math.floor(rawDuration))
+      : (openTime != null && closeTime != null ? Math.max(0, Math.min(86400, Math.round((closeTime - openTime) / 1000))) : 0);
+    var rawId = payload.id != null ? payload.id : payload.orderId;
+    if (rawId == null && payload.requestId == null && !payload.asset && !payload.symbol) return null;
     return {
-      id: String(payload.id || ""),
-      asset: String(payload.asset || ""),
-      amount: parseFloat(payload.amount) || 0,
-      profit: parseFloat(payload.profit) || 0,
-      win: (parseFloat(payload.profit) || 0) > 0,
-      loss: (parseFloat(payload.profit) || 0) < 0,
-      openPrice: parseFloat(payload.openPrice) || 0,
-      closePrice: parseFloat(payload.closePrice) || 0,
-      openTime: payload.openTime || null,
-      closeTime: payload.closeTime || null,
+      id: rawId != null ? String(rawId).slice(0, 128) : "",
+      requestId: payload.requestId != null ? String(payload.requestId).slice(0, 128) : null,
+      asset: normalizeSymbolName(payload.asset || payload.symbol || ""),
+      amount: amount,
+      direction: orderDirection(payload),
+      profit: profit,
+      netProfit: netProfit,
+      win: win,
+      loss: loss,
+      draw: draw,
+      openPrice: positiveNumber(payload.openPrice),
+      closePrice: positiveNumber(payload.closePrice),
+      openTime: openTime,
+      closeTime: closeTime,
+      expiryTime: closeTime,
+      duration: duration,
       status: "CLOSED",
     };
   }
@@ -676,15 +908,36 @@
 
   function parsePrice(text) {
     if (text == null) return null;
-    var t = String(text).replace(/\s/g, "");
-    var m = t.match(/(\d{1,7}(?:[.,]\d{1,7})?)/);
+    var source = String(text);
+    var m = source.match(/\d[\d\s.,]*/);
     if (!m) return null;
-    var n = parseFloat(m[1].replace(",", "."));
+    var raw = m[0].replace(/\s/g, "");
+    var comma = raw.lastIndexOf(",");
+    var dot = raw.lastIndexOf(".");
+    if (comma >= 0 && dot >= 0) {
+      // The final separator is decimal; earlier separators are grouping.
+      var decimalAt = Math.max(comma, dot);
+      raw = raw.slice(0, decimalAt).replace(/[.,]/g, "") + "." + raw.slice(decimalAt + 1).replace(/[.,]/g, "");
+    } else if (comma >= 0) {
+      // Comma is decimal unless it is an obvious 3-digit thousands group.
+      var commaDigits = raw.length - comma - 1;
+      var commas = (raw.match(/,/g) || []).length;
+      var obviousGrouping = commas > 1 || (commaDigits === 3 && /[$€£₹]/.test(source));
+      raw = obviousGrouping ? raw.replace(/,/g, "") : raw.replace(/,/g, ".");
+    } else if ((raw.match(/\./g) || []).length > 1) {
+      var lastDot = raw.lastIndexOf(".");
+      raw = raw.slice(0, lastDot).replace(/\./g, "") + "." + raw.slice(lastDot + 1);
+    }
+    var n = Number(raw);
     return Number.isFinite(n) && n > 0 ? n : null;
   }
 
   function findAssetHeader() {
     var sels = [
+      "[aria-current='true'] [class*='asset']",
+      "[aria-selected='true'] [class*='asset']",
+      "[class*='active'][class*='asset']",
+      "[class*='selected'][class*='asset']",
       "[class*='current-symbol']",
       "[class*='asset-select']",
       "[class*='pair-name']",
@@ -695,49 +948,66 @@
       "[data-test*='symbol']",
       "header [class*='active']",
     ];
+    var best = null;
     for (var i = 0; i < sels.length; i++) {
       var nodes = document.querySelectorAll(sels[i]);
-      for (var j = 0; j < nodes.length; j++) {
-        var t = visibleText(nodes[j]);
-        if (t && t.length >= 3 && t.length < 32) return { el: nodes[j], text: t };
+      for (var j = 0; j < nodes.length && j < 100; j++) {
+        var el = nodes[j];
+        if (!isVisible(el)) continue;
+        var t = visibleText(el);
+        if (!t || t.length < 3 || t.length >= 48) continue;
+        // Asset drawers and "open chart" controls may contain every symbol.
+        // Only short leaf-like labels are eligible for the main header.
+        if (el.children && el.children.length > 3) continue;
+        var meta = String(el.className || "") + " " +
+          String(el.getAttribute && (el.getAttribute("aria-current") || el.getAttribute("aria-selected") || ""));
+        var score = 0;
+        if (/active|current|selected|chosen|true/i.test(meta)) score += 20;
+        if (/symbol|pair|asset.?name|trading.?pair/i.test(meta)) score += 8;
+        try {
+          var r = el.getBoundingClientRect();
+          if (r.top >= 0 && r.top < Math.max(220, window.innerHeight * 0.35)) score += 4;
+          if (r.width >= 40 && r.width <= 320) score += 2;
+        } catch (_) {}
+        score -= t.length / 100;
+        if (!best || score > best.score) best = { el: el, text: t, score: score };
       }
     }
-    return null;
+    return best ? { el: best.el, text: best.text } : null;
   }
 
   function findPriceLabel() {
     var sels = [
-      "[class*='current-profit']",
+      // Deliberately exclude `current-profit`: that is an order P&L label,
+      // not the chart quote, and feeding it produced invalid candles.
       "[class*='current-price']",
       "[class*='currentPrice']",
       "[class*='chart-price']",
       "[class*='asset-price']",
       "[class*='price-info']",
       "[class*='quotes'] [class*='price']",
-      ".value__val",
-      "[class*='value__val']",
       "[data-test*='price']",
     ];
     for (var i = 0; i < sels.length; i++) {
       var nodes = document.querySelectorAll(sels[i]);
-      for (var j = 0; j < nodes.length; j++) {
+      for (var j = 0; j < nodes.length && j < 100; j++) {
         if (!isVisible(nodes[j])) continue;
         var p = parsePrice(visibleText(nodes[j]));
-        if (p && p > 0.0001 && p < 1e7) return { el: nodes[j], price: p };
+        if (p && p > 0.0001 && p <= 1e12) return { el: nodes[j], price: p };
       }
     }
-    // Fallback: scan small text nodes near stake panel for the first price-like number.
-    var panel = findPanel();
-    var scope = panel || document;
-    var all = scope.querySelectorAll("span, div, strong, b");
-    for (var k = 0; k < all.length; k++) {
-      if (all[k].children.length > 1) continue;
+    // Fallback: scan only visible leaf nodes whose own class explicitly says
+    // price/quote/rate. Do not scope this to the stake panel, where amount and
+    // payout values can look exactly like prices.
+    var all = document.querySelectorAll("span, div, strong, b");
+    for (var k = 0; k < all.length && k < 800; k++) {
+      if (all[k].children.length > 1 || !isVisible(all[k])) continue;
       var t = visibleText(all[k]);
       if (t.length < 3 || t.length > 18) continue;
       var cls = (all[k].className || "").toString().toLowerCase();
-      if (!/price|quote|rate|last|valor|curso|profit/i.test(cls)) continue;
+      if (!/price|quote|rate|last|valor|curso/i.test(cls)) continue;
       var p2 = parsePrice(t);
-      if (p2 && p2 > 0.0001) return { el: all[k], price: p2 };
+      if (p2 && p2 > 0.0001 && p2 <= 1e12) return { el: all[k], price: p2 };
     }
     return null;
   }
@@ -748,37 +1018,140 @@
   }
 
   function findExpirySelect() {
-    // The expiry is often a button bar, not a <select>. Return both kinds.
+    // Keep this deliberately narrow. A generic `button[class*='time']`
+    // matched chart/history icons on some builds and auto-clicked them.
     var sels = [
       "select[class*='expir']",
-      "select[class*='time']",
-      "[class*='expir'] [class*='option']",
-      "[class*='duration'] [class*='option']",
-      "button[class*='expir']",
-      "button[class*='time']",
+      "select[name*='expir']",
+      "select[data-testid*='expir' i]",
+      "input[class*='expir']",
+      "input[name*='expir']",
+      "input[class*='duration']",
+      "[class*='expiration'] [role='combobox']",
+      "[class*='expiry'] [role='combobox']",
+      "[class*='duration'] [role='combobox']",
     ];
     for (var i = 0; i < sels.length; i++) {
       var nodes = document.querySelectorAll(sels[i]);
-      for (var j = 0; j < nodes.length; j++) {
+      for (var j = 0; j < nodes.length && j < 100; j++) {
         if (isVisible(nodes[j])) return nodes[j];
       }
     }
     return null;
   }
 
+  function parseExpirySeconds(text, nowMs) {
+    var raw = String(text == null ? "" : text).trim().toLowerCase();
+    if (!raw) return null;
+    var h = raw.match(/(\d+(?:[.,]\d+)?)\s*(?:h|hr|hour)/i);
+    var m = raw.match(/(\d+(?:[.,]\d+)?)\s*(?:m|min|minute)/i);
+    var s = raw.match(/(\d+(?:[.,]\d+)?)\s*(?:s|sec|second)/i);
+    if (h || m || s) {
+      var seconds = Math.round((h ? parseFloat(h[1].replace(",", ".")) * 3600 : 0) +
+        (m ? parseFloat(m[1].replace(",", ".")) * 60 : 0) +
+        (s ? parseFloat(s[1].replace(",", ".")) : 0));
+      return Number.isFinite(seconds) && seconds > 0 && seconds <= 86400 ? seconds : null;
+    }
+    var parts = raw.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+    if (parts) {
+      var a = +parts[1], b = +parts[2];
+      if (b >= 60) return null;
+      if (parts[3] != null) {
+        var c = +parts[3];
+        if (c >= 60) return null;
+        var durationSeconds = a * 3600 + b * 60 + c;
+        return durationSeconds > 0 && durationSeconds <= 86400 ? durationSeconds : null;
+      }
+      // Quotex commonly displays an absolute HH:MM expiry clock. Convert it
+      // to a future duration; values <= 4h are treated as MM:SS instead.
+      if (a <= 4) return a || b ? a * 60 + b : null;
+      if (a > 23) return null;
+      var base = numberValue(nowMs);
+      var now = new Date(base != null ? base : Date.now());
+      var target = new Date(now.getTime());
+      target.setHours(a, b, 0, 0);
+      if (target.getTime() <= now.getTime()) target.setDate(target.getDate() + 1);
+      return Math.round((target.getTime() - now.getTime()) / 1000);
+    }
+    if (/^\d+(?:[.,]\d+)?$/.test(raw)) {
+      var numericSeconds = Math.round(parseFloat(raw.replace(",", ".")) * 60);
+      return Number.isFinite(numericSeconds) && numericSeconds > 0 && numericSeconds <= 86400 ? numericSeconds : null;
+    }
+    return null;
+  }
+
+  function setExpiry(expirySec) {
+    var requested = numberValue(expirySec);
+    if (requested == null || requested < 30 || requested > 86400) return { ok: false, error: "invalid expiry" };
+    var wanted = Math.round(requested);
+    var el = findExpirySelect();
+    if (!el) return { ok: false, error: "expiry control not found" };
+    try {
+      if (String(el.tagName || "").toUpperCase() === "SELECT" && el.options) {
+        var best = null;
+        for (var i = 0; i < el.options.length; i++) {
+          var opt = el.options[i];
+          var sec = parseExpirySeconds((opt.textContent || "") + " " + (opt.value || ""));
+          if (sec == null) continue;
+          var diff = Math.abs(sec - wanted);
+          if (!best || diff < best.diff) best = { option: opt, sec: sec, diff: diff };
+        }
+        if (!best || best.diff > Math.max(5, wanted * 0.1)) return { ok: false, error: "configured expiry unavailable" };
+        var selectProto = window.HTMLSelectElement && window.HTMLSelectElement.prototype;
+        var descriptor = selectProto ? Object.getOwnPropertyDescriptor(selectProto, "value") : null;
+        if (descriptor && descriptor.set) descriptor.set.call(el, best.option.value);
+        else el.value = best.option.value;
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+        if (String(el.value) !== String(best.option.value)) return { ok: false, error: "expiry selection was rejected" };
+        return { ok: true, expiry: best.sec };
+      }
+      if (String(el.tagName || "").toUpperCase() === "INPUT") {
+        var secondsInput = /sec/i.test(String(el.className || "") + " " + String(el.name || ""));
+        var unit = secondsInput ? wanted : wanted / 60;
+        var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value");
+        if (setter && setter.set) setter.set.call(el, String(unit));
+        else el.value = String(unit);
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+        var actualUnit = Number(String(el.value).replace(",", "."));
+        var actualSeconds = actualUnit * (secondsInput ? 1 : 60);
+        if (!Number.isFinite(actualSeconds) || Math.abs(actualSeconds - wanted) > 1) {
+          return { ok: false, error: "expiry input was rejected" };
+        }
+        return { ok: true, expiry: Math.round(actualSeconds) };
+      }
+      var current = parseExpirySeconds(visibleText(el));
+      if (current != null && Math.abs(current - wanted) <= Math.max(5, wanted * 0.1)) {
+        return { ok: true, expiry: current, unchanged: true };
+      }
+    } catch (e) {
+      return { ok: false, error: String(e && e.message || e) };
+    }
+    return { ok: false, error: "expiry control is not safely editable" };
+  }
+
   function findCallButton() { return findDirButton("CALL"); }
   function findPutButton()  { return findDirButton("PUT"); }
 
-  // Words / glyphs that identify a direction on any platform build.
-  var CALL_HINTS = /call|buy|up|rise|higher|bull|subir|comprar|↑|⇑|▲|➚|↗/i;
-  var PUT_HINTS = /put|sell|down|fall|lower|bear|bajar|vender|↓|⇓|▼|➘|↘/i;
+  // Direction words must be complete tokens. The previous `/up/` test also
+  // matched innocent classes such as "group", "popup" and "setup", which is
+  // how the extension ended up clicking Quotex's open-chart icon.
+  var CALL_HINTS = /(?:^|[\s_\-:/])(call|buy|up|rise|higher|bull|subir|comprar)(?:$|[\s_\-:/])|[↑⇑▲➚↗]/i;
+  var PUT_HINTS = /(?:^|[\s_\-:/])(put|sell|down|fall|lower|bear|bajar|vender)(?:$|[\s_\-:/])|[↓⇓▼➘↘]/i;
 
   function elementDirHints(el) {
-    var text = ((el.textContent || "") + " " + (el.getAttribute && (el.getAttribute("aria-label") || "")) + " " + (el.className || "")).toUpperCase();
-    var cls = String(el.className || "").toLowerCase();
-    var call = CALL_HINTS.test(text) || /call|buy|up|rise/.test(cls);
-    var put = PUT_HINTS.test(text) || /put|sell|down|fall/.test(cls);
-    return { call: call, put: put };
+    var attrs = "";
+    try {
+      attrs = (el.getAttribute("aria-label") || "") + " " +
+        (el.getAttribute("data-type") || "") + " " +
+        (el.getAttribute("data-direction") || "") + " " +
+        (el.getAttribute("data-testid") || "");
+    } catch (_) {}
+    var text = " " + (el.textContent || "") + " " + attrs + " " + (el.className || "") + " ";
+    var call = CALL_HINTS.test(text);
+    var put = PUT_HINTS.test(text);
+    return { call: call, put: put, explicit: call !== put };
   }
 
   function elementIsGreen(el) {
@@ -794,73 +1167,94 @@
   }
 
   function findDirButton(dir) {
-    var sels = [
-      "button[class*='call']", "button[class*='put']",
-      "button[class*='up']", "button[class*='down']",
-      "button[class*='buy']", "button[class*='sell']",
-      "[class*='call-btn']", "[class*='put-btn']",
-      "[class*='up-btn']", "[class*='down-btn']",
-      "[class*='btn-call']", "[class*='btn-put']",
-      "[class*='btn-up']", "[class*='btn-down']",
-      "[class*='btn-buy']", "[class*='btn-sell']",
-      "[class*='turbo-buy']", "[class*='turbo-sell']",
-      "[class*='binary-buy']", "[class*='binary-sell']",
-      "[class*='header-call']", "[class*='header-put']",
-      "button[data-type='CALL']", "button[data-type='PUT']",
-      "button[data-direction='CALL']", "button[data-direction='PUT']",
-      "button[data-testid*='call' i]", "button[data-testid*='put' i]",
-      "button[aria-label*='call' i]", "button[aria-label*='put' i]",
-      "[role='button'][class*='call']", "[role='button'][class*='put']",
-    ];
-    var seen = [];
-    for (var i = 0; i < sels.length; i++) {
-      var nodes = document.querySelectorAll(sels[i]);
-      for (var j = 0; j < nodes.length; j++) {
-        if (!isVisible(nodes[j])) continue;
-        if (seen.indexOf(nodes[j]) !== -1) continue;
-        seen.push(nodes[j]);
-        var h = elementDirHints(nodes[j]);
-        if (dir === "CALL" && h.call && !h.put) return nodes[j];
-        if (dir === "PUT" && h.put && !h.call) return nodes[j];
-      }
+    var panel = findPanel();
+    var scope = panel || document;
+    var all = scope.querySelectorAll("button, [role='button'], [data-type], [data-direction]");
+    var explicit = [];
+    var greens = [];
+    var reds = [];
+
+    function eligible(el, hinted) {
+      if (!el || !isVisible(el)) return false;
+      if (el.closest && el.closest("#cyber-binary-hud")) return false;
+      if (el.disabled || (el.getAttribute && el.getAttribute("aria-disabled") === "true")) return false;
+      var blob = ((el.textContent || "") + " " + (el.className || "") + " " +
+        (el.getAttribute && (el.getAttribute("aria-label") || ""))).toLowerCase();
+      if (/open.?chart|add.?chart|chart.?icon|new.?chart/.test(blob)) return false;
+      try {
+        var r = el.getBoundingClientRect();
+        // Icon controls are normally square and < 60px. Direction buttons
+        // are broad action controls; explicit CALL/PUT labels get a little
+        // more leeway for compact/mobile layouts.
+        if (r.height < 28 || r.width < (hinted ? 56 : 80)) return false;
+        if (!hinted && r.width < r.height * 1.45) return false;
+      } catch (_) {}
+      return true;
     }
-    // Last-resort scan: ANY visible clickable element. Classify by label,
-    // then by green/red background (Quotex CALL is green, PUT is red), then
-    // by vertical position among siblings in the trade panel.
-    var scope = findPanel() || document;
-    var all = scope.querySelectorAll("button, [role='button'], [class*='btn'], [class*='button'], [class*='header']");
-    var greens = [], reds = [], unclassified = [];
-    for (var k = 0; k < all.length; k++) {
-      var el = all[k];
-      if (!isVisible(el)) continue;
-      if (el.closest && el.closest("#cyber-binary-hud")) continue;
-      if (el.tagName === "BUTTON" && !el.children.length && !(el.textContent || "").trim()) continue;
-      if (seen.indexOf(el) !== -1) continue;
-      var ht = elementDirHints(el);
-      if (dir === "CALL" && ht.call && !ht.put) return el;
-      if (dir === "PUT" && ht.put && !ht.call) return el;
+
+    for (var i = 0; i < all.length && i < 500; i++) {
+      var el = all[i];
+      var hints = elementDirHints(el);
+      if (hints.explicit && eligible(el, true)) {
+        explicit.push({ el: el, dir: hints.call ? "CALL" : "PUT" });
+        continue;
+      }
+      if (!eligible(el, false)) continue;
       var color = elementIsGreen(el);
       if (color === true) greens.push(el);
       else if (color === false) reds.push(el);
-      else unclassified.push(el);
     }
-    // By color: for CALL prefer the GREEN button, for PUT the RED one —
-    // but only when there is exactly one strong candidate of each color.
-    if (dir === "CALL" && greens.length === 1 && reds.length === 1) return greens[0];
-    if (dir === "PUT" && greens.length === 1 && reds.length === 1) return reds[0];
-    // By position (conservative): only when exactly two unclassified
-    // clickables share the same parent and are large enough to be the
-    // trade buttons — upper = CALL, lower = PUT.
-    if (unclassified.length === 2) {
-      var a1 = unclassified[0], a2 = unclassified[1];
-      var sameParent = (a1.parentElement === a2.parentElement) && a1.parentElement != null;
-      var big = a1.getBoundingClientRect().height >= 28 && a2.getBoundingClientRect().height >= 28;
-      if (sameParent && big) {
-        return a1.getBoundingClientRect().top <= a2.getBoundingClientRect().top
-          ? (dir === "CALL" ? a1 : a2)
-          : (dir === "CALL" ? a2 : a1);
+
+    // Explicit token/attribute matches are safest. If several charts are
+    // visible, prefer the pair in the detected trade panel, then the largest
+    // action control (never the first arbitrary button in DOM order).
+    var bestExplicitPair = null;
+    for (var ej = 0; ej < explicit.length; ej++) {
+      if (explicit[ej].dir !== "CALL") continue;
+      for (var ek = 0; ek < explicit.length; ek++) {
+        if (explicit[ek].dir !== "PUT") continue;
+        try {
+          var cr = explicit[ej].el.getBoundingClientRect();
+          var pr = explicit[ek].el.getBoundingClientRect();
+          var comparable = Math.abs(cr.width - pr.width) <= Math.max(30, cr.width * 0.35) &&
+            Math.abs(cr.height - pr.height) <= Math.max(18, cr.height * 0.4);
+          var close = Math.abs(cr.left - pr.left) < Math.max(cr.width, pr.width) * 2.5 &&
+            Math.abs(cr.top - pr.top) < 320;
+          var sameParent = explicit[ej].el.parentElement && explicit[ej].el.parentElement === explicit[ek].el.parentElement;
+          if (!comparable || !close || (!sameParent && !panel)) continue;
+          var pairScore = cr.width * cr.height + pr.width * pr.height + (sameParent ? 10000 : 0);
+          if (!bestExplicitPair || pairScore > bestExplicitPair.score) {
+            bestExplicitPair = { call: explicit[ej].el, put: explicit[ek].el, score: pairScore };
+          }
+        } catch (_) {}
       }
     }
+    if (bestExplicitPair) return dir === "CALL" ? bestExplicitPair.call : bestExplicitPair.put;
+
+    // Hashed builds can omit labels. Accept color only when a credible
+    // green/red action PAIR exists: similar dimensions, nearby, and either a
+    // common parent or both within the canonical trade panel.
+    var bestPair = null;
+    for (var g = 0; g < greens.length; g++) {
+      for (var r = 0; r < reds.length; r++) {
+        try {
+          var gr = greens[g].getBoundingClientRect();
+          var rr = reds[r].getBoundingClientRect();
+          var similar = Math.abs(gr.width - rr.width) <= Math.max(24, gr.width * 0.25) &&
+            Math.abs(gr.height - rr.height) <= Math.max(14, gr.height * 0.3);
+          var near = Math.abs(gr.left - rr.left) < Math.max(gr.width, rr.width) * 1.5 &&
+            Math.abs(gr.top - rr.top) < 260;
+          var paired = greens[g].parentElement && greens[g].parentElement === reds[r].parentElement;
+          if (!similar || !near || (!paired && !panel)) continue;
+          var score = gr.width * gr.height + rr.width * rr.height + (paired ? 10000 : 0);
+          if (!bestPair || score > bestPair.score) bestPair = { call: greens[g], put: reds[r], score: score };
+        } catch (_) {}
+      }
+    }
+    if (bestPair) return dir === "CALL" ? bestPair.call : bestPair.put;
+
+    // No positional fallback. Clicking nothing is much safer than clicking a
+    // chart/menu icon or the wrong direction.
     return null;
   }
 
@@ -873,7 +1267,7 @@
     ];
     for (var i = 0; i < sels.length; i++) {
       var nodes = document.querySelectorAll(sels[i]);
-      for (var j = 0; j < nodes.length; j++) {
+      for (var j = 0; j < nodes.length && j < 100; j++) {
         if (!isVisible(nodes[j])) continue;
         var p = parsePrice(visibleText(nodes[j]));
         if (p && p > 0 && p < 1e9) return { el: nodes[j], value: p };
@@ -893,7 +1287,14 @@
     ];
     for (var i = 0; i < sels.length; i++) {
       var n = document.querySelector(sels[i]);
-      if (n && isVisible(n)) return n;
+      if (!n || !isVisible(n)) continue;
+      var tag = String(n.tagName || "").toUpperCase();
+      if (tag === "BUTTON" || tag === "INPUT" || tag === "A") continue;
+      try {
+        var r = n.getBoundingClientRect();
+        if (r.width < 140 || r.height < 120) continue;
+      } catch (_) {}
+      return n;
     }
     return null;
   }
@@ -910,14 +1311,12 @@
    * ============================================================ */
   function stakeCandidates() {
     var sels = [
-      "input[class*='amount']", "input[class*='stake']", "input[class*='sum']",
-      "input[aria-label*='amount' i]", "input[aria-label*='stake' i]",
-      "input[placeholder*='amount' i]", "input[placeholder*='stake' i]",
-      "input[name='amount']", "input[name='sum']",
-      "input[data-testid*='amount' i]", "input[data-testid*='stake' i]",
-      "input[inputmode='decimal']", "input[inputmode='numeric']",
-      "[class*='stake'] input[type='number']", "[class*='amount'] input[type='number']",
-      "input[type='number']",
+      "input[class*='amount']", "input[class*='stake']", "input[class*='sum']", "input[class*='invest']",
+      "input[aria-label*='amount' i]", "input[aria-label*='stake' i]", "input[aria-label*='invest' i]",
+      "input[placeholder*='amount' i]", "input[placeholder*='stake' i]", "input[placeholder*='invest' i]",
+      "input[name='amount']", "input[name='sum']", "input[name='stake']", "input[name='investment']",
+      "input[data-testid*='amount' i]", "input[data-testid*='stake' i]", "input[data-testid*='invest' i]",
+      "[class*='stake'] input[type='number']", "[class*='amount'] input[type='number']", "[class*='invest'] input[type='number']",
     ];
     var out = [];
     var seen = [];
@@ -927,14 +1326,14 @@
     try { btn = findCallButton() || findPutButton(); } catch (_) {}
     for (var i = 0; i < sels.length; i++) {
       var nodes = document.querySelectorAll(sels[i]);
-      for (var j = 0; j < nodes.length; j++) {
+      for (var j = 0; j < nodes.length && j < 100; j++) {
         var el = nodes[j];
         if (!isVisible(el)) continue;
         if (seen.indexOf(el) !== -1) continue;
         seen.push(el);
         var type = (el.type || "").toLowerCase();
         if (type === "hidden" || type === "checkbox" || type === "radio" || type === "submit" || type === "button") continue;
-        var score = 0;
+        var score = 2; // every selector above contains an amount/stake/invest token
         var tag = (el.className || "") + " " + (el.placeholder || "") + " " + (el.getAttribute && (el.getAttribute("aria-label") || ""));
         if (/amount|stake|sum|invest/i.test(tag)) score += 4;
         if (el.inputMode === "decimal" || el.inputMode === "numeric") score += 1;
@@ -959,56 +1358,117 @@
   }
 
   function setStake(amount) {
+    var wanted = numberValue(amount);
+    if (wanted == null || wanted <= 0 || wanted > 1000000) return false;
     var cands = stakeCandidates();
-    if (!cands.length) return false;
+    if (!cands.length || cands[0].score < 2) return false;
     var el = cands[0].el;
+    var min = Number(el.min), max = Number(el.max);
+    if (el.min !== "" && Number.isFinite(min) && wanted < min) return false;
+    if (el.max !== "" && Number.isFinite(max) && wanted > max) return false;
     try {
       var proto = el.tagName === "TEXTAREA" ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
       var setter = Object.getOwnPropertyDescriptor(proto, "value");
-      if (setter && setter.set) setter.set.call(el, String(amount));
-      else el.value = String(amount);
+      if (setter && setter.set) setter.set.call(el, String(wanted));
+      else el.value = String(wanted);
       el.dispatchEvent(new Event("input", { bubbles: true }));
       el.dispatchEvent(new Event("change", { bubbles: true }));
       try { el.dispatchEvent(new Event("blur", { bubbles: true })); } catch (_) {}
-      return true;
+      var actual = Number(String(el.value).replace(",", "."));
+      return Number.isFinite(actual) && Math.abs(actual - wanted) <= Math.max(1e-9, Math.abs(wanted) * 1e-9);
     } catch (_) { return false; }
   }
 
   function placeTradeDom(args) {
     args = args || {};
-    var dir = (args.dir || args.direction || "CALL").toUpperCase();
+    var dir = String(args.dir || args.direction || "").toUpperCase();
     if (dir !== "CALL" && dir !== "PUT") return { ok: false, mode: "dom", error: "invalid direction" };
-    if (typeof args.amount !== "undefined") setStake(args.amount);
+    var amount = numberValue(args.amount);
+    if (amount == null || amount <= 0 || amount > 1000000) {
+      return { ok: false, mode: "dom", error: "a valid amount is required" };
+    }
+    if (!setStake(amount)) {
+      return { ok: false, mode: "dom", error: "stake input not found or rejected" };
+    }
+    if (args.expiry == null && args.expirySec == null) {
+      return { ok: false, mode: "dom", error: "a verified expiry is required" };
+    }
+    var expiryResult = setExpiry(args.expiry != null ? args.expiry : args.expirySec);
+    if (!expiryResult.ok) {
+      return { ok: false, mode: "dom", error: expiryResult.error || "expiry not set" };
+    }
     var btn = dir === "CALL" ? findCallButton() : findPutButton();
-    if (!btn) return { ok: false, mode: "dom", error: "trade button not visible" };
+    if (!btn) return { ok: false, mode: "dom", error: "verified trade button not visible" };
     try {
       btn.click();
-      return { ok: true, mode: "dom", id: null, dir: dir, amount: args.amount, expiry: args.expiry || null };
+      return {
+        ok: true, confirmed: false, mode: "dom", id: null, dir: dir,
+        amount: amount, expiry: expiryResult.expiry,
+      };
     } catch (e) {
       return { ok: false, mode: "dom", error: String(e && e.message || e) };
     }
   }
 
-  // The `orders/open` payload the server expects. Mirrors A11ksa/API-Quotex.
+  function qxExpirationEpoch(nowMs, expirySec) {
+    var baseNow = numberValue(nowMs);
+    if (baseNow == null || baseNow <= 0) baseNow = Date.now();
+    var requested = numberValue(expirySec);
+    if (requested == null || requested <= 0) requested = 60;
+    requested = Math.min(86400, requested);
+    var minutes = Math.max(1, Math.ceil(requested / 60));
+    // Quotex's regular-market binary contract expects an ABSOLUTE unix
+    // expiry, rounded to the minute. Epoch arithmetic avoids local-time DST
+    // jumps that Date#setMinutes can introduce.
+    var nowSec = Math.floor(baseNow / 1000);
+    var extra = nowSec % 60 >= 30 ? 1 : 0;
+    return (Math.floor(nowSec / 60) + minutes + extra) * 60;
+  }
+
+  // The `orders/open` payload the server expects. OTC contracts use a duration
+  // in seconds with optionType=100. Regular-market contracts use an absolute
+  // unix expiry with optionType=1. The old implementation sent duration+type1
+  // for every asset, so the server rejected otherwise valid trades.
   function buildOrderPayload(args) {
-    var dir = (args.dir || args.direction || "CALL").toUpperCase();
+    args = args || {};
+    var dir = String(args.dir || args.direction || "").toUpperCase();
+    if (dir !== "CALL" && dir !== "PUT") throw new Error("invalid direction");
     var action = dir === "CALL" ? "call" : "put";
-    var asset = args.asset || args.symbol || "";
-    var amount = parseFloat(args.amount) || 1;
-    var expirySec = parseInt(args.expiry || args.expirySec || 60, 10);
-    var requestId = args.requestId || String(Date.now());
-    // optionType: 0 = turbo (seconds-precision expiry), 1 = binary (whole-minute).
-    // Caller can override; otherwise default to binary for any minute+ duration,
-    // turbo for any sub-minute duration.
-    var optionType = typeof args.optionType === "number" ? args.optionType : (expirySec < 60 ? 0 : 1);
+    var asset = normalizeSymbolName(args.asset || args.symbol || "");
+    if (!asset) throw new Error("asset required");
+    var parsedAmount = numberValue(args.amount);
+    if (parsedAmount == null || parsedAmount <= 0 || parsedAmount > 1000000) throw new Error("invalid amount");
+    var amount = parsedAmount;
+    var parsedExpiry = numberValue(args.expirySec != null ? args.expirySec : args.expiry);
+    if (parsedExpiry == null || parsedExpiry < 30 || parsedExpiry > 86400) throw new Error("invalid expiry");
+    var expirySec = Math.round(parsedExpiry);
+    var requestId = args.requestId != null ? args.requestId : String(Date.now());
+    if (!(args.isDemo === true || args.isDemo === false || args.isDemo === 1 || args.isDemo === 0)) {
+      throw new Error("account mode must be known");
+    }
+    var otc = /_otc$/i.test(asset);
+    var optionType = otc ? 100 : 1;
+    var requestedType = args.optionType != null ? numberValue(args.optionType) : optionType;
+    if (requestedType !== optionType) throw new Error("option type does not match asset market");
+    var expectedEpoch = optionType === 1 ? qxExpirationEpoch(args.nowMs != null ? args.nowMs : Date.now(), expirySec) : null;
+    var suppliedEpoch = args.expiryEpoch != null ? numberValue(args.expiryEpoch) : null;
+    if (args.expiryEpoch != null && suppliedEpoch == null) throw new Error("invalid absolute expiry");
+    if (optionType === 1 && suppliedEpoch != null &&
+        Math.abs(Math.floor(suppliedEpoch) - expectedEpoch) > 60) {
+      throw new Error("invalid absolute expiry");
+    }
+    var timeField = optionType === 1 && suppliedEpoch != null ? Math.floor(suppliedEpoch)
+      : (optionType === 1 ? expectedEpoch : expirySec);
+    var requestNumber = numberValue(requestId);
+    if (requestNumber == null || !Number.isSafeInteger(requestNumber) || requestNumber <= 0) requestNumber = Date.now();
     return {
       asset: asset,
       amount: amount,
-      time: expirySec,
+      time: timeField,
       action: action,
-      isDemo: args.isDemo ? 1 : 0,
+      isDemo: brokerBool(args.isDemo, false) ? 1 : 0,
       tournamentId: 0,
-      requestId: parseInt(requestId, 10) || requestId,
+      requestId: requestNumber,
       optionType: optionType,
     };
   }
@@ -1016,7 +1476,14 @@
   function placeTradeWs(ws, args) {
     args = args || {};
     if (!ws || typeof ws.send !== "function") return { ok: false, mode: "ws", error: "no websocket handle" };
+    if (ws.readyState != null && numberValue(ws.readyState) !== 1) return { ok: false, mode: "ws", error: "websocket is not open" };
     if (!args.asset) return { ok: false, mode: "ws", error: "asset required" };
+    var wsDir = String(args.dir || args.direction || "").toUpperCase();
+    if (wsDir !== "CALL" && wsDir !== "PUT") return { ok: false, mode: "ws", error: "invalid direction" };
+    var wsAmount = args.amount == null ? null : numberValue(args.amount);
+    if (args.amount != null && (wsAmount == null || wsAmount <= 0)) {
+      return { ok: false, mode: "ws", error: "amount must be positive" };
+    }
     try {
       var payload = buildOrderPayload(args);
       // Send `tick` + `instruments/follow` then `orders/open` — this is the
@@ -1025,7 +1492,21 @@
       try { ws.send('42["instruments/follow","' + payload.asset + '"]'); } catch (_) {}
       var msg = '42["orders/open",' + JSON.stringify(payload) + ']';
       ws.send(msg);
-      return { ok: true, mode: "ws", id: String(payload.requestId), dir: payload.action, message: msg };
+      return {
+        ok: true,
+        confirmed: false,
+        sent: true,
+        mode: "ws",
+        id: String(payload.requestId),
+        requestId: String(payload.requestId),
+        dir: payload.action === "put" ? "PUT" : "CALL",
+        asset: payload.asset,
+        amount: payload.amount,
+        expiry: parseInt(args.expirySec != null ? args.expirySec : args.expiry, 10) || 60,
+        expiryTime: payload.optionType === 1 ? payload.time * 1000 : Date.now() + payload.time * 1000,
+        optionType: payload.optionType,
+        message: msg,
+      };
     } catch (e) {
       return { ok: false, mode: "ws", error: String(e && e.message || e) };
     }
@@ -1096,10 +1577,13 @@
     }
 
     function emitTick(payload) {
-      var q = parseQuote(payload);
-      if (q) {
-        try { listeners.tick(q); } catch (_) {}
-        feed("tick", q, null);
+      // quotes/stream commonly batches many subscribed instruments. The old
+      // router emitted only row zero, starving the actual main chart whenever
+      // another subscription happened to appear first.
+      var quotes = parseQuotes(payload);
+      for (var qi = 0; qi < quotes.length; qi++) {
+        try { listeners.tick(quotes[qi]); } catch (_) {}
+        feed("tick", quotes[qi], null);
       }
     }
 
@@ -1112,8 +1596,12 @@
     }
 
     function emitOrderOpen(payload) {
-      var oo = parseOrderOpened(payload);
-      if (oo) {
+      var rows = Array.isArray(payload) ? payload
+        : (payload && Array.isArray(payload.orders) ? payload.orders
+          : (payload && Array.isArray(payload.deals) ? payload.deals : [payload]));
+      for (var oi = 0; oi < rows.length && oi < 100; oi++) {
+        var oo = parseOrderOpened(rows[oi]);
+        if (!oo) continue;
         try { listeners.order({ kind: "opened", data: oo }); } catch (_) {}
         feed("order_opened", oo, null);
       }
@@ -1126,7 +1614,7 @@
       else if (Array.isArray(payload)) ocDeals = payload;
       else if (payload && typeof payload === "object") ocDeals = [payload];
       if (ocDeals) {
-        for (var oci = 0; oci < ocDeals.length; oci++) {
+        for (var oci = 0; oci < ocDeals.length && oci < 100; oci++) {
           var oc5 = parseOrderClosed(ocDeals[oci]);
           if (oc5) { try { listeners.order({ kind: "closed", data: oc5 }); } catch (_) {} }
         }
@@ -1219,21 +1707,22 @@
       }
     }
 
-    function rawToFrame(data, cb) {
-      if (typeof data === "string") {
-        cb(decodeFrame(data));
-        return;
-      }
-      if (data && typeof data === "object" && typeof data.text === "function") {
-        // Blob / polyfill
-        data.text().then(function (s) { cb(decodeFrame(s)); }).catch(function () {});
-        return;
-      }
-      cb(decodeFrame(data));
-    }
-
+    var rawQueue = null;
     function feedRaw(raw) {
-      try { rawToFrame(raw, dispatch); } catch (_) {}
+      var asyncRaw = raw && typeof raw === "object" && typeof raw.text === "function";
+      if (!rawQueue && !asyncRaw) {
+        try { dispatch(decodeFrame(raw)); } catch (_) {}
+        return;
+      }
+      var prior = rawQueue || Promise.resolve();
+      var task = prior.then(function () {
+        if (asyncRaw) return raw.text().then(function (s) { dispatch(decodeFrame(s)); });
+        dispatch(decodeFrame(raw));
+        return null;
+      });
+      var settled = task.catch(function () {});
+      rawQueue = settled;
+      settled.then(function () { if (rawQueue === settled) rawQueue = null; });
     }
 
     return {
@@ -1269,13 +1758,29 @@
     // Only events that carry an asset/symbol reference.
     if (!/^(instruments\/follow|instruments\/update|history\/list\/v2|chart_notification\/get|loadHistoryPeriod|quotes\/stream|orders\/open|instruments\/update_list|tick)$/.test(ev)) return null;
     var asset = null;
+    var period = null;
     if (body && typeof body === "object") {
       asset = body.asset || body.symbol || body.pair || null;
+      var rawPeriod = numberValue(body.period != null ? body.period : body.timeframe);
+      period = rawPeriod != null && rawPeriod > 0 && rawPeriod <= 86400 ? Math.floor(rawPeriod) : null;
     } else if (typeof body === "string" && body) {
       asset = body;
     }
+    if (asset != null && /^\d+$/.test(String(asset)) && ID_TO_SYMBOL[Number(asset)]) asset = ID_TO_SYMBOL[Number(asset)];
+    asset = normalizeSymbolName(asset);
     if (!asset) return null;
-    return { event: ev, symbol: normalizeSymbolName(asset) };
+    // `instruments/update` is the platform's main-chart selection message;
+    // `orders/open` confirms that selection. Follow/history messages can be
+    // emitted for every mini/background chart and must never steal "main".
+    var main = ev === "instruments/update" || ev === "orders/open";
+    var candidate = ev === "instruments/follow";
+    return {
+      event: ev,
+      symbol: asset,
+      period: period,
+      main: main,
+      candidate: candidate,
+    };
   }
 
   function attachPageSocket(handlers) {
@@ -1284,39 +1789,55 @@
     if (typeof Native !== "function") return { ok: false, error: "no native WebSocket" };
     if (Native.__cyberWrapped) return { ok: true, handle: Native.__cyberHandle, already: true };
 
-    var router = createRouter(handlers);
+    var fallbackRouter = createRouter(handlers);
+
+    function brokerSocketUrl(url) {
+      try {
+        var parsed = new URL(String(url || ""), location.href);
+        return (parsed.protocol === "ws:" || parsed.protocol === "wss:") &&
+          isQuotexHost(parsed.hostname) && /\/socket\.io(?:\/|$)/i.test(parsed.pathname);
+      } catch (_) { return false; }
+    }
 
     function Wrapped(url, protocols) {
       var ws = protocols !== undefined ? new Native(url, protocols) : new Native(url);
-      try { router.listeners.status({ state: "opening", url: url }); } catch (_) {}
-      if (handle) handle.lastWs = ws;
-      // Outgoing-frame sniffing: the client's own requests reveal the active
-      // asset with no DOM/selector guessing. Handles ArrayBuffer sends too.
+      var socketRouter = createRouter(handlers);
+      var brokerSocket = brokerSocketUrl(url);
+      if (brokerSocket) {
+        try { socketRouter.listeners.status({ state: "opening", url: url }); } catch (_) {}
+        if (handle) { handle.lastWs = ws; handle.router = socketRouter; }
+      }
+      // Outgoing-frame sniffing can promote a relative/previously unknown
+      // socket, but unrelated analytics sockets never become the trade handle.
       var nativeSend = ws.send.bind(ws);
       ws.send = function (data) {
         try {
           var s = typeof data === "string" ? data
-            : (data instanceof ArrayBuffer ? asString(data) : null);
+            : (typeof ArrayBuffer !== "undefined" && data instanceof ArrayBuffer ? asString(data) : null);
           var hit = s ? sniffOutgoing(s) : null;
           if (hit && hit.symbol) {
-            try { router.listeners.asset(hit.symbol); } catch (_) {}
-            feedOut(hit);
+            brokerSocket = true;
+            if (handle) { handle.lastWs = ws; handle.router = socketRouter; }
+            try { socketRouter.listeners.asset(hit.symbol, hit); } catch (_) {}
+            feedOut(socketRouter, hit);
           }
         } catch (_) {}
         return nativeSend(data);
       };
       ws.addEventListener("open", function () {
-        try { router.listeners.status({ state: "open", url: url }); } catch (_) {}
+        if (brokerSocket) try { socketRouter.listeners.status({ state: "open", url: url }); } catch (_) {}
       });
       ws.addEventListener("close", function () {
-        try { router.listeners.status({ state: "closed", url: url }); } catch (_) {}
+        var wasCurrent = handle && handle.lastWs === ws;
+        if (wasCurrent) handle.lastWs = null;
+        if (brokerSocket && wasCurrent) try { socketRouter.listeners.status({ state: "closed", url: url }); } catch (_) {}
       });
       ws.addEventListener("message", function (ev) {
-        try { router.feedRaw(ev.data); } catch (_) {}
+        if (brokerSocket) try { socketRouter.feedRaw(ev.data); } catch (_) {}
       });
       return ws;
     }
-    function feedOut(hit) {
+    function feedOut(router, hit) {
       try {
         if (router.listeners && typeof router.listeners.frame === "function") {
           router.listeners.frame("outgoing", hit, null);
@@ -1328,8 +1849,12 @@
     Wrapped.OPEN = Native.OPEN;
     Wrapped.CLOSING = Native.CLOSING;
     Wrapped.CLOSED = Native.CLOSED;
+    try { Object.setPrototypeOf(Wrapped, Native); } catch (_) {}
 
-    var handle = { native: Native, wrapper: Wrapped, router: router, lastWs: null, pending: function () { return router.pending(); } };
+    var handle = {
+      native: Native, wrapper: Wrapped, router: fallbackRouter, lastWs: null,
+      pending: function () { return handle.router ? handle.router.pending() : null; },
+    };
     Wrapped.__cyberWrapped = true;
     Wrapped.__cyberHandle = handle;
     window.WebSocket = Wrapped;
@@ -1337,7 +1862,7 @@
     return {
       ok: true,
       handle: handle,
-      router: router,
+      router: fallbackRouter,
       detach: function detach() {
         if (window.WebSocket === Wrapped) window.WebSocket = Native;
         Wrapped.__cyberWrapped = false;
@@ -1376,6 +1901,7 @@
     parseCandles: parseCandles,
     normalizeCandles: normalizeCandles,
     parseQuote: parseQuote,
+    parseQuotes: parseQuotes,
     parseBalance: parseBalance,
     parseOrderOpened: parseOrderOpened,
     parseOrderClosed: parseOrderClosed,
@@ -1384,9 +1910,12 @@
     findPanel: findPanel,
     findAssetHeader: findAssetHeader,
     findPriceLabel: findPriceLabel,
+    parsePrice: parsePrice,
     findStakeInput: findStakeInput,
     stakeCandidates: stakeCandidates,
     findExpirySelect: findExpirySelect,
+    parseExpirySeconds: parseExpirySeconds,
+    setExpiry: setExpiry,
     findCallButton: findCallButton,
     findPutButton: findPutButton,
     findBalance: findBalance,
@@ -1395,6 +1924,7 @@
     placeTradeDom: placeTradeDom,
     placeTradeWs: placeTradeWs,
     buildOrderPayload: buildOrderPayload,
+    qxExpirationEpoch: qxExpirationEpoch,
     /**
      * Ask the broker for real-time ticks + history on the *page's own*
      * socket. Mirrors the exact sequence the Quotex web client sends when a
@@ -1403,9 +1933,11 @@
      */
     subscribeHistory: function (ws, asset, period) {
       if (!ws || typeof ws.send !== "function") return { ok: false, error: "no websocket handle" };
-      var sym = (asset || "").replace(/_OTC/g, "_otc");
+      if (ws.readyState != null && numberValue(ws.readyState) !== 1) return { ok: false, error: "websocket is not open" };
+      var sym = normalizeSymbolName(asset || "");
       if (!sym) return { ok: false, error: "asset required" };
-      period = parseInt(period, 10) || 60;
+      period = numberValue(period);
+      period = period != null && period > 0 ? Math.min(86400, Math.floor(period)) : 60;
       try {
         ws.send('42["tick"]');
         ws.send('42["instruments/follow","' + sym + '"]');
@@ -1476,6 +2008,7 @@
  *     node tools/build-hook.js
  */
 (function () {
+  try { if (window.top && window.top !== window.self) return; } catch (_) { return; }
   if (window.__CYBER_WS_HOOK__) return;
   window.__CYBER_WS_HOOK__ = true;
 
@@ -1493,16 +2026,27 @@
   }
 
   var live = {
-    candles: {},      // asset@period -> latest candles array
-    ticks: {},        // asset -> last tick { price, time }
+    candles: Object.create(null), // asset@period -> latest candles array
+    ticks: Object.create(null),   // asset -> last tick { price, time }
     instruments: [],  // broker-discovered instruments
     balance: null,
     orders: [],       // rolling list of recent orders (last 50)
     status: { state: "idle", url: null },
     assetIdMap: {},   // broker numeric id -> symbol
-    lastWsSymbol: null, // most recent asset seen on the socket (in or out)
+    lastWsSymbol: null, // authoritative main-chart symbol (legacy snapshot field)
+    lastWsPeriod: 60,
+    activeChart: null,  // {symbol, period, source, at}; never derived from quote fan-out
   };
 
+  var internalSubscriptionSend = false;
+  var candleKeyOrder = [];
+  var tickKeyOrder = [];
+  var backgroundTickAt = Object.create(null);
+  var lastBackgroundEmitAt = 0;
+  var seenOrderKeys = Object.create(null);
+  var seenOrderOrder = [];
+  var seenPlacementIds = Object.create(null);
+  var seenPlacementOrder = [];
   var handle = {
     native: null,
     wrapper: null,
@@ -1511,7 +2055,27 @@
     pending: function () { return handle.router ? handle.router.pending() : null; },
   };
 
-  var router = Q.createRouter({
+  function selectActiveChart(hit, source) {
+    if (!hit || !hit.symbol) return false;
+    live.lastWsSymbol = hit.symbol;
+    if (hit.period) live.lastWsPeriod = hit.period;
+    live.activeChart = {
+      symbol: hit.symbol,
+      period: hit.period || live.lastWsPeriod || 60,
+      source: source || hit.event || "socket",
+      at: Date.now(),
+    };
+    emit("asset", {
+      symbol: live.activeChart.symbol,
+      period: live.activeChart.period,
+      raw: live.activeChart.source,
+      event: hit.event || null,
+      main: true,
+    });
+    return true;
+  }
+
+  var routerHandlers = {
     onStatus: function (s) {
       live.status = s || live.status;
       emit("quotex_status", s || {});
@@ -1519,50 +2083,79 @@
     onCandle: function (msg) {
       if (!msg || !msg.asset) return;
       var key = msg.asset + "@" + (msg.period || 60);
-      live.candles[key] = msg.candles || [];
-      // Incoming history payloads name their asset — another reliable
-      // active-asset signal (covers builds that never stream quotes/stream).
-      live.lastWsSymbol = msg.asset;
-      emit("asset", { symbol: msg.asset, raw: "ws_candle" });
-      emit("candle", { asset: msg.asset, period: msg.period, candles: msg.candles });
+      live.candles[key] = Array.isArray(msg.candles) ? msg.candles.slice(-400) : [];
+      var oldKeyAt = candleKeyOrder.indexOf(key);
+      if (oldKeyAt >= 0) candleKeyOrder.splice(oldKeyAt, 1);
+      candleKeyOrder.push(key);
+      while (candleKeyOrder.length > 12) delete live.candles[candleKeyOrder.shift()];
+      // History is low-frequency and remains available per asset/timeframe;
+      // it never changes activeChart.
+      emit("candle", { asset: msg.asset, period: msg.period, candles: live.candles[key] });
     },
     onTick: function (q) {
       if (!q || !q.symbol) return;
+      if (!Object.prototype.hasOwnProperty.call(live.ticks, q.symbol)) tickKeyOrder.push(q.symbol);
       live.ticks[q.symbol] = q;
-      emit("tick", { price: q.price, symbol: q.symbol, time: q.time, raw: "ws" });
-      // Also emit an `asset` message so content.js keeps the active asset up-to-date.
-      emit("asset", { symbol: q.symbol, raw: "ws" });
+      while (tickKeyOrder.length > 500) {
+        var oldSymbol = tickKeyOrder.shift();
+        delete live.ticks[oldSymbol];
+        delete backgroundTickAt[oldSymbol];
+      }
+      // Quote streams can contain hundreds of subscribed instruments. Keep
+      // bounded latest values for snapshots, but rate-limit background bridges
+      // globally so they cannot dominate the selected chart's UI updates.
+      var main = !!(live.activeChart &&
+        Q.normalizeSymbol(live.activeChart.symbol) === Q.normalizeSymbol(q.symbol));
+      var now = Date.now();
+      var allowBackground = !main && now - lastBackgroundEmitAt >= 1000 &&
+        now - (backgroundTickAt[q.symbol] || 0) >= 30000;
+      if (main || allowBackground) {
+        if (allowBackground) { backgroundTickAt[q.symbol] = now; lastBackgroundEmitAt = now; }
+        emit("tick", {
+          price: q.price, symbol: q.symbol, time: q.time, raw: "ws", main: main,
+        });
+      }
     },
     onInstruments: function (list) {
-      live.instruments = list || [];
-      live.assetIdMap = {};
-      for (var i = 0; i < (list || []).length; i++) {
-        var it = list[i];
-        if (it && it.symbol) live.assetIdMap[it.id] = it.symbol;
+      live.instruments = Array.isArray(list) ? list.slice(0, 2000) : [];
+      live.assetIdMap = Object.create(null);
+      for (var i = 0; i < live.instruments.length; i++) {
+        var it = live.instruments[i];
+        if (it && it.symbol && it.id) live.assetIdMap[it.id] = it.symbol;
       }
       // Learn broker ids so numeric tick rows ([id, ts, price]) resolve.
-      try { if (Q.rememberIds) Q.rememberIds(list); } catch (_) {}
-      emit("instruments", list || []);
+      try { if (Q.rememberIds) Q.rememberIds(live.instruments); } catch (_) {}
+      emit("instruments", live.instruments);
     },
-    onAsset: function (symbol) {
-      // Active-asset hint from OUTGOING frames (the web client tells the
-      // server which asset it charts — the most reliable detector of all).
-      if (!symbol) return;
-      live.lastWsSymbol = symbol;
-      emit("asset", { symbol: symbol, raw: "ws_out" });
+    onAsset: function (symbol, hit) {
+      // Generic follow events are only an initial candidate. Explicit
+      // instruments/update and orders/open events are selected in send().
+      if (!symbol || live.activeChart) return;
+      selectActiveChart(hit || { symbol: symbol, period: 60 }, "ws_candidate");
     },
     onBalance: function (b) {
       live.balance = b;
       emit("balance", b);
     },
     onOrder: function (e) {
-      if (!e) return;
+      if (!e || typeof e !== "object") return;
+      var data = e.data && typeof e.data === "object" ? e.data : {};
+      var identity = data.id || data.requestId || "";
+      var at = data.openTime || data.closeTime || "";
+      var key = String(e.kind || "") + ":" + String(identity) + ":" + String(at);
+      if (key !== "::" && seenOrderKeys[key]) return;
+      if (key !== "::") {
+        seenOrderKeys[key] = true;
+        seenOrderOrder.push(key);
+        while (seenOrderOrder.length > 500) delete seenOrderKeys[seenOrderOrder.shift()];
+      }
       live.orders.unshift(e);
       if (live.orders.length > 50) live.orders.length = 50;
       emit("order", e);
     },
     onFrame: function (label, payload, frame) {
-      // Reserved for debugging — keep the last 20 frames for the dashboard.
+      // Do not allocate/debug-log high-frequency quote or candle events.
+      if (label === "tick" || label === "candles") return;
       try {
         if (!window.__cyber_frames) window.__cyber_frames = [];
         window.__cyber_frames.unshift({
@@ -1573,7 +2166,8 @@
         if (window.__cyber_frames.length > 20) window.__cyber_frames.length = 20;
       } catch (_) {}
     },
-  });
+  };
+  var router = Q.createRouter(routerHandlers);
   handle.router = router;
 
   /* ====================================================================
@@ -1595,7 +2189,8 @@
    *      that never expose the library globally).
    * ==================================================================== */
   var MARKERS = (function () {
-    var chart = null;        // lightweight-charts IChartApi
+    var chart = null;        // selected (largest visible) lightweight-charts IChartApi
+    var chartContainer = null;
     var series = null;       // main price series (the one that accepts setMarkers)
     var nativeList = [];     // last normalized native marker list
     var lastPayload = null;  // raw { asset, markers, bars } from content
@@ -1634,10 +2229,24 @@
       return null;
     }
 
-    function captureChart(c) {
+    function containerArea(el) {
+      try {
+        var r = el && el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+        return r && r.width > 0 && r.height > 0 ? r.width * r.height : 0;
+      } catch (_) { return 0; }
+    }
+
+    function captureChart(c, container) {
       if (!isChartLike(c)) return false;
       if (chart === c) return true;
+      // Multiple-chart mode creates several valid chart APIs. The main price
+      // chart is the largest visible container; do not let a later mini chart
+      // replace it merely because it was discovered last.
+      var nextArea = containerArea(container);
+      var currentArea = containerArea(chartContainer);
+      if (chart && currentArea > 0 && (nextArea === 0 || nextArea < currentArea)) return true;
       chart = c;
+      chartContainer = container || chartContainer;
       series = findExistingSeries(c);
       // Wrap series adders so a re-created main series (asset / timeframe
       // switch) is captured too. Candlestick/bar adders REPLACE the marker
@@ -1667,11 +2276,14 @@
     /** Raw markers -> lightweight-charts setMarkers() format. */
     function normalize(list) {
       var byTime = Object.create(null);
-      var arr = Array.isArray(list) ? list : [];
+      var arr = Array.isArray(list) ? list.slice(-MAX) : [];
       for (var i = 0; i < arr.length; i++) {
         var m = arr[i];
-        if (!m || m.time == null || !isFinite(m.time)) continue;
-        var sec = Math.floor(Number(m.time) / 1000);
+        var time = Number(m && m.time);
+        if (!m || (m.dir !== "CALL" && m.dir !== "PUT") || !Number.isFinite(time) || time <= 0) continue;
+        while (time >= 1e14) time /= 1000;
+        var sec = Math.floor(time >= 1e11 ? time / 1000 : time);
+        if (!Number.isSafeInteger(sec) || sec <= 0) continue;
         var put = m.dir === "PUT";
         byTime[sec] = {
           time: sec,
@@ -1691,8 +2303,15 @@
     }
 
     function applyMarkers(payload) {
-      lastPayload = payload || null;
-      nativeList = normalize(lastPayload && lastPayload.markers);
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) payload = null;
+      lastPayload = payload ? {
+        asset: typeof payload.asset === "string" ? payload.asset.slice(0, 64) : "",
+        markers: Array.isArray(payload.markers) ? payload.markers.slice(-MAX) : [],
+        bars: Array.isArray(payload.bars) ? payload.bars.slice(-400) : [],
+      } : null;
+      var chartMismatch = !!(lastPayload && lastPayload.asset && live.activeChart && live.activeChart.symbol &&
+        Q.normalizeSymbol(lastPayload.asset) !== Q.normalizeSymbol(live.activeChart.symbol));
+      nativeList = chartMismatch ? [] : normalize(lastPayload && lastPayload.markers);
       // The platform may have recreated the main series (asset/timeframe
       // switch) since the last markers message — re-resolve it if needed.
       if (!series && chart) series = findExistingSeries(chart);
@@ -1715,6 +2334,7 @@
         mode = "native";
         hideOverlay();
       } catch (_) {
+        mode = "overlay";
         drawOverlay();
       }
     }
@@ -1722,19 +2342,22 @@
     /* ---------- overlay fallback ---------- */
     function findChartCanvas() {
       var all = document.querySelectorAll("canvas");
+      var best = null, bestArea = 0;
       for (var i = 0; i < all.length; i++) {
         try {
           var r = all[i].getBoundingClientRect();
-          if (r && r.width > 240 && r.height > 140) return all[i];
+          var area = r && r.width > 240 && r.height > 140 ? r.width * r.height : 0;
+          if (area > bestArea) { best = all[i]; bestArea = area; }
         } catch (_) {}
       }
-      return null;
+      return best;
     }
 
     function ensureOverlay() {
-      if (overlay && overlay.el && overlay.el.isConnected) return overlay;
-      overlay = null;
       var target = findChartCanvas();
+      if (overlay && overlay.el && overlay.el.isConnected && overlay.target === target) return overlay;
+      if (overlay) hideOverlay();
+      overlay = null;
       if (!target || !document.body) return null;
       var el = document.createElement("div");
       el.style.cssText = "position:fixed;pointer-events:none;z-index:2147483000;";
@@ -1775,9 +2398,11 @@
       ov.el.style.top = rect.top + "px";
       ov.el.style.width = rect.width + "px";
       ov.el.style.height = rect.height + "px";
-      var dpr = window.devicePixelRatio || 1;
-      ov.canvas.width = Math.floor(rect.width * dpr);
-      ov.canvas.height = Math.floor(rect.height * dpr);
+      var rawDpr = Number(window.devicePixelRatio);
+      var dpr = Number.isFinite(rawDpr) ? Math.max(1, Math.min(2, rawDpr)) : 1;
+      var pixelW = Math.floor(rect.width * dpr), pixelH = Math.floor(rect.height * dpr);
+      if (ov.canvas.width !== pixelW) ov.canvas.width = pixelW;
+      if (ov.canvas.height !== pixelH) ov.canvas.height = pixelH;
       var ctx = ov.ctx;
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, rect.width, rect.height);
@@ -1799,10 +2424,15 @@
       var W = rect.width, H = rect.height;
       for (var k = 0; k < markers.length; k++) {
         var m = markers[k];
-        if (!m || m.time == null || m.price == null) continue;
-        if (m.time < t0 || m.time > t1) continue;
-        var x = ((m.time - t0) / (t1 - t0)) * W;
-        var y = H - ((m.price - lo) / (hi - lo)) * H;
+        var markerTime = Number(m && m.time), markerPrice = Number(m && m.price);
+        if (!m || (m.dir !== "CALL" && m.dir !== "PUT") || !Number.isFinite(markerTime) ||
+            !Number.isFinite(markerPrice) || markerPrice <= 0) continue;
+        while (markerTime >= 1e14) markerTime /= 1000;
+        if (markerTime < 1e11) markerTime *= 1000;
+        if (markerTime < t0 || markerTime > t1) continue;
+        var x = ((markerTime - t0) / (t1 - t0)) * W;
+        var y = H - ((markerPrice - lo) / (hi - lo)) * H;
+        if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
         drawArrow(ctx, x, y, m.dir === "PUT");
       }
     }
@@ -1826,42 +2456,47 @@
 
     /* ---------- chart discovery ---------- */
     var scanTimer = null;
+    var inspectBudget = 0;
+    var inspectSeen = null;
     function scheduleScan() {
       if (scanTimer) return;
       var tries = 0;
       scanTimer = setInterval(function () {
         tries++;
-        try {
-          if (hasChart() || scanOnce()) { clearInterval(scanTimer); scanTimer = null; return; }
-        } catch (_) {}
-        if (tries > 30) { clearInterval(scanTimer); scanTimer = null; }
+        try { scanOnce(); } catch (_) {}
+        // Keep scanning briefly after the first capture: multi-chart layouts
+        // often mount mini charts first and the large main chart later.
+        if (tries > 12) { clearInterval(scanTimer); scanTimer = null; }
       }, 2000);
     }
 
     function scanOnce() {
+      var found = false;
+      inspectBudget = 1600;
+      inspectSeen = typeof WeakSet !== "undefined" ? new WeakSet() : null;
       // a) lightweight-charts web component
       try {
         var els = document.querySelectorAll("lightweight-chart");
         for (var i = 0; i < els.length; i++) {
-          if (els[i] && els[i].chart && captureChart(els[i].chart)) return true;
+          if (els[i] && els[i].chart && captureChart(els[i].chart, els[i])) found = true;
         }
       } catch (_) {}
       // b) React fiber scan on chart containers (bundled lightweight-charts)
       try {
         var containers = document.querySelectorAll("[class*='tv-lightweight-charts'], [class*='chart']");
-        for (var c = 0; c < containers.length; c++) {
+        for (var c = 0; c < containers.length && c < 80; c++) {
           var inst = fiberScan(containers[c]);
-          if (inst && captureChart(inst)) return true;
+          if (inst && captureChart(inst, containers[c])) found = true;
         }
       } catch (_) {}
       // c) common window handles
       try {
         var cands = [window.chart, window.qxChart, window.quotexChart, window.tradeChart, window.activeChart];
         for (var j = 0; j < cands.length; j++) {
-          if (captureChart(cands[j])) return true;
+          if (captureChart(cands[j])) found = true;
         }
       } catch (_) {}
-      return false;
+      return found;
     }
 
     function fiberScan(el) {
@@ -1891,8 +2526,12 @@
     }
 
     function inspectObj(obj, depth) {
-      if (!obj || typeof obj !== "object" || depth > 7) return null;
+      if (!obj || typeof obj !== "object" || depth > 7 || inspectBudget-- <= 0) return null;
       try {
+        if (inspectSeen) {
+          if (inspectSeen.has(obj)) return null;
+          inspectSeen.add(obj);
+        }
         if (isChartLike(obj)) return obj;
         // React hook list / linked structures
         var probe = obj;
@@ -1929,8 +2568,9 @@
           if (v && typeof v.createChart === "function" && !v.__cyberWrapped) {
             var origCreate = v.createChart;
             v.createChart = function () {
+              var container = arguments[0];
               var c = origCreate.apply(this, arguments);
-              try { captureChart(c); } catch (_) {}
+              try { captureChart(c, container); } catch (_) {}
               return c;
             };
             try { v.__cyberWrapped = true; } catch (_) {}
@@ -1940,8 +2580,9 @@
       if (_lwc && typeof _lwc.createChart === "function" && !_lwc.__cyberWrapped) {
         var origCreate2 = _lwc.createChart;
         _lwc.createChart = function () {
+          var container = arguments[0];
           var c = origCreate2.apply(this, arguments);
-          try { captureChart(c); } catch (_) {}
+          try { captureChart(c, container); } catch (_) {}
           return c;
         };
         try { _lwc.__cyberWrapped = true; } catch (_) {}
@@ -1974,9 +2615,19 @@
       candles: live.candles,
       assetIdMap: live.assetIdMap,
       lastWsSymbol: live.lastWsSymbol,
+      lastWsPeriod: live.lastWsPeriod,
+      activeChart: live.activeChart,
       socket: !!handle.lastWs,
       frames: (window.__cyber_frames || []).slice(0, 12),
     };
+  }
+
+  function isBrokerSocketUrl(url) {
+    try {
+      var parsed = new URL(String(url || ""), location.href);
+      return (parsed.protocol === "ws:" || parsed.protocol === "wss:") &&
+        Q.isQuotexHost(parsed.hostname) && /\/socket\.io(?:\/|$)/i.test(parsed.pathname);
+    } catch (_) { return false; }
   }
 
   // Install the WebSocket wrapper *synchronously*. Handles text, Blob and
@@ -1987,8 +2638,13 @@
     handle.native = Native;
     function Wrapped(url, protocols) {
       var ws = protocols !== undefined ? new Native(url, protocols) : new Native(url);
-      handle.lastWs = ws;
-      try { emit("open", { url: url || "" }); } catch (_) {}
+      var brokerSocket = isBrokerSocketUrl(url);
+      // Binary attachment headers are socket-local. A dedicated router per
+      // WebSocket prevents interleaved sockets from stealing each other's
+      // pending header/event context.
+      var socketRouter = Q.createRouter(routerHandlers);
+      if (brokerSocket) { handle.lastWs = ws; handle.router = socketRouter; }
+      if (brokerSocket) try { emit("open", { url: url || "" }); } catch (_) {}
       // --- outgoing-frame sniffing: the client's own requests tell us the
       // active asset. This is what makes auto-detection work even when the
       // DOM uses hashed class names or ticks arrive with numeric ids. ---
@@ -2006,20 +2662,33 @@
           }
           var hit = s ? Q.sniffOutgoing(s) : null;
           if (hit && hit.symbol) {
-            live.lastWsSymbol = hit.symbol;
-            emit("asset", { symbol: hit.symbol, raw: "ws_out", event: hit.event });
+            brokerSocket = true;
+            handle.lastWs = ws;
+            handle.router = socketRouter;
+          }
+          if (hit && hit.symbol && !internalSubscriptionSend) {
+            if (hit.main) selectActiveChart(hit, "ws_out");
+            else if (hit.candidate && !live.activeChart) selectActiveChart(hit, "ws_candidate");
+            else if (live.activeChart && hit.symbol === live.activeChart.symbol && hit.period &&
+                /history\/list\/v2|chart_notification\/get|loadHistoryPeriod/.test(hit.event || "")) {
+              // Same selected symbol: learn the visible chart timeframe without
+              // allowing another asset's background history to become main.
+              selectActiveChart(hit, "ws_period");
+            }
           }
         } catch (_) {}
         return nativeSend(data);
       };
       ws.addEventListener("open", function () {
-        try { emit("quotex_status", { state: "open", url: url || "" }); } catch (_) {}
+        if (brokerSocket && handle.lastWs === ws) try { emit("quotex_status", { state: "open", url: url || "" }); } catch (_) {}
       });
       ws.addEventListener("close", function () {
-        try { emit("quotex_status", { state: "closed", url: url || "" }); } catch (_) {}
+        var wasCurrent = handle.lastWs === ws;
+        if (wasCurrent) handle.lastWs = null;
+        if (brokerSocket && wasCurrent) try { emit("quotex_status", { state: "closed", url: url || "" }); } catch (_) {}
       });
       ws.addEventListener("message", function (ev) {
-        try { router.feedRaw(ev.data); } catch (_) {}
+        if (brokerSocket && handle.lastWs === ws) try { socketRouter.feedRaw(ev.data); } catch (_) {}
       });
       return ws;
     }
@@ -2028,6 +2697,7 @@
     Wrapped.OPEN = Native.OPEN;
     Wrapped.CLOSING = Native.CLOSING;
     Wrapped.CLOSED = Native.CLOSED;
+    try { Object.setPrototypeOf(Wrapped, Native); } catch (_) {}
     handle.wrapper = Wrapped;
     window.WebSocket = Wrapped;
   }
@@ -2062,18 +2732,31 @@
   //                     page's own socket (mirrors the web client's frames).
   //   - place_ws      → send a real `orders/open` frame on the page socket.
   window.addEventListener("message", function (ev) {
-    if (!ev.data || ev.data.source !== "CYBER_BINARY_CONTENT") return;
+    if (ev.source !== window || !ev.data || ev.data.source !== "CYBER_BINARY_CONTENT") return;
     if (ev.data.kind === "sync_request") {
       emit("snapshot", snapshot());
     } else if (ev.data.kind === "subscribe") {
       var sub = ev.data.payload || {};
-      var r = Q.subscribeHistory(handle.lastWs, sub.asset, sub.period);
+      internalSubscriptionSend = true;
+      var r;
+      try { r = Q.subscribeHistory(handle.lastWs, sub.asset, sub.period); }
+      finally { internalSubscriptionSend = false; }
       emit("subscribe_result", { ok: !!(r && r.ok), payload: r || {} });
     } else if (ev.data.kind === "place_ws") {
-      var args = ev.data.payload || {};
-      var reqId = args.requestId;
-      var res = Q.placeTradeWs(handle.lastWs, args);
-      res = res || { ok: false, error: "no result" };
+      var args = ev.data.payload && typeof ev.data.payload === "object" ? ev.data.payload : {};
+      var reqId = args.requestId != null ? String(args.requestId).slice(0, 128) : "";
+      var res;
+      if (!reqId) {
+        res = { ok: false, confirmed: false, error: "request id required" };
+      } else if (seenPlacementIds[reqId]) {
+        res = { ok: false, confirmed: false, sent: true, error: "duplicate placement request" };
+      } else {
+        seenPlacementIds[reqId] = true;
+        seenPlacementOrder.push(reqId);
+        while (seenPlacementOrder.length > 500) delete seenPlacementIds[seenPlacementOrder.shift()];
+        res = Q.placeTradeWs(handle.lastWs, args);
+      }
+      res = res || { ok: false, confirmed: false, error: "no result" };
       res.requestId = reqId;
       emit("ws_result", res);
     } else if (ev.data.kind === "markers") {

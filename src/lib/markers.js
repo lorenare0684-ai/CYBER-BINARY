@@ -20,35 +20,74 @@
   var PUT_COLOR = "#ff5d7a";
   var MAX_DEFAULT = 600;
 
+  function numberOrNull(value) {
+    try {
+      var n = Number(value);
+      return Number.isFinite(n) ? n : null;
+    } catch (_) { return null; }
+  }
+
   function createStore(opts) {
-    var max = (opts && opts.max) || MAX_DEFAULT;
+    var requestedMax = numberOrNull(opts && opts.max);
+    var max = Number.isFinite(requestedMax) && requestedMax >= 1
+      ? Math.min(5000, Math.floor(requestedMax)) : MAX_DEFAULT;
     var byAsset = Object.create(null);
+    var anchorsByAsset = Object.create(null);
+    var assetCount = 0;
+
+    function confidence(value) {
+      var n = numberOrNull(value);
+      return n != null ? Math.max(0, Math.min(100, n)) : null;
+    }
+
+    function safeAt(value) {
+      var n = numberOrNull(value);
+      return Number.isSafeInteger(n) && n >= 0 ? n : null;
+    }
 
     function add(m) {
-      if (!m || m.time == null || !Number.isFinite(Number(m.time)) ||
-          m.dir == null || m.price == null || !Number.isFinite(Number(m.price))) return false;
-      var key = String(m.asset || "?");
-      var list = byAsset[key] || (byAsset[key] = []);
-      var time = Math.floor(Number(m.time));
+      var rawTime = m ? numberOrNull(m.time) : null;
+      var price = m ? numberOrNull(m.price) : null;
+      var key = m && typeof m.asset === "string" ? m.asset.trim() : "";
+      if (!m || !Number.isSafeInteger(rawTime) || rawTime < 0 ||
+          (m.dir !== "CALL" && m.dir !== "PUT") || !Number.isFinite(price) ||
+          price <= 0 || price > 1e15 || !/^[A-Za-z0-9._-]{1,64}$/.test(key)) return false;
+      var list = byAsset[key];
+      if (!list) {
+        if (assetCount >= 512) return false;
+        list = byAsset[key] = [];
+        anchorsByAsset[key] = Object.create(null);
+        assetCount++;
+      }
+      var time = rawTime;
       var dir = m.dir === "PUT" ? "PUT" : "CALL";
+      var anchorKey = time + ":" + dir;
+      var existing = anchorsByAsset[key][anchorKey];
       // Dedupe by anchor: same (asset, bar, direction) never adds a second
       // marker. Meta (confidence/at) may be refreshed in place.
-      for (var i = 0; i < list.length; i++) {
-        if (list[i].time === time && list[i].dir === dir) {
-          if (m.confidence != null) list[i].confidence = m.confidence;
-          if (m.at != null) list[i].at = m.at;
-          return false;
+      if (existing) {
+        if (m.confidence != null) existing.confidence = confidence(m.confidence);
+        if (m.at != null) {
+          var refreshedAt = safeAt(m.at);
+          if (refreshedAt != null) existing.at = refreshedAt;
         }
+        return false;
       }
-      list.push({
+      var suppliedAt = safeAt(m.at);
+      var marker = {
         asset: key,
         time: time,
-        price: Number(m.price),
+        price: price,
         dir: dir,
-        confidence: m.confidence != null ? Number(m.confidence) : null,
-        at: m.at != null ? Number(m.at) : Date.now(),
-      });
-      if (list.length > max) list.splice(0, list.length - max);
+        confidence: m.confidence != null ? confidence(m.confidence) : null,
+        at: suppliedAt != null ? suppliedAt : Date.now(),
+      };
+      list.push(marker);
+      anchorsByAsset[key][anchorKey] = marker;
+      if (list.length > max) {
+        var removed = list.splice(0, list.length - max);
+        for (var i = 0; i < removed.length; i++) delete anchorsByAsset[key][removed[i].time + ":" + removed[i].dir];
+      }
       return true;
     }
 
@@ -78,7 +117,9 @@
         }
       }
       out.sort(function (a, b) { return a.time - b.time; });
-      return out;
+      // Return detached records so dashboard/consumer edits cannot mutate an
+      // anchor held by the non-repainting store.
+      return out.map(function (marker) { return Object.assign({}, marker); });
     }
 
     function count(asset) {
@@ -87,8 +128,16 @@
     }
 
     function clear(asset) {
-      if (asset != null) delete byAsset[String(asset)];
-      else for (var key in byAsset) if (Object.prototype.hasOwnProperty.call(byAsset, key)) delete byAsset[key];
+      if (asset != null) {
+        var key = String(asset);
+        if (byAsset[key]) assetCount--;
+        delete byAsset[key];
+        delete anchorsByAsset[key];
+      } else {
+        byAsset = Object.create(null);
+        anchorsByAsset = Object.create(null);
+        assetCount = 0;
+      }
     }
 
     return { add: add, seedHistory: seedHistory, list: list, count: count, clear: clear };
@@ -101,15 +150,21 @@
    * exist, so the newest one wins), capped.
    */
   function toNative(list, opts) {
-    var cap = (opts && opts.cap) || MAX_DEFAULT;
+    var requestedCap = numberOrNull(opts && opts.cap);
+    var cap = Number.isFinite(requestedCap) && requestedCap >= 1
+      ? Math.min(5000, Math.floor(requestedCap)) : MAX_DEFAULT;
     var out = [];
     var byTime = Object.create(null);
     var arr = Array.isArray(list) ? list : [];
     for (var i = 0; i < arr.length; i++) {
       var m = arr[i];
-      if (!m || m.time == null || !Number.isFinite(Number(m.time))) continue;
-      var sec = Math.floor(Number(m.time) / 1000);
-      var dir = m.dir === "PUT" ? "PUT" : "CALL";
+      if (!m || m.time == null) continue;
+      var rawTime = numberOrNull(m.time);
+      if (rawTime == null) continue;
+      while (Math.abs(rawTime) >= 1e14) rawTime /= 1000;
+      var sec = Math.floor(Math.abs(rawTime) >= 1e11 ? rawTime / 1000 : rawTime);
+      if (!Number.isSafeInteger(sec) || sec < 0 || (m.dir !== "CALL" && m.dir !== "PUT")) continue;
+      var dir = m.dir;
       byTime[sec] = {
         time: sec,
         position: dir === "PUT" ? "aboveBar" : "belowBar",
