@@ -77,9 +77,9 @@ function testStrategiesList() {
   const list = STRAT.list();
   check("Strategy catalog contains 12 strategies", list.length >= 12, "length=" + list.length);
   const expected = [
-    "auto_adaptive", "confluence", "trend", "meanrev", "breakout",
-    "scalp", "otc", "squeeze", "ribbon", "reversal",
-    "momentum_pulse", "choppy_range"
+    "auto_adaptive", "sniper", "turbo_trend", "institutional_flow",
+    "confluence", "trend", "breakout", "scalp", "otc", "squeeze",
+    "ribbon", "momentum_pulse"
   ];
   for (const id of expected) {
     const s = STRAT.get(id);

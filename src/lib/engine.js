@@ -39,8 +39,8 @@
   };
 
   const CONCRETE_STRATEGIES = [
-    "confluence", "trend", "meanrev", "breakout", "scalp", "otc",
-    "squeeze", "ribbon", "reversal", "momentum_pulse", "choppy_range"
+    "sniper", "turbo_trend", "institutional_flow", "confluence", "trend",
+    "breakout", "scalp", "otc", "squeeze", "ribbon", "momentum_pulse"
   ];
 
   function numberValue(value) {
@@ -172,16 +172,15 @@
 
       let regimeBonus = 0;
       if (regime === "trending" || regime === "strong-trend") {
-        if (stratId === "trend" || stratId === "ribbon") regimeBonus = 30;
-        else if (stratId === "momentum_pulse" || stratId === "confluence") regimeBonus = 20;
+        if (stratId === "turbo_trend" || stratId === "sniper" || stratId === "trend" || stratId === "ribbon") regimeBonus = 30;
+        else if (stratId === "momentum_pulse" || stratId === "institutional_flow" || stratId === "confluence") regimeBonus = 20;
         else if (stratId === "breakout") regimeBonus = 15;
       } else if (regime === "mean-reverting" || regime === "ranging") {
-        if (stratId === "meanrev" || stratId === "choppy_range") regimeBonus = 30;
-        else if (stratId === "reversal" || stratId === "confluence") regimeBonus = 20;
-        else if (stratId === "otc") regimeBonus = 15;
+        if (stratId === "institutional_flow" || stratId === "sniper" || stratId === "confluence") regimeBonus = 30;
+        else if (stratId === "otc" || stratId === "scalp") regimeBonus = 20;
       } else if (regime === "squeeze" || regime === "choppy") {
         if (stratId === "squeeze" || stratId === "breakout") regimeBonus = 30;
-        else if (stratId === "scalp" || stratId === "confluence") regimeBonus = 20;
+        else if (stratId === "scalp" || stratId === "sniper" || stratId === "confluence") regimeBonus = 20;
       }
 
       const hasSignal = res.direction === "CALL" || res.direction === "PUT";
@@ -256,16 +255,15 @@
 
       let regimeBonus = 0;
       if (regime === "trending" || regime === "strong-trend") {
-        if (stratId === "trend" || stratId === "ribbon") regimeBonus = 30;
-        else if (stratId === "momentum_pulse" || stratId === "confluence") regimeBonus = 20;
+        if (stratId === "turbo_trend" || stratId === "sniper" || stratId === "trend" || stratId === "ribbon") regimeBonus = 30;
+        else if (stratId === "momentum_pulse" || stratId === "institutional_flow" || stratId === "confluence") regimeBonus = 20;
         else if (stratId === "breakout") regimeBonus = 15;
       } else if (regime === "mean-reverting" || regime === "ranging") {
-        if (stratId === "meanrev" || stratId === "choppy_range") regimeBonus = 30;
-        else if (stratId === "reversal" || stratId === "confluence") regimeBonus = 20;
-        else if (stratId === "otc") regimeBonus = 15;
+        if (stratId === "institutional_flow" || stratId === "sniper" || stratId === "confluence") regimeBonus = 30;
+        else if (stratId === "otc" || stratId === "scalp") regimeBonus = 20;
       } else if (regime === "squeeze" || regime === "choppy") {
         if (stratId === "squeeze" || stratId === "breakout") regimeBonus = 30;
-        else if (stratId === "scalp" || stratId === "confluence") regimeBonus = 20;
+        else if (stratId === "scalp" || stratId === "sniper" || stratId === "confluence") regimeBonus = 20;
       }
 
       const hasSignal = res.direction === "CALL" || res.direction === "PUT";
