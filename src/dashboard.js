@@ -44,6 +44,9 @@
   let historyRenderToken = 0;
   const recentAutoLogKeys = new Set();
   const recentAutoLogOrder = [];
+  // Genuine 1m candles received in the latest live state. Backtests can use
+  // these immediately instead of racing the asynchronous storage persistence.
+  const liveCandlesByAsset = Object.create(null);
 
   function tfLabel(sec) {
     if (!sec) return "1m";
@@ -181,7 +184,7 @@
       ctx.fillStyle = "rgba(255,255,255,0.45)";
       ctx.font = "11px system-ui, sans-serif";
       ctx.textAlign = "center";
-      ctx.fillText("Waiting for candles…", w / 2, h / 2);
+      ctx.fillText(o.emptyMessage || "Waiting for candles…", w / 2, h / 2);
       return;
     }
     if (o.equity) {
@@ -505,14 +508,28 @@
 
   function bindSelectors() {
     $("asset-select").addEventListener("change", (e) => {
-      activeAsset = e.target.value;
+      const requested = e.target.value;
+      const previous = activeAsset;
       if (hasChrome) {
-        chrome.runtime.sendMessage({ type: "CYBER_SET_ASSET", asset: activeAsset }).catch(() => {});
-      } else {
-        // Re-seed local demo feed for the new asset.
-        const a = ASSETS.get(activeAsset);
-        if (a) localFeed.setSeries(FEED.syntheticSeries(a, 240));
+        chrome.runtime.sendMessage({ type: "CYBER_SET_ASSET", asset: requested }).then((response) => {
+          if (!response || !response.ok) {
+            e.target.value = previous;
+            const pill = $("link-state");
+            if (pill) {
+              pill.textContent = response && response.error || "Select the asset on Quotex first";
+              pill.className = "pill warn";
+            }
+            return;
+          }
+          activeAsset = response.asset || requested;
+          e.target.value = activeAsset;
+        }).catch(() => { e.target.value = previous; });
+        return;
       }
+      activeAsset = requested;
+      // Re-seed local demo feed for the new asset.
+      const a = ASSETS.get(activeAsset);
+      if (a) localFeed.setSeries(FEED.syntheticSeries(a, 240));
       renderLocalTick();
     });
     $("strategy-select").addEventListener("change", (e) => {
@@ -627,6 +644,12 @@
       activeStrategy = state.strategy.slice(0, 64);
       const sel = $("strategy-select");
       if (sel && sel.value !== activeStrategy) sel.value = activeStrategy;
+    }
+    if (state.realHistoryReady === true && Array.isArray(state.candles) && state.candles.length) {
+      // Keep only the bounded payload from the authoritative selected tab.
+      // The content script marks this true only after genuine 1m broker OHLC
+      // has replaced the synthetic warm-up feed.
+      liveCandlesByAsset[activeAsset] = state.candles.slice(-500);
     }
 
     const sig = state.signal && typeof state.signal === "object" ? state.signal : {};
@@ -1106,19 +1129,52 @@
       if (n) btn.textContent = "Running live-feed backtest " + i + " / " + n + "…";
     }
 
-    const assetPool = ASSETS.list().filter((a) => !kinds || kinds.includes(a.kind)).slice(0, 256);
+    const assetPool = ASSETS.list().filter((a) => !kinds || kinds.some((kindName) =>
+      typeof ASSETS.matchesKind === "function" ? ASSETS.matchesKind(a, kindName) : a.kind === kindName)).slice(0, 256);
     const minNeeded = Math.max(40, 50 + horizon + 1);
     // Ask the selected Quotex tab for broker history immediately instead of
-    // assuming its periodic subscription has already completed. Give the
-    // socket response/storage write a short window before reading the cache.
+    // assuming its periodic subscription has completed. Poll the genuine
+    // live/storage sources briefly because socket delivery and persistence are
+    // asynchronous and a fixed 1.2-second delay routinely raced them.
     const requestFreshHistory = hasChrome
       ? chrome.runtime.sendMessage({ type: "CYBER_REQUEST_HISTORY", limit: 5000 })
-          .catch(() => null)
-          .then(() => new Promise((resolve) => setTimeout(resolve, 1200)))
-      : Promise.resolve();
-    const loadLiveCache = requestFreshHistory.then(() => Promise.all(assetPool.map((a) =>
-      STORE.getCandles(a.id).then((bars) => ({ asset: a, bars })).catch(() => ({ asset: a, bars: [] }))
-    ))).then((rows) => {
+          .then((response) => {
+            if (!response || !response.ok) throw new Error(response && response.error || "The selected Quotex tab could not request history.");
+            return response;
+          })
+      : Promise.resolve({ ok: true });
+
+    const readLiveRows = () => STORE.load().then((snapshot) => {
+      const storedByAsset = snapshot && snapshot.candles && typeof snapshot.candles === "object"
+        ? snapshot.candles : {};
+      return assetPool.map((a) => {
+        const stored = storedByAsset[a.id];
+        const immediate = liveCandlesByAsset[a.id];
+        const storedBars = Array.isArray(stored) ? stored : [];
+        const immediateBars = Array.isArray(immediate) ? immediate : [];
+        // Prefer whichever genuine source is longer. A live-state payload can
+        // arrive before chrome.storage.local has completed its cross-context
+        // write, which previously made a populated chart report no candles.
+        return { asset: a, bars: immediateBars.length > storedBars.length ? immediateBars : storedBars };
+      });
+    }).catch(() => assetPool.map((a) => ({
+      asset: a,
+      bars: Array.isArray(liveCandlesByAsset[a.id]) ? liveCandlesByAsset[a.id] : [],
+    })));
+
+    const waitForLiveRows = async () => {
+      const deadline = Date.now() + 10000;
+      let rows = await readLiveRows();
+      while (!rows.some((row) => Array.isArray(row.bars) && row.bars.length >= minNeeded) && Date.now() < deadline) {
+        const secondsLeft = Math.max(1, Math.ceil((deadline - Date.now()) / 1000));
+        btn.textContent = "Waiting for broker candles… " + secondsLeft + "s";
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        rows = await readLiveRows();
+      }
+      return rows;
+    };
+
+    const loadLiveCache = requestFreshHistory.then(waitForLiveRows).then((rows) => {
       const cachedByAsset = Object.create(null);
       const liveAssets = [];
       rows.forEach((row) => {
@@ -1129,7 +1185,7 @@
         }
       });
       if (!liveAssets.length) {
-        return { results: [], count: 0, liveOnly: true, error: "No usable Quotex candles were received. Keep the selected Quotex chart open and connected, then retry; at least " + minNeeded + " one-minute bars are required." };
+        return { results: [], count: 0, liveOnly: true, error: "No genuine one-minute Quotex history arrived within 10 seconds. Keep the selected trade chart open and connected, then retry; at least " + minNeeded + " bars are required." };
       }
       o.assets = liveAssets;
       o.cachedByAsset = cachedByAsset;
@@ -1150,6 +1206,12 @@
         if (body) body.innerHTML = "<tr><td colspan='5'>" + esc(r.error) + "</td></tr>";
       }
     }).catch((e) => {
+      const message = String(e && e.message || e || "Backtest failed");
+      const failure = { results: [], count: 0, liveOnly: true, error: message };
+      btResults = failure;
+      paintBacktest(failure, o);
+      const body = $("bt-assets") && $("bt-assets").querySelector("tbody");
+      if (body) body.innerHTML = "<tr><td colspan='5'>" + esc(message) + "</td></tr>";
       console.error(e);
     }).then(() => {
       btn.disabled = false;
@@ -1165,7 +1227,8 @@
     $("bt-trades").textContent = String(sum.trades || 0);
     $("bt-winrate").textContent = fmtPct(sum && sum.winrate);
     $("bt-pnl").textContent = String(sum && sum.pnl || 0);
-    $("bt-dd").textContent = "—";
+    const maxDrawdown = finite(sum && sum.maxDrawdown, null);
+    $("bt-dd").textContent = maxDrawdown == null ? "—" : maxDrawdown.toFixed(2);
 
     // The matrix does not retain trade chronology, so never fabricate it by
     // grouping every win before every loss. Plot one bounded cumulative point
@@ -1177,8 +1240,12 @@
       running += finite(r && r.pnl, 0);
       seq.push({ equity: running });
     }
-    lastBtEquity = seq;
-    drawChart($("bt-equity"), seq, { equity: true, equityLabel: "runs" });
+    lastBtEquity = matrix.error ? null : seq;
+    drawChart($("bt-equity"), matrix.error ? [] : seq, {
+      equity: true,
+      equityLabel: "runs",
+      emptyMessage: matrix.error ? "No genuine Quotex history received — see status below." : undefined,
+    });
 
     // Per-strategy
     const stBody = $("bt-strategies").querySelector("tbody");
@@ -1353,11 +1420,28 @@
           "<td>" + liveWR + "</td>" +
           "<td>" + liveT + "</td>";
         tr.addEventListener("click", () => {
+          if (hasChrome) {
+            chrome.runtime.sendMessage({ type: "CYBER_SET_ASSET", asset: a.id }).then((response) => {
+              if (response && response.ok) {
+                activeAsset = response.asset || a.id;
+                const sel = $("asset-select");
+                if (sel) sel.value = activeAsset;
+                activateTab("live");
+              } else {
+                const pill = $("link-state");
+                if (pill) {
+                  pill.textContent = response && response.error || "Select the asset on Quotex first";
+                  pill.className = "pill warn";
+                }
+                activateTab("live");
+              }
+            }).catch(() => {});
+            return;
+          }
           activeAsset = a.id;
           const sel = $("asset-select");
           if (sel) sel.value = a.id;
-          if (hasChrome) chrome.runtime.sendMessage({ type: "CYBER_SET_ASSET", asset: a.id }).catch(() => {});
-          else localFeed.setSeries(FEED.syntheticSeries(a, 240));
+          localFeed.setSeries(FEED.syntheticSeries(a, 240));
           activateTab("live");
         });
         tb.appendChild(tr);

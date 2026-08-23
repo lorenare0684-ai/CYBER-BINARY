@@ -437,8 +437,12 @@ h1 {
 }
 .arm-btn { background: linear-gradient(135deg, #ff2d55, #7b1748); border-color: rgba(255, 93, 122, 0.5); }
 .arm-btn.armed { background: linear-gradient(135deg, #16ff9d, #087d58); border-color: rgba(61, 255, 154, 0.55); }
-.table { display: block; overflow-x: auto; }
-.table thead, .table tbody { display: table; width: 100%; }
+/* Keep every table as one table formatting context. Making the table itself a
+   block and its thead/tbody separate tables lets each section calculate
+   different column widths, so body values appear under the wrong headers. */
+.table { display: table; table-layout: auto; }
+.table thead { display: table-header-group; }
+.table tbody { display: table-row-group; }
 @media (min-width: 900px) {
   .tab-pane[data-pane="live"].active {
     display: grid;

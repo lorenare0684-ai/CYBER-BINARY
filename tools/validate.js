@@ -68,6 +68,15 @@ else {
   const f = sandbox.self.CYBER_FEED.createFeed({ tfMs: 60000 });
   f.seedHistory(50, 1.1);
   if (f.series().length < 40) { console.error("feed seed failed"); failed++; }
+  const beforeRebase = f.series();
+  const beforeShape = beforeRebase[beforeRebase.length - 2].close / beforeRebase[beforeRebase.length - 1].close;
+  if (!f.rebase(1.75)) { console.error("feed warm-up rebase failed"); failed++; }
+  const afterRebase = f.series();
+  const afterShape = afterRebase[afterRebase.length - 2].close / afterRebase[afterRebase.length - 1].close;
+  if (f.lastPrice() !== 1.75 || afterRebase[afterRebase.length - 1].close !== 1.75 ||
+      Math.abs(beforeShape - afterShape) > 1e-12) {
+    console.error("feed rebase must align newest close while preserving shape"); failed++;
+  }
   const s1 = sandbox.self.CYBER_FEED.syntheticSeries("EURUSD", 80, { seed: 7 });
   const s2 = sandbox.self.CYBER_FEED.syntheticSeries("GBPUSD", 80, { seed: 7 });
   if (!s1.length || !s2.length || s1[20].close / s1[20].open === s2[20].close / s2[20].open) {
@@ -87,6 +96,20 @@ else {
   const kinds = new Set(all.map((a) => a.kind));
   for (const k of ["fx", "crypto", "commodity", "index", "stock", "otc"]) {
     if (!kinds.has(k)) { console.error("missing asset kind " + k); failed++; }
+  }
+  // OTC is a venue, not a mutually exclusive underlying class. Every real
+  // broker `_otc` symbol must be reachable from the OTC filter even though it
+  // remains classed as fx/crypto/commodity/index/stock.
+  const expectedOtc = all.filter((a) => a.isOtc === true);
+  const filteredOtc = A.byKind("otc");
+  const suffixOtc = all.filter((a) => /_otc$/i.test(a.id));
+  if (suffixOtc.length < 100 || suffixOtc.some((a) => a.isOtc !== true) ||
+      expectedOtc.length < suffixOtc.length || filteredOtc.length !== expectedOtc.length ||
+      expectedOtc.some((a) => !filteredOtc.some((b) => b.id === a.id))) {
+    console.error("OTC venue metadata/filter omitted broker instruments: " + filteredOtc.length + "/" + expectedOtc.length); failed++;
+  }
+  if (all.filter((a) => a.kind === "stock").some((a) => !a.isOtc || a.session !== "OTC 24/7")) {
+    console.error("OTC stocks expose a false NYSE session"); failed++;
   }
   // detection smoke (display names + OTC routing + tickers)
   const detCases = [
@@ -155,6 +178,11 @@ if (!W) {
     workerInputsSafe = Object.getPrototypeOf(canonical.seriesByAsset) === null &&
       canonical.jobs.length === 1 && canonical.jobs[0].asset.name !== "FORGED" &&
       canonical.jobs[0].strategy.label !== "FORGED" && canonical.seriesByAsset.EURUSD.length === 1440;
+    const otcJob = W.buildJob(["EURUSD", "EURUSD_otc", "BTCUSD_otc", "AAPL_otc"], ["trend"], {
+      days: 1, kinds: ["otc"],
+    });
+    workerInputsSafe = workerInputsSafe && otcJob.jobs.length === 3 &&
+      otcJob.jobs.every((job) => /_otc$/i.test(job.asset.id));
     W.runChunk(canonical.seriesByAsset, canonical.jobs, {
       days: Symbol("days"), horizon: Symbol("horizon"), minConf: Symbol("confidence"), minBars: Symbol("bars"),
     });
@@ -203,6 +231,22 @@ else {
   stringQuoteRouter.dispatch({ type:"bin", payload:[["EURUSD", "1700000000", "1.0815"]] });
   if (!stringQuote || stringQuote.symbol !== "EURUSD" || stringQuote.price !== 1.0815) {
     console.error("numeric-string headerless quotes must be inferred and parsed"); failed++;
+  }
+  let wrappedQuote = null;
+  const wrappedQuoteRouter = Q.createRouter({ onTick: (quote) => { wrappedQuote = quote; } });
+  wrappedQuoteRouter.dispatch({ type:"bin", payload:{ data:[["EURUSD", 1700000000, 1.0825]] } });
+  const wrappedObjectQuote = Q.parseQuote({ result:{ symbol:"EURUSD", time:1700000001, price:1.083 } });
+  const wrappedCandles = Q.parseCandles({ result:{ asset:"EURUSD", period:60,
+    candles:[[1700000000,1.08,1.082,1.085,1.075,100]] } });
+  const wrappedBalance = Q.parseBalance({ data:{ uid:7, balance:52.5, currency:"USD" } });
+  const wrappedOrder = Q.parseOrderOpened({ requestId:"req-envelope", result:{
+    id:"order-7", asset:"EURUSD", amount:10, action:"call"
+  } });
+  if (!wrappedQuote || wrappedQuote.price !== 1.0825 || !wrappedObjectQuote ||
+      wrappedObjectQuote.price !== 1.083 || !wrappedCandles || wrappedCandles.raw.length !== 1 ||
+      !wrappedBalance || wrappedBalance.balance !== 52.5 || !wrappedOrder ||
+      wrappedOrder.id !== "order-7" || wrappedOrder.requestId !== "req-envelope") {
+    console.error("broker data/result envelopes must preserve quotes, history, balance, and order correlation"); failed++;
   }
   let malformedBrokerSafe = true;
   try {
@@ -298,10 +342,15 @@ if (sandbox.self.CYBER_ASSETS.registerQuotexAsset) {
   });
   // Broker convention: base uppercase, OTC suffix lowercase (EURUSD_otc).
   if (!a || a.id !== "TEST_otc") { console.error("registerQuotexAsset expected TEST_otc, got " + (a && a.id)); failed++; }
+  if (!a || a.isOtc !== true || a.session !== "OTC 24/7") { console.error("runtime OTC venue metadata missing"); failed++; }
   if (!a || a.timeframes.includes(0)) { console.error("fractional timeframe normalized to invalid zero"); failed++; }
   if (!A.get("EURUSD") || A.get("EURUSD").id !== "EURUSD") { console.error("runtime alias hijacked a static asset"); failed++; }
   const closed = A.registerQuotexAsset({ symbol: "TEST_otc", isOpen: "0" });
   if (!closed || closed.isOpen !== false) { console.error("string broker open-state parsing failed"); failed++; }
+  const staticOtc = A.registerQuotexAsset({ symbol: "EURUSD_otc", isOtc: false });
+  if (!staticOtc || !staticOtc.isOtc || staticOtc.session !== "OTC 24/7") {
+    console.error("live metadata update erased a static OTC venue"); failed++;
+  }
   const doge = A.detect("Dogecoin (OTC)");
   if (!doge || doge.id !== "DOGUSD_otc") { console.error("confirmed Dogecoin broker symbol was shadowed"); failed++; }
 }
@@ -520,9 +569,19 @@ if (cachedSeries.length !== 1440 || cachedSeries[cachedSeries.length - 1].close 
 }
 const dedupedMatrix = HIST.runMatrix({ days: 1, strategies: ["confluence", "confluence"], assets: ["EURUSD", "EURUSD"] });
 if (dedupedMatrix.count !== 1) { console.error("historic matrix did not deduplicate jobs"); failed++; }
-const safeSummary = HIST.summarize({ results: [{ asset: "A", strategy: "S", kind: "fx", wins: "2", losses: "1", draws: Infinity, pnl: "3" }, null] });
-if (!safeSummary || safeSummary.trades !== 3 || safeSummary.draws !== 0 || safeSummary.pnl !== 3) {
-  console.error("historic summary sanitation failed"); failed++;
+const otcMatrix = HIST.runMatrix({
+  days: 1, minBars: 40, strategies: ["confluence"], kinds: ["otc"],
+  assets: ["EURUSD", "EURUSD_otc", "BTCUSD_otc", "AAPL_otc"],
+});
+if (otcMatrix.count !== 3 || otcMatrix.results.some((row) => !/_otc$/i.test(row.asset))) {
+  console.error("historic OTC filter omitted cross-class broker markets"); failed++;
+}
+const safeSummary = HIST.summarize({ results: [
+  { asset: "A", strategy: "S", kind: "fx", wins: "2", losses: "1", draws: Infinity, pnl: "3", maxDrawdown: "4.5" },
+  { asset: "B", strategy: "S", kind: "fx", wins: 1, losses: 0, maxDrawdown: 2 }, null,
+] });
+if (!safeSummary || safeSummary.trades !== 4 || safeSummary.draws !== 0 || safeSummary.pnl !== 3 || safeSummary.maxDrawdown !== 4.5) {
+  console.error("historic summary sanitation/drawdown failed"); failed++;
 }
 
 if (failed) {

@@ -45,6 +45,12 @@
     return id ? STRATEGIES.get(id) : null;
   }
 
+  function matchesKinds(asset, kinds) {
+    if (!Array.isArray(kinds)) return true;
+    return kinds.some((kind) => typeof ASSETS.matchesKind === "function"
+      ? ASSETS.matchesKind(asset, kind) : !!asset && asset.kind === kind);
+  }
+
   function sortResults(results, requestedKey) {
     const allowed = new Set(["winrate", "wins", "losses", "draws", "total", "payoff", "pnl", "maxDrawdown", "maxWinStreak", "maxLossStreak"]);
     const key = allowed.has(requestedKey) ? requestedKey : "winrate";
@@ -74,7 +80,7 @@
   function buildJob(assets, strategies, opts) {
     opts = opts || {};
     assets = uniqueById(assets, resolveAsset, 256);
-    if (Array.isArray(opts.kinds)) assets = assets.filter((a) => opts.kinds.includes(a.kind));
+    if (Array.isArray(opts.kinds)) assets = assets.filter((a) => matchesKinds(a, opts.kinds));
     strategies = uniqueById(strategies, resolveStrategy, 128);
     // Pre-build series for each asset, return as plain array of objects.
     const seriesByAsset = Object.create(null);
@@ -155,7 +161,7 @@
       const poolSize = Math.max(1, Math.min(numCpus, 4));
       const assets = uniqueById(Array.isArray(opts.assets) ? opts.assets : ASSETS.list(),
         resolveAsset, 256)
-        .filter((a) => !Array.isArray(opts.kinds) || opts.kinds.includes(a.kind));
+        .filter((a) => matchesKinds(a, opts.kinds));
       const strategies = uniqueById(Array.isArray(opts.strategies) ? opts.strategies : STRATEGIES.list(),
         resolveStrategy, 128);
 
@@ -304,7 +310,7 @@
     return new Promise((resolve) => {
       const assets = uniqueById(Array.isArray(opts.assets) ? opts.assets : ASSETS.list(),
         resolveAsset, 256)
-        .filter((a) => !Array.isArray(opts.kinds) || opts.kinds.includes(a.kind));
+        .filter((a) => matchesKinds(a, opts.kinds));
       const strategies = uniqueById(Array.isArray(opts.strategies) ? opts.strategies : STRATEGIES.list(),
         resolveStrategy, 128);
       const jobs = [];
@@ -353,7 +359,7 @@
     }
     const assets = uniqueById(Array.isArray(opts.assets) ? opts.assets : ASSETS.list(),
       resolveAsset, 256)
-      .filter((a) => !Array.isArray(opts.kinds) || opts.kinds.includes(a.kind));
+      .filter((a) => matchesKinds(a, opts.kinds));
     const strategies = uniqueById(Array.isArray(opts.strategies) ? opts.strategies : STRATEGIES.list(),
       resolveStrategy, 128);
     const rawSeed = numberValue(opts.seed);

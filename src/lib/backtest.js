@@ -141,7 +141,9 @@
     const assetInput = Array.isArray(o.assets) ? o.assets : ASSETS.list();
     for (const value of assetInput) {
       const asset = ASSETS.get(typeof value === "string" ? value : value && value.id);
-      if (!asset || seenAssets.has(asset.id) || (allowedKinds && !allowedKinds.has(asset.kind))) continue;
+      const kindMatch = !allowedKinds || Array.from(allowedKinds).some((kind) =>
+        typeof ASSETS.matchesKind === "function" ? ASSETS.matchesKind(asset, kind) : asset && asset.kind === kind);
+      if (!asset || seenAssets.has(asset.id) || !kindMatch) continue;
       seenAssets.add(asset.id); assets.push(asset);
       if (assets.length >= 256) break;
     }
@@ -223,7 +225,7 @@
       const n = Number(value);
       return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 0;
     };
-    let wins = 0, losses = 0, draws = 0, pnl = 0;
+    let wins = 0, losses = 0, draws = 0, pnl = 0, maxDrawdown = 0;
     const byStrategy = Object.create(null);
     const byKind = Object.create(null);
     const assetIds = new Set(), strategyIds = new Set();
@@ -232,6 +234,8 @@
       wins += rowWins; losses += rowLosses; draws += rowDraws;
       const rowPnl = Number(r.pnl);
       if (Number.isFinite(rowPnl)) pnl += rowPnl;
+      const rowDrawdown = Number(r.maxDrawdown);
+      if (Number.isFinite(rowDrawdown) && rowDrawdown >= 0) maxDrawdown = Math.max(maxDrawdown, rowDrawdown);
       if (typeof r.asset === "string" && r.asset) assetIds.add(r.asset);
       if (typeof r.strategy === "string" && r.strategy) strategyIds.add(r.strategy);
       const strategy = typeof r.strategy === "string" && r.strategy ? r.strategy : "unknown";
@@ -252,7 +256,7 @@
     return {
       assets: assetIds.size, strategies: strategyIds.size,
       trades: total, decisions: total + draws, wins, losses, draws,
-      winrate: total ? (wins / total) * 100 : 0, pnl,
+      winrate: total ? (wins / total) * 100 : 0, pnl, maxDrawdown,
       byStrategy, byKind,
     };
   }

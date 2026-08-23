@@ -148,6 +148,15 @@ hookMsg("asset", { symbol: "EURUSD_otc", period: 60, raw: "ws_out", main: true }
 forceTick();
 const state1 = lastState();
 check("active asset is EURUSD_otc", state1 && state1.payload ? state1.payload.assetId : state1.assetId === "EURUSD_otc", state1 && state1.assetId);
+let rejectedAsset = null;
+onMsg({ type: "CYBER_SET_ASSET", asset: "GBPUSD" }, {}, (response) => { rejectedAsset = response; });
+check("dashboard cannot pin a feed different from the Quotex main chart",
+  rejectedAsset && rejectedAsset.ok === false && rejectedAsset.asset === "EURUSD_otc",
+  rejectedAsset && JSON.stringify(rejectedAsset));
+let acceptedAsset = null;
+onMsg({ type: "CYBER_SET_ASSET", asset: "EURUSD_otc" }, {}, (response) => { acceptedAsset = response; });
+check("dashboard accepts the already-selected Quotex asset",
+  acceptedAsset && acceptedAsset.ok === true && acceptedAsset.asset === "EURUSD_otc");
 
 // 2. tick ingest
 hookMsg("tick", { price: 1.0855, symbol: "EURUSD_otc", time: fakeNow, raw: "ws" });

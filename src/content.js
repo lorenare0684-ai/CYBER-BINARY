@@ -84,6 +84,8 @@
   let lastBalance = null;
   let lastOrders = [];
   const pendingWs = Object.create(null);       // page-hook send ack requestId -> resolver
+  const pendingHistory = Object.create(null);  // page-hook history-subscription requestId -> resolver
+  let historyRequestSequence = 0;
   const pendingOrders = Object.create(null);   // broker order-open requestId -> resolver
   const settledOrderIds = Object.create(null); // de-dupe broker close replays
   const settledOrderQueue = [];
@@ -606,7 +608,11 @@
     // away from the live feed. Resample the genuine 1m feed into the visible
     // broker timeframe and replace matching buckets with those live values.
     const period = Number(selected.period);
-    if (period > 60 && period % 60 === 0 && self.CYBER_TA && typeof self.CYBER_TA.resample === "function") {
+    // Never overlay resampled synthetic warm-up bars on genuine higher-
+    // timeframe broker history. Until a real 1m batch arrives, those two
+    // series can have different price levels and create a fake final spike.
+    if (historySeeded[activeAsset] && period > 60 && period % 60 === 0 &&
+        self.CYBER_TA && typeof self.CYBER_TA.resample === "function") {
       const live = self.CYBER_TA.resample(activeFeed.series(), period / 60);
       if (live.length) {
         const byTime = Object.create(null);
@@ -1019,6 +1025,10 @@
       // every accepted Quotex tick instead of waiting for a history refresh.
       chartCandles: chartSeries,
       chartPeriod: chart ? chart.period : 60,
+      // Allows the dashboard backtester to consume the already-delivered
+      // genuine 1m series directly while the storage write is still settling.
+      // Synthetic warm-up bars must never be presented as broker history.
+      realHistoryReady: !!realHistoryReady[activeAsset],
       signal: sig,
       wins: stats.wins,
       losses: stats.losses,
@@ -1113,15 +1123,38 @@
     el.querySelector(".cb-hud-meta").textContent = metaText;
   }
 
-  function ingest(price, assetOverride, tickTime) {
+  function ingest(price, assetOverride, tickTime, source) {
     const safePrice = Number(price);
     if (!Number.isFinite(safePrice) || safePrice <= 0 || safePrice > 1e12) return false;
+    const targetAsset = assetOverride || activeAsset;
+    const targetFeed = createFeedFor(targetAsset);
+    const priorPrice = Number(targetFeed.lastPrice());
+    const relativeMove = Number.isFinite(priorPrice) && priorPrice > 0
+      ? Math.abs(safePrice / priorPrice - 1) : 0;
+
+    // The DOM is only a fallback and can briefly point at a balance, payout,
+    // strike, or another chart while the broker SPA is remounting. Once real
+    // history anchors the feed, reject a single DOM value more than 2% away;
+    // WebSocket quotes and broker OHLC remain authoritative.
+    if (source === "dom" && historySeeded[targetAsset] && relativeMove > 0.02) return false;
+
     let ts = tickTime == null ? Date.now() : Number(tickTime);
     if (!Number.isFinite(ts)) return false;
     while (Math.abs(ts) >= 1e14) ts /= 1000;
     if (Math.abs(ts) < 1e11) ts *= 1000;
     ts = Math.floor(ts);
-    if (!Number.isSafeInteger(ts) || ts < Date.now() - 7 * 86400000 || ts > Date.now() + 60000) return false;
+    if (!Number.isSafeInteger(ts) || ts < Date.now() - 7 * 86400000 || ts > Date.now() + 60000 ||
+        (typeof targetFeed.canIngest === "function" && !targetFeed.canIngest(ts))) return false;
+
+    // Before genuine 1m history is available the feed contains a synthetic
+    // indicator warm-up. Align that warm-up to the first valid real quote (and
+    // to a later source correction if it differs by >2%) instead of joining
+    // two unrelated price levels with the giant candle in the bug report.
+    if (!historySeeded[targetAsset] && typeof targetFeed.rebase === "function" &&
+        (!lastAcceptedQuoteAt[targetAsset] || relativeMove > 0.02)) {
+      targetFeed.rebase(safePrice);
+    }
+
     if (assetOverride && assetOverride !== activeAsset) {
       // Keep background charts warm. Per-asset pending calls may settle only
       // from their own feed, never from the currently selected asset's price.
@@ -1151,25 +1184,46 @@
   }
 
   function ensureHistorySubscription(det, force, requestedLimit) {
-    if (!det || !QUOTEX || !QUOTEX.subscribeHistory) return false;
+    if (!det || !QUOTEX || !QUOTEX.subscribeHistory) return null;
     const id = det.id;
     const at = historyRequestedAt[id] || 0;
     // Once real history has arrived, live ticks extend the cache; do not pull a
     // 5,000-row batch on every periodic scan. The backtest button can still
     // force one refresh on demand.
-    if (!force && historySeeded[id]) return false;
-    if (!force && Date.now() - at < 30000) return false; // retry initial attachment at most every 30s
+    if (!force && historySeeded[id]) return null;
+    if (!force && Date.now() - at < 30000) return null; // retry initial attachment at most every 30s
     const rawLimit = Number(requestedLimit);
     const limit = Number.isFinite(rawLimit) ? Math.max(60, Math.min(5000, Math.floor(rawLimit))) : 5000;
+    const requestId = "history_" + Date.now() + "_" + (++historyRequestSequence % 1000000);
     historyRequestedAt[id] = Date.now();
     try {
       window.postMessage({
         source: "CYBER_BINARY_CONTENT",
         kind: "subscribe",
-        payload: { asset: id, period: 60, limit },
+        payload: { requestId, asset: id, period: 60, limit },
       }, "*");
-      return true;
-    } catch (_) { return false; }
+      return requestId;
+    } catch (_) {
+      historyRequestedAt[id] = 0;
+      return null;
+    }
+  }
+
+  function requestHistorySubscription(det, requestedLimit) {
+    const requestId = ensureHistorySubscription(det, true, requestedLimit);
+    if (!requestId) return Promise.resolve({ ok: false, requested: false, error: "history request could not be posted" });
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        if (!pendingHistory[requestId]) return;
+        delete pendingHistory[requestId];
+        if (det && det.id) historyRequestedAt[det.id] = 0;
+        resolve({ ok: false, requested: false, asset: det && det.id || activeAsset, error: "history subscription acknowledgement timeout" });
+      }, 4000);
+      pendingHistory[requestId] = (result) => {
+        clearTimeout(timer);
+        resolve(result);
+      };
+    });
   }
 
   function tick() {
@@ -1189,7 +1243,7 @@
       const p = findPrice();
       if (p && p !== lastDomPriceByAsset[activeAsset]) {
         lastDomPriceByAsset[activeAsset] = p;
-        ingest(p, det && det.id);
+        ingest(p, det && det.id, currentTime, "dom");
       }
     }
     maybeSignal();
@@ -1225,7 +1279,7 @@
           const relevant = det && (det.id === activeAsset || !!pendingByAsset[det.id]);
           // Unrelated subscriptions from mini/open charts must not allocate a
           // synthetic feed or trigger analysis work on every quote.
-          const accepted = relevant ? ingest(price, det.id, p.time) : false;
+          const accepted = relevant ? ingest(price, det.id, p.time, "websocket") : false;
           if (accepted && lastWsSymbol && QUOTEX &&
               QUOTEX.normalizeSymbol(symbol) === QUOTEX.normalizeSymbol(lastWsSymbol)) {
             lastWsPrice = price;
@@ -1357,6 +1411,28 @@
           };
           try { pendingWs[requestId](result); } catch (_) {}
           delete pendingWs[requestId];
+        }
+        break;
+      }
+      case "subscribe_result": {
+        const requestId = p && typeof p.requestId === "string" ? p.requestId.slice(0, 128) : "";
+        const asset = p && typeof p.asset === "string" ? p.asset.slice(0, 96) : activeAsset;
+        const detail = p && p.payload && typeof p.payload === "object" && !Array.isArray(p.payload) ? p.payload : {};
+        const result = {
+          ok: p && p.ok === true,
+          requested: p && p.ok === true,
+          requestId,
+          asset,
+          period: Number.isFinite(Number(detail.period)) ? Number(detail.period) : 60,
+          limit: Number.isFinite(Number(detail.limit)) ? Number(detail.limit) : null,
+          error: p && p.ok === true ? null : String(detail.error || "broker history subscription failed").slice(0, 256),
+        };
+        const hasPendingRequest = !!(requestId && pendingHistory[requestId]);
+        if (!result.ok && asset && hasPendingRequest) historyRequestedAt[asset] = 0;
+        if (hasPendingRequest) {
+          const done = pendingHistory[requestId];
+          delete pendingHistory[requestId];
+          try { done(result); } catch (_) {}
         }
         break;
       }
@@ -1671,9 +1747,11 @@
     }
     if (msg && msg.type === "CYBER_REQUEST_HISTORY") {
       const det = ASSETS.get(activeAsset) || ASSETS.ensureRegistered(lastWsSymbol || activeAsset);
-      const requested = ensureHistorySubscription(det, true, msg.limit);
-      sendResponse({ ok: requested, asset: det && det.id || activeAsset, requested });
-      return;
+      requestHistorySubscription(det, msg.limit).then(sendResponse).catch((e) => {
+        sendResponse({ ok: false, requested: false, asset: det && det.id || activeAsset,
+          error: String(e && e.message || e || "history request failed").slice(0, 256) });
+      });
+      return true;
     }
     if (msg && msg.type === "CYBER_SET_STRATEGY") {
       const requested = typeof msg.strategy === "string" ? msg.strategy.trim() : "";
@@ -1696,9 +1774,20 @@
         sendResponse({ ok: false, error: "unknown or invalid asset", asset: activeAsset });
         return;
       }
-      manualAsset = det.id;
+      // The dashboard cannot safely switch the broker's chart. Pinning a
+      // different local feed made the UI display synthetic candles for one
+      // asset while Quotex was trading another. Only acknowledge the symbol
+      // already selected on the authoritative main chart.
+      const matchesMain = !!lastWsSymbol && !!QUOTEX &&
+        QUOTEX.normalizeSymbol(det.id) === QUOTEX.normalizeSymbol(lastWsSymbol);
+      if (!matchesMain) {
+        sendResponse({ ok: false, asset: activeAsset,
+          error: "Select " + det.name + " on the Quotex chart first" });
+        return;
+      }
+      manualAsset = null;
       activateAsset(det.id);
-      sendResponse({ ok: true, asset: det.id, manual: true });
+      sendResponse({ ok: true, asset: det.id, manual: false });
       return;
     }
     if (msg && msg.type === "CYBER_DETECT_ASSET") {
