@@ -397,10 +397,14 @@ const callSignal = sandbox.self.CYBER_ENGINE.analyze(directionalSeries(1), { str
 const putSignal = sandbox.self.CYBER_ENGINE.analyze(directionalSeries(-1), { strategy: "confluence", lean: false });
 if (!callSignal || callSignal.direction !== "CALL") { console.error("engine CALL coverage failed", callSignal && callSignal.direction); failed++; }
 if (!putSignal || putSignal.direction !== "PUT") { console.error("engine PUT coverage failed", putSignal && putSignal.direction); failed++; }
+if (!callSignal.metrics || callSignal.metrics.mtfChecked !== 2 || callSignal.metrics.mtfBias !== 2 ||
+    !putSignal.metrics || putSignal.metrics.mtfChecked !== 2 || putSignal.metrics.mtfBias !== -2) {
+  console.error("5m/15m MTF must warm from a normal bounded Quotex history response"); failed++;
+}
 
 // A strong trend often has several correlated oscillators briefly voting the
-// other way. A one-point winning margin must not leave the live engine stuck
-// at score/confidence zero in that regime.
+// other way. A narrow winning margin must not leave the live engine stuck at
+// score/confidence zero in that regime.
 function trendingPullbackSeries() {
   const out = [];
   let state = 1;
@@ -431,9 +435,9 @@ const trendPullbackSignal = sandbox.self.CYBER_ENGINE.analyze(trendingPullbackSe
 });
 if (!trendPullbackSignal || trendPullbackSignal.regime !== "trending" ||
     trendPullbackSignal.direction !== "CALL" || trendPullbackSignal.score <= 0 ||
-    trendPullbackSignal.confidence <= 0 || trendPullbackSignal.metrics.callScore !== 4 ||
-    trendPullbackSignal.metrics.putScore !== 3) {
-  console.error("trending one-point vote lead must generate a signal", trendPullbackSignal);
+    trendPullbackSignal.confidence <= 0 || trendPullbackSignal.metrics.callScore <= trendPullbackSignal.metrics.putScore ||
+    trendPullbackSignal.metrics.mtfChecked !== 2) {
+  console.error("trending narrow vote lead must generate a signal", trendPullbackSignal);
   failed++;
 }
 

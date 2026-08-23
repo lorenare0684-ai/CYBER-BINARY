@@ -6,7 +6,7 @@
  *   - tools/page-hook.shell.js (MAIN-world WebSocket hook shell)
  *
  * Rebuild after any change to either source file.
- * Generated: 2026-08-23T06:39:28.742Z
+ * Generated: 2026-08-23T06:43:07.130Z
  */
 /* ====================================================================
  * Inlined CYBER_QUOTEX adapter (src/lib/quotex.js).
@@ -1350,7 +1350,9 @@
       "input[placeholder*='amount' i]", "input[placeholder*='stake' i]", "input[placeholder*='invest' i]",
       "input[name='amount']", "input[name='sum']", "input[name='stake']", "input[name='investment']",
       "input[data-testid*='amount' i]", "input[data-testid*='stake' i]", "input[data-testid*='invest' i]",
-      "[class*='stake'] input[type='number']", "[class*='amount'] input[type='number']", "[class*='invest'] input[type='number']",
+      "[class*='stake'] input", "[class*='amount'] input", "[class*='invest'] input", "[class*='investment'] input",
+      "[data-testid*='stake' i] input", "[data-testid*='amount' i] input", "[data-testid*='invest' i] input",
+      "[data-test*='stake' i] input", "[data-test*='amount' i] input", "[data-test*='invest' i] input",
     ];
     var out = [];
     var seen = [];
@@ -1401,14 +1403,19 @@
     if (el.min !== "" && Number.isFinite(min) && wanted < min) return false;
     if (el.max !== "" && Number.isFinite(max) && wanted > max) return false;
     try {
+      try { if (typeof el.focus === "function") el.focus(); } catch (_) {}
       var proto = el.tagName === "TEXTAREA" ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
       var setter = Object.getOwnPropertyDescriptor(proto, "value");
       if (setter && setter.set) setter.set.call(el, String(wanted));
       else el.value = String(wanted);
       el.dispatchEvent(new Event("input", { bubbles: true }));
       el.dispatchEvent(new Event("change", { bubbles: true }));
-      try { el.dispatchEvent(new Event("blur", { bubbles: true })); } catch (_) {}
-      var actual = Number(String(el.value).replace(",", "."));
+      // Quotex may render a currency prefix/suffix or localized decimal after
+      // React processes the input. Validate the numeric content, not the raw
+      // decorated string.
+      var cleaned = String(el.value == null ? "" : el.value)
+        .replace(/[^0-9,.-]/g, "").replace(",", ".");
+      var actual = Number(cleaned);
       return Number.isFinite(actual) && Math.abs(actual - wanted) <= Math.max(1e-9, Math.abs(wanted) * 1e-9);
     } catch (_) { return false; }
   }

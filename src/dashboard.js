@@ -42,6 +42,8 @@
   let activeTab = "live";
   let assetsRenderToken = 0;
   let historyRenderToken = 0;
+  const recentAutoLogKeys = new Set();
+  const recentAutoLogOrder = [];
 
   function tfLabel(sec) {
     if (!sec) return "1m";
@@ -965,6 +967,12 @@
   function appendAutoLog(entry) {
     const ul = $("auto-log");
     if (!ul) return;
+    const at = finite(entry && entry.at, Date.now());
+    const key = String(entry && entry.level || "") + "|" + String(entry && entry.msg || "") + "|" + Math.floor(at / 1000);
+    if (recentAutoLogKeys.has(key)) return;
+    recentAutoLogKeys.add(key);
+    recentAutoLogOrder.push(key);
+    while (recentAutoLogOrder.length > 100) recentAutoLogKeys.delete(recentAutoLogOrder.shift());
     const li = document.createElement("li");
     const cls = entry.level === "trade" || entry.level === "alert" ? "win"
       : entry.level === "error" ? "loss" : "";

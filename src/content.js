@@ -589,14 +589,34 @@
   function chartForActiveAsset() {
     const periods = chartHistory[activeAsset];
     if (!periods) return null;
-    if (periods[lastWsPeriod] && periods[lastWsPeriod].candles.length) return periods[lastWsPeriod];
-    if (periods[60] && periods[60].candles.length) return periods[60];
-    let freshest = null;
-    for (const p in periods) {
-      const item = periods[p];
-      if (item && item.candles && item.candles.length && (!freshest || item.ts > freshest.ts)) freshest = item;
+    let selected = null;
+    if (periods[lastWsPeriod] && periods[lastWsPeriod].candles.length) selected = periods[lastWsPeriod];
+    else if (periods[60] && periods[60].candles.length) selected = periods[60];
+    else {
+      for (const p in periods) {
+        const item = periods[p];
+        if (item && item.candles && item.candles.length && (!selected || item.ts > selected.ts)) selected = item;
+      }
     }
-    return freshest;
+    if (!selected) return null;
+
+    // Quotex sends higher-timeframe history only occasionally, while the 1m
+    // feed receives every live tick. Without this merge a 5m/15m dashboard
+    // ended at the last history response and the next refreshed candle jumped
+    // away from the live feed. Resample the genuine 1m feed into the visible
+    // broker timeframe and replace matching buckets with those live values.
+    const period = Number(selected.period);
+    if (period > 60 && period % 60 === 0 && self.CYBER_TA && typeof self.CYBER_TA.resample === "function") {
+      const live = self.CYBER_TA.resample(activeFeed.series(), period / 60);
+      if (live.length) {
+        const byTime = Object.create(null);
+        for (const bar of selected.candles) if (bar && Number.isFinite(Number(bar.time))) byTime[Number(bar.time)] = bar;
+        for (const bar of live) if (bar && Number.isFinite(Number(bar.time))) byTime[Number(bar.time)] = bar;
+        const times = Object.keys(byTime).map(Number).sort((a, b) => a - b).slice(-400);
+        return { period, candles: times.map((time) => byTime[time]), ts: Date.now() };
+      }
+    }
+    return selected;
   }
 
   function scheduleTickSignalRefresh() {
@@ -1557,7 +1577,22 @@
         pendingDomOrder = null;
         cancelDomWait({ ok: false, confirmed: false, mode: "dom", error: "DOM placement failed" });
       }
-      return Object.assign({ ok: false, confirmed: false, mode: "dom" }, domResult || { error: "DOM placement failed" });
+      const failure = String(domResult && domResult.error || "DOM placement failed");
+      // Missing/rejected controls are deterministic page-integration failures,
+      // not market rejections. Continuing to attempt every new candle only
+      // repeats the same error (and could become unsafe if the DOM changes
+      // mid-session), so fail closed and require an explicit re-arm.
+      if (/stake input|expiry|trade button/i.test(failure)) {
+        try {
+          const saved = await STORE.setSettings({ armed: false });
+          runtimeSettings = saved;
+          if (autoController) autoController.setArmed(false);
+        } catch (_) {
+          if (autoController) autoController.setArmed(false);
+        }
+        return { ok: false, confirmed: false, mode: "dom", error: failure + " — automation disarmed" };
+      }
+      return Object.assign({ ok: false, confirmed: false, mode: "dom" }, domResult || { error: failure });
     }
     const confirmed = await domConfirmation;
     if (confirmed && confirmed.ok) {
