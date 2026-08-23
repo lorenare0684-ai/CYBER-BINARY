@@ -1023,6 +1023,10 @@
       // every accepted Quotex tick instead of waiting for a history refresh.
       chartCandles: chartSeries,
       chartPeriod: chart ? chart.period : 60,
+      // Allows the dashboard backtester to consume the already-delivered
+      // genuine 1m series directly while the storage write is still settling.
+      // Synthetic warm-up bars must never be presented as broker history.
+      realHistoryReady: !!realHistoryReady[activeAsset],
       signal: sig,
       wins: stats.wins,
       losses: stats.losses,
