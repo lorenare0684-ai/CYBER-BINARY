@@ -100,11 +100,16 @@ else {
   // OTC is a venue, not a mutually exclusive underlying class. Every real
   // broker `_otc` symbol must be reachable from the OTC filter even though it
   // remains classed as fx/crypto/commodity/index/stock.
-  const expectedOtc = all.filter((a) => /_otc$/i.test(a.id) || a.kind === "otc");
+  const expectedOtc = all.filter((a) => a.isOtc === true);
   const filteredOtc = A.byKind("otc");
-  if (expectedOtc.length < 100 || filteredOtc.length !== expectedOtc.length ||
+  const suffixOtc = all.filter((a) => /_otc$/i.test(a.id));
+  if (suffixOtc.length < 100 || suffixOtc.some((a) => a.isOtc !== true) ||
+      expectedOtc.length < suffixOtc.length || filteredOtc.length !== expectedOtc.length ||
       expectedOtc.some((a) => !filteredOtc.some((b) => b.id === a.id))) {
-    console.error("OTC filter omitted broker instruments: " + filteredOtc.length + "/" + expectedOtc.length); failed++;
+    console.error("OTC venue metadata/filter omitted broker instruments: " + filteredOtc.length + "/" + expectedOtc.length); failed++;
+  }
+  if (all.filter((a) => a.kind === "stock").some((a) => !a.isOtc || a.session !== "OTC 24/7")) {
+    console.error("OTC stocks expose a false NYSE session"); failed++;
   }
   // detection smoke (display names + OTC routing + tickers)
   const detCases = [
@@ -321,10 +326,15 @@ if (sandbox.self.CYBER_ASSETS.registerQuotexAsset) {
   });
   // Broker convention: base uppercase, OTC suffix lowercase (EURUSD_otc).
   if (!a || a.id !== "TEST_otc") { console.error("registerQuotexAsset expected TEST_otc, got " + (a && a.id)); failed++; }
+  if (!a || a.isOtc !== true || a.session !== "OTC 24/7") { console.error("runtime OTC venue metadata missing"); failed++; }
   if (!a || a.timeframes.includes(0)) { console.error("fractional timeframe normalized to invalid zero"); failed++; }
   if (!A.get("EURUSD") || A.get("EURUSD").id !== "EURUSD") { console.error("runtime alias hijacked a static asset"); failed++; }
   const closed = A.registerQuotexAsset({ symbol: "TEST_otc", isOpen: "0" });
   if (!closed || closed.isOpen !== false) { console.error("string broker open-state parsing failed"); failed++; }
+  const staticOtc = A.registerQuotexAsset({ symbol: "EURUSD_otc", isOtc: false });
+  if (!staticOtc || !staticOtc.isOtc || staticOtc.session !== "OTC 24/7") {
+    console.error("live metadata update erased a static OTC venue"); failed++;
+  }
   const doge = A.detect("Dogecoin (OTC)");
   if (!doge || doge.id !== "DOGUSD_otc") { console.error("confirmed Dogecoin broker symbol was shadowed"); failed++; }
 }

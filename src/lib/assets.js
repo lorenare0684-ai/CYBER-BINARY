@@ -424,6 +424,18 @@
   }
 
   var ASSETS = buildEntries();
+  // Canonical venue metadata belongs on every catalog record. Previously all
+  // 125 static `_otc` instruments omitted `isOtc`, forcing each consumer to
+  // guess from an id/name/session and making serialized asset snapshots lie
+  // about their venue. A few broker commodities use OTC names/sessions without
+  // an `_otc` suffix, so include those explicit catalog signals too.
+  for (var ai = 0; ai < ASSETS.length; ai++) {
+    var catalogAsset = ASSETS[ai];
+    catalogAsset.isOtc = /_otc$/i.test(String(catalogAsset.id || "")) ||
+      catalogAsset.kind === "otc" || /\bOTC\b/i.test(String(catalogAsset.session || ""));
+    // Quotex stock entries are OTC instruments, not NYSE-session instruments.
+    if (catalogAsset.isOtc && catalogAsset.kind === "stock") catalogAsset.session = "OTC 24/7";
+  }
   var BY_ID = Object.create(null);
   for (var bi = 0; bi < ASSETS.length; bi++) BY_ID[ASSETS[bi].id] = ASSETS[bi];
 
@@ -596,7 +608,8 @@
         vol: prof.vol,
         drift: 0,
         jumpRate: prof.jumpRate,
-        session: prof.session,
+        session: isOtc ? "OTC 24/7" : prof.session,
+        isOtc: isOtc,
         aliases: cleanAliases,
         brokerId: Number.isSafeInteger(rawBrokerId) && rawBrokerId > 0 && rawBrokerId <= 1000000000 ? rawBrokerId : 0,
         payout: Number.isFinite(rawPayout) ? Math.max(0, Math.min(100, rawPayout)) : 0,
@@ -615,6 +628,10 @@
       // Update metadata (payout / open state / timeframes / id) on re-list.
       var a = getInternal(sym);
       if (a) {
+        // Static entries are updated in place when the live broker catalog
+        // arrives; preserve the canonical venue bit in that path too.
+        a.isOtc = /_otc$/i.test(sym) || brokerBoolean(q.isOtc, a.isOtc === true);
+        if (a.isOtc) a.session = "OTC 24/7";
         var updatedPayout = numberValue(q.payout);
         if (q.payout != null && Number.isFinite(updatedPayout)) a.payout = Math.max(0, Math.min(100, updatedPayout));
         if (q.isOpen != null) a.isOpen = brokerBoolean(q.isOpen, a.isOpen !== false);
@@ -728,7 +745,7 @@
     if (!asset || typeof asset !== "object" || typeof kind !== "string") return false;
     var wanted = kind.trim().toLowerCase();
     if (!wanted || wanted === "all") return true;
-    if (wanted === "otc") return /_otc$/i.test(String(asset.id || "")) || asset.kind === "otc" || asset.isOtc === true;
+    if (wanted === "otc") return asset.isOtc === true || /_otc$/i.test(String(asset.id || "")) || asset.kind === "otc";
     return asset.kind === wanted;
   }
 
