@@ -1,5 +1,5 @@
 /**
- * CYBER BINARY — Auto-Adapting High-Accuracy Asset System v2.5
+ * CYBER BINARY — Auto-Adapting High-Accuracy Asset System v2.6
  *
  * Evaluates, ranks, and filters all catalog assets in real-time based on:
  *   - Historical & live recorded strategy win-rates
@@ -38,6 +38,9 @@
     let asset = assetOrId;
     if (typeof assetOrId === "string") {
       asset = ASSETS.get(assetOrId) || ASSETS.ensureRegistered(assetOrId);
+    } else if (assetOrId && typeof assetOrId === "object" && assetOrId.id) {
+      const full = ASSETS.get(assetOrId.id) || ASSETS.ensureRegistered(assetOrId.id);
+      asset = Object.assign({}, full || {}, assetOrId);
     }
     if (!asset || typeof asset !== "object" || !asset.id) return null;
     opts = opts || {};

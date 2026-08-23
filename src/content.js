@@ -1,7 +1,7 @@
 "use strict";
 
 /**
- * CYBER BINARY v2.3 — content script.
+ * CYBER BINARY v2.6 — content script.
  *
  * Runs in the page's ISOLATED world. Reads the live state the page-hook
  * pushes via window.postMessage, keeps one feed per detected asset, runs

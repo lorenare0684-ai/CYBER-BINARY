@@ -1,5 +1,5 @@
 /**
- * Confluence signal engine v2.5 — multi-indicator, multi-timeframe, regime-aware,
+ * Confluence signal engine v2.6 — multi-indicator, multi-timeframe, regime-aware,
  * auto-adaptive multi-strategy router.
  *
  * Inputs: candle series (1m), optional strategy preset, optional asset profile.
@@ -195,20 +195,21 @@
         if (Number.isFinite(wr) && wr > 50) winrateBonus = (wr - 50) * 0.5;
       }
 
-      const fitness = Math.min(100, Math.round(
+      const rawFitness = Math.round(
         rawScore * 8 + confScore * 0.3 + regimeBonus + signalBonus + winrateBonus
-      ));
+      );
+      const displayFitness = Math.min(100, Math.max(0, rawFitness));
 
       scores[stratId] = {
         label: (STRAT && STRAT[stratId] && STRAT[stratId].label) || stratId,
-        fitness,
+        fitness: displayFitness,
         direction: res.direction,
         confidence: res.confidence,
         score: res.score,
         regimeBonus,
       };
 
-      const effectiveFitness = hasSignal ? fitness + 100 : fitness;
+      const effectiveFitness = hasSignal ? rawFitness + 1000 : rawFitness;
       if (effectiveFitness > bestScore) {
         bestScore = effectiveFitness;
         bestStrategy = stratId;
@@ -235,22 +236,22 @@
     });
   }
 
-  function evaluateAdaptiveLeanAt(preparedMap, i, opts) {
+  function evaluateAdaptiveLeanAt(preparedMap, i, opts, resolvedMap) {
     const scores = {};
     let bestStrategy = "confluence";
     let bestScore = -1;
     let bestResult = null;
 
-    const { params: baseParams, weights: baseWeights } = resolveStrategy({ strategy: "confluence" });
+    const baseResolved = (resolvedMap && resolvedMap["confluence"]) || resolveStrategy({ strategy: "confluence" });
     const basePrepared = preparedMap["confluence"];
-    const baseResult = basePrepared ? evaluateLeanAt(basePrepared, i, baseParams, baseWeights) : null;
+    const baseResult = basePrepared ? evaluateLeanAt(basePrepared, i, baseResolved.params, baseResolved.weights) : null;
     const regime = baseResult ? baseResult.regime || "ranging" : "ranging";
 
     for (const stratId of CONCRETE_STRATEGIES) {
       const pSeries = preparedMap[stratId];
       if (!pSeries) continue;
-      const { params: sParams, weights: sWeights } = resolveStrategy({ strategy: stratId });
-      const res = evaluateLeanAt(pSeries, i, sParams, sWeights);
+      const sResolved = (resolvedMap && resolvedMap[stratId]) || resolveStrategy({ strategy: stratId });
+      const res = evaluateLeanAt(pSeries, i, sResolved.params, sResolved.weights, regime);
       if (!res || !res.ready) continue;
 
       let regimeBonus = 0;
@@ -278,20 +279,21 @@
         if (Number.isFinite(wr) && wr > 50) winrateBonus = (wr - 50) * 0.5;
       }
 
-      const fitness = Math.min(100, Math.round(
+      const rawFitness = Math.round(
         rawScore * 8 + confScore * 0.3 + regimeBonus + signalBonus + winrateBonus
-      ));
+      );
+      const displayFitness = Math.min(100, Math.max(0, rawFitness));
 
       scores[stratId] = {
         label: (STRAT && STRAT[stratId] && STRAT[stratId].label) || stratId,
-        fitness,
+        fitness: displayFitness,
         direction: res.direction,
         confidence: res.confidence,
         score: res.score,
         regimeBonus,
       };
 
-      const effectiveFitness = hasSignal ? fitness + 100 : fitness;
+      const effectiveFitness = hasSignal ? rawFitness + 1000 : rawFitness;
       if (effectiveFitness > bestScore) {
         bestScore = effectiveFitness;
         bestStrategy = stratId;
@@ -468,9 +470,9 @@
 
     // Stochastic
     if (st.k[prev] != null && st.d[prev] != null) {
-      if (st.k[prev] < cfg.stochOs && st.k[i] > st.d[i] && st.k[i] < 50)
+      if ((st.k[prev] <= cfg.stochOs || st.k[i] <= cfg.stochOs) && st.k[i] > st.d[i] && st.k[i] < 50)
         votes.push({ name: "Stoch", dir: "CALL", w: weights.stoch });
-      if (st.k[prev] > cfg.stochOb && st.k[i] < st.d[i] && st.k[i] > 50)
+      if ((st.k[prev] >= cfg.stochOb || st.k[i] >= cfg.stochOb) && st.k[i] < st.d[i] && st.k[i] > 50)
         votes.push({ name: "Stoch", dir: "PUT", w: weights.stoch });
     }
 
@@ -553,7 +555,7 @@
     const rawMinScore = numberValue(cfg.minScore);
     const baseMinScore = rawMinScore != null ? Math.max(0, rawMinScore) : DEFAULTS.minScore;
     const requiredScore = baseMinScore + (regime === "choppy" ? 2 : 0);
-    const requiredLead = regime === "trending" ? 0 : 1;
+    const requiredLead = (regime === "trending" || regime === "strong-trend") ? 0 : 1;
 
     let direction = "WAIT";
     let score = 0;
@@ -663,7 +665,7 @@
       priorClose = closes[i];
       const ef = previewEma(fast, closes[i]);
       const es = previewEma(slow, closes[i]);
-      if (completed + 1 >= 30 && ef != null && es != null) {
+      if (completed + 1 >= 21 && ef != null && es != null) {
         out[i] = closes[i] > ef && ef > es ? 1 : (closes[i] < ef && ef < es ? -1 : 0);
       }
     }
@@ -695,85 +697,128 @@
     };
   }
 
-  function evaluateLeanAt(p, i, cfg, weights) {
-    const prev = i - 1;
-    const need = [p.rsi[i], p.emaF[i], p.emaS[i], p.macd.hist[i], p.st.k[i], p.st.d[i],
-      p.bb.mid[i], p.atr[i], p.adxR.adx[i], p.psar[i], p.superR.st[i]];
-    if (need.some((v) => v == null || numberValue(v) == null) || !Number.isFinite(p.c[i]) || p.c[i] <= 0) {
+  function evaluateLeanAt(p, i, cfg, weights, precomputedRegime) {
+    const ci = p.c[i];
+    if (!Number.isFinite(ci) || ci <= 0) {
       return { ready: false, direction: "WAIT", confidence: 0, score: 0, regime: "unknown" };
     }
-    const regime = detectRegime(i, p.rsi, p.emaF, p.emaS, p.adxR.adx, p.atr, p.c, p.hurst, p.bb, p.keltner);
-    if (p.atr[i] / p.c[i] < cfg.minAtrPct) {
+    const rsiVal = p.rsi[i], emaFVal = p.emaF[i], emaSVal = p.emaS[i];
+    const macdHistVal = p.macd && p.macd.hist ? p.macd.hist[i] : null;
+    const stKVal = p.st && p.st.k ? p.st.k[i] : null, stDVal = p.st && p.st.d ? p.st.d[i] : null;
+    const bbMidVal = p.bb && p.bb.mid ? p.bb.mid[i] : null, atrVal = p.atr[i];
+    const adxVal = p.adxR && p.adxR.adx ? p.adxR.adx[i] : null;
+    const psarVal = p.psar[i], superStVal = p.superR && p.superR.st ? p.superR.st[i] : null;
+
+    if (rsiVal == null || emaFVal == null || emaSVal == null || macdHistVal == null ||
+        stKVal == null || stDVal == null || bbMidVal == null || atrVal == null ||
+        adxVal == null || psarVal == null || superStVal == null) {
+      return { ready: false, direction: "WAIT", confidence: 0, score: 0, regime: "unknown" };
+    }
+
+    const regime = precomputedRegime || detectRegime(i, p.rsi, p.emaF, p.emaS, p.adxR.adx, p.atr, p.c, p.hurst, p.bb, p.keltner);
+    if (atrVal / ci < cfg.minAtrPct) {
       return { ready: true, direction: "WAIT", confidence: 0, score: 0, regime };
     }
-    const votes = [];
-    if (p.c[i] > p.emaS[i] && p.emaF[i] > p.emaS[i]) votes.push({ dir: "CALL", w: weights.emaTrend });
-    else if (p.c[i] < p.emaS[i] && p.emaF[i] < p.emaS[i]) votes.push({ dir: "PUT", w: weights.emaTrend });
-    const rawLookback = numberValue(cfg.lookback);
-    const lookback = Math.max(0, Math.min(100, Math.floor(rawLookback == null ? 0 : rawLookback)));
+
+    let call = 0, put = 0;
+    const prev = i - 1;
+
+    // EMA trend
+    if (ci > emaSVal && emaFVal > emaSVal) call += weights.emaTrend || 0;
+    else if (ci < emaSVal && emaFVal < emaSVal) put += weights.emaTrend || 0;
+
+    // EMA cross
+    const lookback = cfg.lookback || 0;
     for (let k = 0; k < lookback; k++) {
       const a = i - k, b = a - 1;
-      if (b < 0 || p.emaF[a] == null || p.emaS[a] == null) continue;
-      if (p.emaF[b] <= p.emaS[b] && p.emaF[a] > p.emaS[a]) { votes.push({ dir: "CALL", w: weights.emaCross }); break; }
-      if (p.emaF[b] >= p.emaS[b] && p.emaF[a] < p.emaS[a]) { votes.push({ dir: "PUT", w: weights.emaCross }); break; }
+      if (b < 0) continue;
+      const fb = p.emaF[b], sb = p.emaS[b], fa = p.emaF[a], sa = p.emaS[a];
+      if (fb == null || sb == null || fa == null || sa == null) continue;
+      if (fb <= sb && fa > sa) { call += weights.emaCross || 0; break; }
+      if (fb >= sb && fa < sa) { put += weights.emaCross || 0; break; }
     }
-    if (p.rsi[i] < cfg.rsiBuy && p.rsi[i] > 22 && p.c[i] > p.emaS[i]) votes.push({ dir: "CALL", w: weights.rsiPull });
-    if (p.rsi[i] > cfg.rsiSell && p.rsi[i] < 78 && p.c[i] < p.emaS[i]) votes.push({ dir: "PUT", w: weights.rsiPull });
+
+    // RSI pull
+    if (rsiVal < cfg.rsiBuy && rsiVal > 22 && ci > emaSVal) call += weights.rsiPull || 0;
+    if (rsiVal > cfg.rsiSell && rsiVal < 78 && ci < emaSVal) put += weights.rsiPull || 0;
+
+    // MACD
     if (prev >= 0 && p.macd.hist[prev] != null) {
-      if (p.macd.hist[i] > 0 && p.macd.hist[i] > p.macd.hist[prev]) votes.push({ dir: "CALL", w: weights.macd });
-      if (p.macd.hist[i] < 0 && p.macd.hist[i] < p.macd.hist[prev]) votes.push({ dir: "PUT", w: weights.macd });
+      const prevHist = p.macd.hist[prev];
+      if (macdHistVal > 0 && macdHistVal > prevHist) call += weights.macd || 0;
+      if (macdHistVal < 0 && macdHistVal < prevHist) put += weights.macd || 0;
     }
+
+    // Stochastic
     if (prev >= 0 && p.st.k[prev] != null && p.st.d[prev] != null) {
-      if (p.st.k[prev] < cfg.stochOs && p.st.k[i] > p.st.d[i] && p.st.k[i] < 50) votes.push({ dir: "CALL", w: weights.stoch });
-      if (p.st.k[prev] > cfg.stochOb && p.st.k[i] < p.st.d[i] && p.st.k[i] > 50) votes.push({ dir: "PUT", w: weights.stoch });
+      const prevK = p.st.k[prev];
+      if ((prevK <= cfg.stochOs || stKVal <= cfg.stochOs) && stKVal > stDVal && stKVal < 50) call += weights.stoch || 0;
+      if ((prevK >= cfg.stochOb || stKVal >= cfg.stochOb) && stKVal < stDVal && stKVal > 50) put += weights.stoch || 0;
     }
-    if ((p.c[i] <= p.bb.lower[i]) || (prev >= 0 && p.l[prev] <= p.bb.lower[prev] && p.c[i] > p.bb.lower[i]) || (p.c[i] <= p.bb.mid[i] && p.c[i] > p.emaS[i] && p.emaF[i] > p.emaS[i]))
-      votes.push({ dir: "CALL", w: weights.bb });
-    if ((p.c[i] >= p.bb.upper[i]) || (prev >= 0 && p.h[prev] >= p.bb.upper[prev] && p.c[i] < p.bb.upper[i]) || (p.c[i] >= p.bb.mid[i] && p.c[i] < p.emaS[i] && p.emaF[i] < p.emaS[i]))
-      votes.push({ dir: "PUT", w: weights.bb });
-    if (p.adxR.adx[i] >= cfg.adxMin) {
-      if (p.adxR.plus[i] > p.adxR.minus[i] && p.c[i] > p.emaS[i]) votes.push({ dir: "CALL", w: weights.adxTrend });
-      if (p.adxR.minus[i] > p.adxR.plus[i] && p.c[i] < p.emaS[i]) votes.push({ dir: "PUT", w: weights.adxTrend });
+
+    // Bollinger
+    const bbLower = p.bb.lower[i], bbUpper = p.bb.upper[i];
+    if ((ci <= bbLower) || (prev >= 0 && p.l[prev] <= p.bb.lower[prev] && ci > bbLower) || (ci <= bbMidVal && ci > emaSVal && emaFVal > emaSVal))
+      call += weights.bb || 0;
+    if ((ci >= bbUpper) || (prev >= 0 && p.h[prev] >= p.bb.upper[prev] && ci < bbUpper) || (ci >= bbMidVal && ci < emaSVal && emaFVal < emaSVal))
+      put += weights.bb || 0;
+
+    // ADX
+    if (adxVal >= cfg.adxMin) {
+      if (p.adxR.plus[i] > p.adxR.minus[i] && ci > emaSVal) call += weights.adxTrend || 0;
+      if (p.adxR.minus[i] > p.adxR.plus[i] && ci < emaSVal) put += weights.adxTrend || 0;
     }
-    if (p.superR.trend[i] === 1) votes.push({ dir: "CALL", w: weights.supertrend });
-    else if (p.superR.trend[i] === -1) votes.push({ dir: "PUT", w: weights.supertrend });
-    if (p.c[i] > p.psar[i]) votes.push({ dir: "CALL", w: weights.psar });
-    else votes.push({ dir: "PUT", w: weights.psar });
+
+    // Supertrend
+    const stTrend = p.superR.trend[i];
+    if (stTrend === 1) call += weights.supertrend || 0;
+    else if (stTrend === -1) put += weights.supertrend || 0;
+
+    // PSAR
+    if (ci > psarVal) call += weights.psar || 0;
+    else put += weights.psar || 0;
+
+    // VWAP
     if (p.vwap && p.vwap[i] != null) {
-      if (p.c[i] > p.vwap[i] && p.emaF[i] > p.emaS[i]) votes.push({ dir: "CALL", w: weights.vwap });
-      else if (p.c[i] < p.vwap[i] && p.emaF[i] < p.emaS[i]) votes.push({ dir: "PUT", w: weights.vwap });
+      if (ci > p.vwap[i] && emaFVal > emaSVal) call += weights.vwap || 0;
+      else if (ci < p.vwap[i] && emaFVal < emaSVal) put += weights.vwap || 0;
     }
+
+    // MTF
     let mtfBias = 0, mtfChecked = 0;
-    if (p.mtfFast[i] != null) { mtfBias += p.mtfFast[i]; mtfChecked++; }
-    if (p.mtfMid[i] != null) { mtfBias += p.mtfMid[i]; mtfChecked++; }
-    if (mtfChecked && mtfBias > 0) votes.push({ dir: "CALL", w: weights.mtfAlign });
-    else if (mtfChecked && mtfBias < 0) votes.push({ dir: "PUT", w: weights.mtfAlign });
+    if (p.mtfFast && p.mtfFast[i] != null) { mtfBias += p.mtfFast[i]; mtfChecked++; }
+    if (p.mtfMid && p.mtfMid[i] != null) { mtfBias += p.mtfMid[i]; mtfChecked++; }
+    if (mtfChecked && mtfBias > 0) call += weights.mtfAlign || 0;
+    else if (mtfChecked && mtfBias < 0) put += weights.mtfAlign || 0;
+
+    // Hurst
     if (p.hurst && p.hurst[i] != null && p.hurst[i] > 0.55) {
-      if ((p.emaF[i] - p.emaS[i]) > 0) votes.push({ dir: "CALL", w: weights.hurst });
-      else if ((p.emaF[i] - p.emaS[i]) < 0) votes.push({ dir: "PUT", w: weights.hurst });
+      if ((emaFVal - emaSVal) > 0) call += weights.hurst || 0;
+      else if ((emaFVal - emaSVal) < 0) put += weights.hurst || 0;
     }
+
+    // Williams
     if (p.williams && p.williams[i] != null) {
-      if (p.williams[i] < -80) votes.push({ dir: "CALL", w: weights.williams });
-      if (p.williams[i] > -20) votes.push({ dir: "PUT", w: weights.williams });
+      if (p.williams[i] < -80) call += weights.williams || 0;
+      if (p.williams[i] > -20) put += weights.williams || 0;
     }
+
+    // CCI
     if (p.cci && p.cci[i] != null) {
-      if (p.cci[i] < -100) votes.push({ dir: "CALL", w: weights.cci });
-      if (p.cci[i] > 100) votes.push({ dir: "PUT", w: weights.cci });
+      if (p.cci[i] < -100) call += weights.cci || 0;
+      if (p.cci[i] > 100) put += weights.cci || 0;
     }
+
+    // Donchian
     if (p.donch && p.donch.upper != null && p.donch.upper[i] != null && prev >= 0 && p.donch.upper[prev] != null) {
-      if (p.c[i] >= p.donch.upper[prev] || p.h[i] >= p.donch.upper[prev]) votes.push({ dir: "CALL", w: weights.donchianBreak });
-      if (p.c[i] <= p.donch.lower[prev] || p.l[i] <= p.donch.lower[prev]) votes.push({ dir: "PUT", w: weights.donchianBreak });
+      if (ci >= p.donch.upper[prev] || p.h[i] >= p.donch.upper[prev]) call += weights.donchianBreak || 0;
+      if (ci <= p.donch.lower[prev] || p.l[i] <= p.donch.lower[prev]) put += weights.donchianBreak || 0;
     }
-    let call = 0, put = 0;
-    for (const vote of votes) {
-      const weight = numberValue(vote.w);
-      if (weight == null || weight <= 0) continue;
-      if (vote.dir === "CALL") call += weight; else put += weight;
-    }
+
     const rawMin = numberValue(cfg.minScore);
     const baseMin = rawMin != null ? Math.max(0, rawMin) : DEFAULTS.minScore;
     const required = baseMin + (regime === "choppy" ? 2 : 0);
-    const requiredLead = regime === "trending" ? 0 : 1;
+    const requiredLead = (regime === "trending" || regime === "strong-trend") ? 0 : 1;
     let direction = "WAIT", score = 0;
     if (call >= required && call > put + requiredLead) { direction = "CALL"; score = call; }
     else if (put >= required && put > call + requiredLead) { direction = "PUT"; score = put; }
@@ -812,13 +857,16 @@
 
     let prepared = null;
     let adaptivePrepared = null;
+    let resolvedMap = null;
     if (lean && !isAdaptive) {
       prepared = prepareLeanSeries(candles, cfg);
     } else if (lean && isAdaptive) {
       adaptivePrepared = {};
+      resolvedMap = {};
       for (const stratId of CONCRETE_STRATEGIES) {
-        const { params: sParams } = resolveStrategy({ strategy: stratId });
-        adaptivePrepared[stratId] = prepareLeanSeries(candles, sParams);
+        const stratResolved = resolveStrategy({ strategy: stratId });
+        resolvedMap[stratId] = stratResolved;
+        adaptivePrepared[stratId] = prepareLeanSeries(candles, stratResolved.params);
       }
     }
 
@@ -858,7 +906,7 @@
 
     for (let i = warmup; i < candles.length - horizon; i++) {
       const sig = adaptivePrepared
-        ? evaluateAdaptiveLeanAt(adaptivePrepared, i, opts)
+        ? evaluateAdaptiveLeanAt(adaptivePrepared, i, opts, resolvedMap)
         : (prepared
           ? evaluateLeanAt(prepared, i, cfg, resolved.weights)
           : analyze(candles.slice(Math.max(0, i + 1 - nonLeanTail), i + 1), Object.assign({}, opts, { lean: false })));
@@ -899,9 +947,9 @@
       else byRegime[r].losses++;
     }
     for (const r of Object.keys(byRegime)) {
-      const resolved = byRegime[r].wins + byRegime[r].losses;
-      byRegime[r].total = resolved + byRegime[r].draws;
-      byRegime[r].winrate = resolved ? (byRegime[r].wins / resolved) * 100 : 0;
+      const resolvedR = byRegime[r].wins + byRegime[r].losses;
+      byRegime[r].total = resolvedR + byRegime[r].draws;
+      byRegime[r].winrate = resolvedR ? (byRegime[r].wins / resolvedR) * 100 : 0;
     }
 
     let maxWinStreak = 0, maxLossStreak = 0, curW = 0, curL = 0;
