@@ -135,11 +135,38 @@ function hookTests() {
   };
 
   const seriesB = { setMarkers: () => { throw new Error("setMarkers unsupported"); } };
-  const chartB = { timeScale: () => ({}), series: () => [seriesB], addCandlestickSeries: () => seriesB };
+  // Overlay-mode chart: v4-style marker calls fail and the module must fall
+  // back to the overlay canvas, re-projecting on visible-range changes.
+  let rangeChangeCb = null;
+  let overlayClears = 0;
+  const chartB = {
+    timeScale: () => ({ subscribeVisibleLogicalRangeChange: (cb) => { rangeChangeCb = cb; } }),
+    series: () => [seriesB],
+    addCandlestickSeries: () => seriesB,
+  };
+
+  // v5 chart: series has NO setMarkers; markers come from
+  // LightweightCharts.createSeriesMarkers(series, markers) plugins.
+  const pluginCalls = [];
+  let pluginTarget = null;
+  const plugin = { setMarkers(list) { pluginCalls.push(JSON.parse(JSON.stringify(list))); } };
+  const seriesV5a = { setData() {}, update() {}, seriesType: () => "Candlestick" };
+  const seriesV5b = { setData() {}, update() {}, seriesType: () => "Candlestick" };
+  const lineSeriesV5 = { setData() {}, update() {}, seriesType: () => "Line" };
+  let v5CandleCalls = 0;
+  const chartV5 = {
+    timeScale: () => ({}),
+    series: () => [seriesV5a],
+    addSeries(def) {
+      return def && String(def.type && def.type()) === "Candlestick"
+        ? (++v5CandleCalls === 1 ? seriesV5a : seriesV5b)
+        : lineSeriesV5;
+    },
+  };
 
   // ---- DOM stubs ----
   const ctxStub = {
-    setTransform() {}, clearRect() {}, beginPath() {}, moveTo() {}, lineTo() {},
+    setTransform() {}, clearRect() { overlayClears++; }, beginPath() {}, moveTo() {}, lineTo() {},
     closePath() {}, fill() {}, fillRect() {},
   };
   function makeEl(tag) {
@@ -158,6 +185,7 @@ function hookTests() {
   const body = makeEl("body");
   let created = [];
   const intervalFns = [];
+  const timerFns = [];
   let msgListener = null;
   const posted = [];
 
@@ -188,7 +216,7 @@ function hookTests() {
     addEventListener: () => {},
     setInterval: (fn) => { intervalFns.push(fn); return intervalFns.length; },
     clearInterval: () => {},
-    setTimeout: () => 0,
+    setTimeout: (fn) => { timerFns.push(fn); return timerFns.length; },
     devicePixelRatio: 1,
     WebSocket: function () {},
     document: {
@@ -249,6 +277,48 @@ function hookTests() {
   msgListener({ source: sandbox.window, data: { source: "CYBER_BINARY_CONTENT", kind: "markers", payload: { asset: "EURUSD_otc", markers: [{ time: t0, price: 1.085, dir: "CALL" }], bars: [] } } });
   check("setMarkers failure falls back to overlay mode", HK.mode() === "overlay", HK.mode());
   check("overlay canvas element created", created.some((el) => el.tagName === "canvas"));
+
+  // 2b) overlay arrows must re-project when the chart's visible range moves
+  // (scroll / zoom / new bars) instead of freezing at stale pixels.
+  check("overlay subscribes to visible-range changes", typeof rangeChangeCb === "function");
+  overlayClears = 0;
+  rangeChangeCb();
+  const redrawTimer = timerFns[timerFns.length - 1];
+  check("range change schedules an overlay redraw", typeof redrawTimer === "function");
+  if (typeof redrawTimer === "function") redrawTimer();
+  check("overlay redraw repaints the canvas", overlayClears >= 1, "clears=" + overlayClears);
+
+  // 2c) v5 chart: series.setMarkers does not exist; markers must render
+  // natively through a createSeriesMarkers() plugin glued to the price
+  // series, not through the approximate overlay.
+  sandbox.window.LightweightCharts = {
+    createChart: () => chartV5,
+    createSeriesMarkers: (s) => { pluginTarget = s; return plugin; },
+  };
+  const madeV5 = sandbox.window.LightweightCharts.createChart({});
+  // page adds its candlestick through the v5 addSeries(SeriesDefinition) API
+  const firstCandle = madeV5.addSeries({ type: () => "Candlestick" }, {});
+  check("v5 addSeries(Candlestick) captured as the price series", firstCandle === seriesV5a);
+  // a moving average must NOT steal the marker target
+  madeV5.addSeries({ type: () => "Line" }, {});
+  msgListener({ source: sandbox.window, data: { source: "CYBER_BINARY_CONTENT", kind: "markers", payload: {
+    asset: "EURUSD_otc",
+    markers: [{ time: t0, price: 1.085, dir: "PUT" }, { time: t0 + 60000, price: 1.086, dir: "CALL" }],
+    bars: [],
+  } } });
+  check("v5 renders natively via createSeriesMarkers plugin", HK.mode() === "native" && pluginCalls.length >= 1, HK.mode() + " calls=" + pluginCalls.length);
+  check("v5 plugin targets the candlestick series", pluginTarget === seriesV5a);
+  const pluginList = pluginCalls[pluginCalls.length - 1];
+  check("v5 plugin receives timeframe-aligned native list",
+    pluginList.length === 2 && pluginList[0].time === Math.floor(Math.floor(t0 / 1000) / 60) * 60 &&
+    pluginList[0].shape === "arrowDown" && pluginList[1].shape === "arrowUp",
+    JSON.stringify(pluginList));
+  // asset/timeframe switch: page re-creates the candlestick series → the
+  // plugin must be re-created for the new series (the old one died with it).
+  pluginTarget = null;
+  madeV5.addSeries({ type: () => "Candlestick" }, {});
+  check("v5 re-created price series becomes the marker target", pluginTarget === seriesV5b, String(pluginTarget === seriesV5b));
+  check("v5 native mode survives series switch", HK.mode() === "native", HK.mode());
 
   // 3) fiber-discovered chart (chartA) renders natively + idempotently
   const hk2 = (function loadSecondHook() {

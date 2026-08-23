@@ -27,6 +27,7 @@
   let autoState = null;
   let settings = null;
   let btResults = null;
+  let btDataByAsset = null; // asset id -> "live" | "live+sim" | "sim" for the last run
   let lastChartCandles = null;
   let lastChartMeta = {};
   let lastBtEquity = null;
@@ -705,7 +706,7 @@
       const isAdaptive = activeStrategy === "auto_adaptive" || sig.adaptive === true;
       $("adaptive-regime-label").textContent = sig.regime ? sig.regime.toUpperCase() : "ANALYZING";
       const selStratObj = sig.selectedStrategy ? STRAT.get(sig.selectedStrategy) : null;
-      $("adaptive-strategy-label").textContent = sig.selectedStrategyLabel || (selStratObj ? selStratObj.label : (isAdaptive ? "⚡ Auto-Adaptive Engine" : activeStrategy));
+      $("adaptive-strategy-label").textContent = sig.selectedStrategyLabel || (selStratObj ? selStratObj.label : (isAdaptive ? "Auto-Adaptive Engine" : activeStrategy));
       $("adaptive-reason-text").textContent = sig.reason || "Evaluating optimal strategy for situation…";
 
       const fitnessContainer = $("fitness-meters");
@@ -1181,7 +1182,12 @@
     const minConf = Number.isFinite(rawMinConf) ? Math.max(0, Math.min(100, rawMinConf)) : 0;
     const kind = $("bt-kinds").value;
     const kinds = kind === "all" ? null : [kind];
-    const o = { days, horizon, minConf, kinds, minBars: 50, liveOnly: true, requireLive: true };
+    // The matrix runs across the WHOLE catalog (kind-filtered), not just the
+    // assets that happen to have a live candle cache. Cached broker candles
+    // are still preferred wherever they exist; every other asset is covered
+    // by the deterministic per-asset simulator, so a run always includes all
+    // assets and the per-asset table says which data each row used.
+    const o = { days, horizon, minConf, kinds, minBars: 50 };
 
     const btn = $("bt-run");
     btn.disabled = true;
@@ -1191,7 +1197,7 @@
     function tick(progress, total) {
       const i = progress && typeof progress === "object" ? progress.i : progress;
       const n = progress && typeof progress === "object" ? progress.total : total;
-      if (n) btn.textContent = "Running live-feed backtest " + i + " / " + n + "…";
+      if (n) btn.textContent = "Running backtest " + i + " / " + n + "…";
     }
 
     const assetPool = ASSETS.list().filter((a) => !kinds || kinds.some((kindName) =>
@@ -1229,14 +1235,18 @@
     })));
 
     const waitForLiveRows = async () => {
-      const deadline = Date.now() + 10000;
+      // Cached broker candles are preferred but never required: this probe
+      // just gives an open Quotex chart a few seconds to deliver fresh
+      // history before the run starts. Assets without a cache fall back to
+      // the simulator, so the wait must stay short.
+      const deadline = Date.now() + 5000;
       let nudged = false;
       let rows = await readLiveRows();
       while (!rows.some((row) => Array.isArray(row.bars) && row.bars.length >= minNeeded) && Date.now() < deadline) {
         const secondsLeft = Math.max(1, Math.ceil((deadline - Date.now()) / 1000));
         const bestBars = rows.reduce((m, r) => Math.max(m, Array.isArray(r.bars) ? r.bars.length : 0), 0);
         btn.textContent = "Waiting for broker candles… " + bestBars + "/" + minNeeded + " (" + secondsLeft + "s)";
-        if (!nudged && (historyProbeError || bestBars < minNeeded) && deadline - Date.now() <= 6000) {
+        if (!nudged && (historyProbeError || bestBars < minNeeded) && deadline - Date.now() <= 3000) {
           nudged = true;
           nudgeHistory().catch(() => {});
         }
@@ -1248,21 +1258,21 @@
 
     const loadLiveCache = seedProbe.then(waitForLiveRows).then((rows) => {
       const cachedByAsset = Object.create(null);
-      const liveAssets = [];
       rows.forEach((row) => {
         const bars = Array.isArray(row.bars) ? row.bars : [];
-        if (bars.length >= minNeeded) {
-          cachedByAsset[row.asset.id] = bars;
-          liveAssets.push(row.asset);
-        }
+        if (bars.length >= minNeeded) cachedByAsset[row.asset.id] = bars;
       });
-      if (!liveAssets.length) {
-        const error = historyProbeError
-          ? "Could not pull history from the selected Quotex tab (" + historyProbeError + "). Open a Quotex trade page, keep its chart open and connected, then retry; at least " + minNeeded + " one-minute bars are required."
-          : "No genuine one-minute Quotex history arrived within 10 seconds. Keep the selected trade chart open and connected, then retry; at least " + minNeeded + " bars are required.";
-        return { results: [], count: 0, liveOnly: true, error };
+      // Tag each asset's data source so the UI can show it honestly:
+      // "live" (cache covers the whole window), "live+sim" (cache padded by
+      // the simulator) or "sim" (no cache for this asset).
+      const minutes = days * 24 * 60;
+      btDataByAsset = Object.create(null);
+      for (const a of assetPool) {
+        const bars = cachedByAsset[a.id];
+        btDataByAsset[a.id] = !Array.isArray(bars) || !bars.length ? "sim"
+          : bars.length >= minutes ? "live" : "live+sim";
       }
-      o.assets = liveAssets;
+      o.assets = assetPool;
       o.cachedByAsset = cachedByAsset;
       o.onProgress = tick;
       const useWorkers = WORKERS && WORKERS.runBrowser;
@@ -1278,7 +1288,7 @@
       paintBacktest(r, o);
       if (r && r.error) {
         const body = $("bt-assets") && $("bt-assets").querySelector("tbody");
-        if (body) body.innerHTML = "<tr><td colspan='5'>" + esc(r.error) + "</td></tr>";
+        if (body) body.innerHTML = "<tr><td colspan='6'>" + esc(r.error) + "</td></tr>";
       }
     }).catch((e) => {
       const message = String(e && e.message || e || "Backtest failed");
@@ -1286,7 +1296,7 @@
       btResults = failure;
       paintBacktest(failure, o);
       const body = $("bt-assets") && $("bt-assets").querySelector("tbody");
-      if (body) body.innerHTML = "<tr><td colspan='5'>" + esc(message) + "</td></tr>";
+      if (body) body.innerHTML = "<tr><td colspan='6'>" + esc(message) + "</td></tr>";
       console.error(e);
     }).then(() => {
       btn.disabled = false;
@@ -1337,13 +1347,31 @@
       perAsset[r.asset].pnl += r.pnl;
       if (r.maxDrawdown > perAsset[r.asset].dd) perAsset[r.asset].dd = r.maxDrawdown;
     }
+    const sourceLabel = { live: "Live", "live+sim": "Live+Sim", sim: "Sim" };
     for (const k of Object.keys(perAsset).sort((a, b) => perAsset[b].pnl - perAsset[a].pnl)) {
       const v = perAsset[k];
       const t = v.wins + v.losses;
       const wr = t ? (v.wins / t) * 100 : 0;
+      const source = btDataByAsset && btDataByAsset[k] ? sourceLabel[btDataByAsset[k]] || "Sim" : "—";
       const tr = document.createElement("tr");
-      tr.innerHTML = "<td>" + esc(v.name || k) + "</td><td>" + t + "</td><td class='" + (wr >= 55 ? "win" : wr <= 45 ? "loss" : "") + "'>" + wr.toFixed(1) + "%</td><td>" + finite(v.pnl, 0) + "</td><td>" + finite(v.dd, 0) + "</td>";
+      tr.innerHTML = "<td>" + esc(v.name || k) + "</td><td>" + t + "</td><td class='" + (wr >= 55 ? "win" : wr <= 45 ? "loss" : "") + "'>" + wr.toFixed(1) + "%</td><td>" + finite(v.pnl, 0) + "</td><td>" + finite(v.dd, 0) + "</td><td>" + source + "</td>";
       aBody.appendChild(tr);
+    }
+
+    const sourcesEl = $("bt-sources");
+    if (sourcesEl) {
+      if (matrix.error) {
+        sourcesEl.textContent = "";
+      } else {
+        const counts = { live: 0, "live+sim": 0, sim: 0 };
+        for (const k of Object.keys(perAsset)) {
+          if (btDataByAsset && btDataByAsset[k] && counts[btDataByAsset[k]] != null) counts[btDataByAsset[k]]++;
+        }
+        const covered = Object.keys(perAsset).length;
+        sourcesEl.textContent = "Covered " + covered + " asset" + (covered === 1 ? "" : "s") +
+          " — " + counts.live + " live-cached, " + counts["live+sim"] + " live+simulated, " +
+          counts.sim + " simulated. Cached Quotex candles are used when available; the rest of the catalog runs on the deterministic simulator.";
+      }
     }
 
     const regBody = $("bt-regimes").querySelector("tbody");

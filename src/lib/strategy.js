@@ -7,7 +7,7 @@
 
   const STRATEGIES = {
     "auto_adaptive": {
-      label: "⚡ Auto-Adaptive (Elite Strategy Router)",
+      label: "Auto-Adaptive (Elite Strategy Router)",
       blurb: "Dynamically evaluates market regime, volatility, and high-accuracy strategy matrix to auto-select the highest winrate setup for the current bar.",
       params: {
         rsiPeriod: 14, rsiBuy: 42, rsiSell: 58,
@@ -25,7 +25,7 @@
       },
     },
     "sniper": {
-      label: "🎯 Sniper 90+ Confluence",
+      label: "Sniper 90+ Confluence",
       blurb: "Ultra-high conviction multi-timeframe alignment with strict Supertrend, ADX filter, and Parabolic SAR confirmation.",
       params: {
         rsiPeriod: 14, rsiBuy: 45, rsiSell: 55,
@@ -43,7 +43,7 @@
       },
     },
     "turbo_trend": {
-      label: "🚀 Turbo Trend Flow",
+      label: "Turbo Trend Flow",
       blurb: "Fast EMA ribbon acceleration coupled with Supertrend and higher-timeframe momentum continuation.",
       params: {
         rsiPeriod: 12, rsiBuy: 46, rsiSell: 54,
@@ -61,7 +61,7 @@
       },
     },
     "institutional_flow": {
-      label: "🏛️ Institutional VWAP Flow",
+      label: "Institutional VWAP Flow",
       blurb: "Volume-weighted institutional anchor levels aligned with Hurst fractal trend persistence.",
       params: {
         rsiPeriod: 14, rsiBuy: 45, rsiSell: 55,

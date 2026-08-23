@@ -4,14 +4,20 @@ Chrome extension (Manifest V3) that attaches to a Quotex / QX Broker chart, buil
 
 > Live signal analysis and explicitly armed automated execution for Quotex. This third-party tool can place real trades. Binary options are high risk, losses can quickly outweigh returns, and no result or profit is guaranteed.
 
+## What's new in v2.6.1 — Emoji-Free UI, Full-Catalog Backtest, Attached Arrows
+
+- **Emoji-free UI**: removed every decorative emoji from the dashboard, strategy labels, engine reason strings, and docs (broker button-detection arrow glyphs in the adapter regexes are functional and stay).
+- **Backtest uses all assets**: the Backtest tab now runs the full kind-filtered catalog (every asset × every strategy) instead of only assets with a live candle cache. Cached Quotex candles are preferred wherever they exist; the rest of the catalog runs on the deterministic per-asset simulator, the per-asset table gains a Data column (Live / Live+Sim / Sim), and a coverage line states exactly what ran. Backtests now also run in a pool of up to four dedicated workers with aggregated progress and per-chunk recovery.
+- **Signal arrows attached to candles**: lightweight-charts v5 builds no longer fall through to the approximate overlay — arrows render natively via `createSeriesMarkers()` on the captured price series (v4 `setMarkers()` remains first). The v5 `addSeries(CandlestickSeries, ...)` price series is now detected, plugins follow series re-creation on asset/timeframe switches, and the overlay fallback re-projects on every visible-range change (scroll / zoom / new bars) so arrows can no longer drift off their candles.
+
 ## What's new in v2.6.0 — High-Accuracy Strategy Suite & Engine Upgrades
 
-- **🎯 Elite High-Accuracy Strategy Suite (Removed Worst, Added Best)**:
+- **Elite High-Accuracy Strategy Suite (Removed Worst, Added Best)**:
   - **Removed Worst Performing Strategies**: Eliminated counter-trend and blind mean-reversion presets (`meanrev`, `reversal`, `choppy_range`) which suffered from low winrates (20%–35%) on binary options due to trend-fading vulnerabilities.
   - **Added New High-Accuracy Presets**:
-    - `sniper`: **🎯 Sniper 90+ Confluence** — Ultra-high conviction multi-timeframe alignment, Supertrend, ADX strength, and Parabolic SAR confirmation (~79.0% win rate).
-    - `turbo_trend`: **🚀 Turbo Trend Flow** — Fast EMA ribbon acceleration coupled with Supertrend and higher-timeframe continuation (~78.6% win rate).
-    - `institutional_flow`: **🏛️ Institutional VWAP Flow** — Volume-weighted VWAP anchor levels aligned with Hurst fractal persistence (~79.0% win rate).
+    - `sniper`: **Sniper 90+ Confluence** — Ultra-high conviction multi-timeframe alignment, Supertrend, ADX strength, and Parabolic SAR confirmation (~79.0% win rate).
+    - `turbo_trend`: **Turbo Trend Flow** — Fast EMA ribbon acceleration coupled with Supertrend and higher-timeframe continuation (~78.6% win rate).
+    - `institutional_flow`: **Institutional VWAP Flow** — Volume-weighted VWAP anchor levels aligned with Hurst fractal persistence (~79.0% win rate).
   - **Refined & Retained Top Strategies**:
     - `scalp`: 1m Ultra Scalp (~79.6% win rate)
     - `momentum_pulse`: Momentum Pulse (~79.4% win rate)
@@ -22,29 +28,29 @@ Chrome extension (Manifest V3) that attaches to a Quotex / QX Broker chart, buil
     - `squeeze`: Volatility Squeeze Expansion (~78.2% win rate)
     - `otc`: OTC Pro Matrix (~76.4% win rate)
     - `auto_adaptive`: Auto-Adaptive Elite Strategy Router (~76.1% win rate across all regimes)
-- **⚡ Signal Generation & Auto-Adaptive Engine Fixes**:
+- **Signal Generation & Auto-Adaptive Engine Fixes**:
   - **Uncapped Fitness Comparison**: Fixed a critical bug in `evaluateAdaptive` where candidate strategy fitness scores were clamped to 100 before applying the signal bonus, causing ties at 200 that prevented higher-confluence strategies (such as Ribbon, Trend, or Momentum Pulse) from being selected over the baseline preset.
   - **Stochastic Signal Trigger Fix**: Extended stochastic oversold/overbought detection to recognize intra-bar crossovers and fresh reversals, restoring signals across oscillator-based strategies.
   - **MTF 15m Warmup Gate Fix**: Lowered the completion threshold in `mtfTrendSeries` from 30 bars (450 minutes) to 21 bars (the slow EMA length), ensuring higher-timeframe trend alignment actively contributes to live signals on standard 200-bar histories.
   - **Regime Directional Alignment**: Corrected regime detection so strong directional EMA separation properly identifies `strong-trend` regimes.
   - **400x Backtest & Evaluation Performance**: Vectorized numerical extraction in indicators (`stdev`, `donchian`, `stochastic`, `williamsR`, `cci`, `hurst`), pre-resolved strategy parameter maps, and shared invariant indicators across parallel evaluation passes.
-- **🎯 Asset Selector Bare-Object Support**:
+- **Asset Selector Bare-Object Support**:
   - Enhanced `CYBER_ASSET_SELECTOR.evaluateAsset()` to automatically augment partial asset references (e.g. `{ id: "EURUSD" }`) with full catalog metadata (payout, classification, and OTC flags) used by the auto-trade gate.
-- **🚀 Manifest & UI Refresh**:
+- **Manifest & UI Refresh**:
   - Upgraded Manifest V3 version to `2.6.0` and refreshed dashboard cockpit headers and strategy selection menus.
 
 ## What's new in v2.5.0 — Auto-Adaptive System & High-Accuracy Assets
 
-- **⚡ Auto-Adaptive Strategy Engine (`auto_adaptive`)**:
+- **Auto-Adaptive Strategy Engine (`auto_adaptive`)**:
   - Dynamically evaluates market situation and regime (`trending`, `strong-trend`, `mean-reverting`, `choppy`, `ranging`, `squeeze`, `volatile`) on every bar.
   - Concurrently analyzes all 11 concrete strategy presets (`confluence`, `trend`, `meanrev`, `breakout`, `scalp`, `otc`, `squeeze`, `ribbon`, `reversal`, `momentum_pulse`, `choppy_range`).
   - Calculates a **Situation Fitness Score** (0-100) combining regime compatibility, indicator confluence, signal strength, and strategy hit-rate history.
   - Automatically selects and executes using the **Best Strategy** for the current market situation!
-- **🎯 Auto-Adapting High-Accuracy Asset Selector**:
+- **Auto-Adapting High-Accuracy Asset Selector**:
   - Continuously ranks all catalog instruments in real time by **Expected Value (EV = WinRate% × (1 + Payout%) - 1)** and **Accuracy Score**.
   - Displays top high-accuracy assets with EV %, win rate, payout %, and recommended strategy.
   - Includes a **High-Accuracy Asset Filter Gate** in Auto-Trade mode: automatically suppresses trades on negative-EV / low-accuracy assets and executes on top high-accuracy opportunities.
-  - Quick "🎯 Select Best High-Accuracy Asset" button on the live dashboard.
+  - Quick "Select Best High-Accuracy Asset" button on the live dashboard.
 - **5 New Specialized Strategy Presets**:
   - `squeeze`: Volatility Squeeze & Expansion (Bollinger Bands compression inside Keltner Channels + momentum expansion).
   - `ribbon`: EMA Ribbon Alignment (Fast / Medium / Slow EMA stack alignment + ADX).

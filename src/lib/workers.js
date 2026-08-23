@@ -360,56 +360,120 @@
     const assets = uniqueById(Array.isArray(opts.assets) ? opts.assets : ASSETS.list(),
       resolveAsset, 256)
       .filter((a) => matchesKinds(a, opts.kinds));
-    const strategies = uniqueById(Array.isArray(opts.strategies) ? opts.strategies : STRATEGIES.list(),
+    const strategies = uniqueById(Array.isArray(opts.strategies) ? opts.strategies : STRAT.list(),
       resolveStrategy, 128);
+    if (!assets.length || !strategies.length) {
+      return Promise.resolve({ results: [], count: 0 });
+    }
     const rawSeed = numberValue(opts.seed);
-    const payload = {
-      assets: assets.map((a) => a.id),
+    const rawHorizon = numberValue(opts.horizon), rawMinConf = numberValue(opts.minConf), rawMinBars = numberValue(opts.minBars);
+    const basePayload = {
       strategies: strategies.map((s) => s.id),
       days: boundedDays(opts.days),
       seed: rawSeed != null ? rawSeed : 7,
-      horizon: opts.horizon,
-      minConf: opts.minConf,
-      minBars: opts.minBars,
+      horizon: rawHorizon != null ? Math.max(1, Math.min(1440, Math.floor(rawHorizon))) : 3,
+      minConf: rawMinConf != null ? Math.max(0, Math.min(100, rawMinConf)) : 0,
+      minBars: rawMinBars != null ? Math.max(40, Math.min(2000, Math.floor(rawMinBars))) : 200,
       sortBy: opts.sortBy,
-      cachedByAsset: opts.cachedByAsset,
+      cachedByAsset: opts.cachedByAsset && typeof opts.cachedByAsset === "object" ? opts.cachedByAsset : null,
       liveOnly: opts.liveOnly === true || opts.requireLive === true,
     };
+    // Pool of dedicated workers so full-catalog runs (every asset × every
+    // strategy) finish in a fraction of the single-worker time. Assets are
+    // split into contiguous chunks; a worker that dies has only its own
+    // chunk replayed by the responsive chunked runner on the main thread.
+    let cores = 0;
+    try { cores = Math.max(1, Math.floor(Number(root.navigator && root.navigator.hardwareConcurrency) || 0)); } catch (_) {}
+    const poolSize = Math.max(1, Math.min(cores || 2, 4, assets.length));
+    const chunks = [];
+    for (let ci = 0; ci < poolSize; ci++) chunks.push([]);
+    const per = Math.ceil(assets.length / poolSize);
+    for (let ai = 0; ai < assets.length; ai++) {
+      chunks[Math.min(poolSize - 1, Math.floor(ai / per))].push(assets[ai]);
+    }
+    const activeChunks = chunks.filter((c) => c.length > 0);
+    const totalJobs = assets.length * strategies.length;
     return new Promise((resolve) => {
-      let worker = null, finished = false;
-      function fallback() {
-        if (finished) return;
-        finished = true;
-        try { if (worker) worker.terminate(); } catch (_) {}
-        runBrowserChunked(opts).then(resolve);
+      const results = [];
+      const failedAssets = [];
+      const progress = new Array(activeChunks.length).fill(0);
+      let settled = 0;
+      let reported = false;
+      function reportProgress() {
+        try {
+          if (typeof opts.onProgress !== "function") return;
+          let done = 0;
+          for (const p of progress) done += p;
+          opts.onProgress({ i: done, total: totalJobs });
+        } catch (_) {}
       }
-      try {
-        worker = new root.Worker(runtime.getURL("src/historic-worker.js"));
-      } catch (_) {
-        fallback(); return;
-      }
-      worker.onmessage = (event) => {
-        const message = event && event.data;
-        if (!message || typeof message !== "object" || finished) return;
-        if (message.type === "error") { fallback(); return; }
-        if (message.type === "progress") {
-          try {
-            if (typeof opts.onProgress === "function") opts.onProgress({
-              i: numberValue(message.i) || 0,
-              total: numberValue(message.total) || assets.length * strategies.length,
-            });
-          } catch (_) {}
+      function finish() {
+        if (reported || settled < activeChunks.length) return;
+        reported = true;
+        if (!failedAssets.length) {
+          sortResults(results, opts.sortBy);
+          resolve({ results, count: results.length });
           return;
         }
-        if (message.type !== "done" || !message.result || !Array.isArray(message.result.results)) return;
-        finished = true;
-        try { worker.terminate(); } catch (_) {}
-        sortResults(message.result.results, opts.sortBy);
-        resolve({ results: message.result.results, count: message.result.results.length });
-      };
-      worker.onerror = fallback;
-      worker.onmessageerror = fallback;
-      try { worker.postMessage(payload); } catch (_) { fallback(); }
+        runBrowserChunked(Object.assign({}, opts, { assets: failedAssets, onProgress: null }))
+          .then((recovered) => {
+            if (recovered && Array.isArray(recovered.results)) {
+              for (const r of recovered.results) results.push(r);
+            }
+            sortResults(results, opts.sortBy);
+            resolve({ results, count: results.length });
+          })
+          .catch(() => {
+            sortResults(results, opts.sortBy);
+            resolve({ results, count: results.length });
+          });
+      }
+      activeChunks.forEach((chunk, wi) => {
+        let worker = null;
+        try {
+          worker = new root.Worker(runtime.getURL("src/historic-worker.js"));
+        } catch (e) {
+          for (const a of chunk) failedAssets.push(a);
+          settled++;
+          finish();
+          return;
+        }
+        let done = false;
+        function fail() {
+          if (done) return;
+          done = true;
+          try { worker.terminate(); } catch (_) {}
+          for (const a of chunk) failedAssets.push(a);
+          settled++;
+          finish();
+        }
+        worker.onmessage = (event) => {
+          const message = event && event.data;
+          if (!message || typeof message !== "object" || done) return;
+          if (message.type === "error") { fail(); return; }
+          if (message.type === "progress") {
+            progress[wi] = Math.max(0, Math.floor(numberValue(message.i) || 0));
+            reportProgress();
+            return;
+          }
+          if (message.type === "done" && message.result && Array.isArray(message.result.results)) {
+            done = true;
+            for (const r of message.result.results) results.push(r);
+            progress[wi] = chunk.length * strategies.length;
+            reportProgress();
+            try { worker.terminate(); } catch (_) {}
+            settled++;
+            finish();
+          }
+        };
+        worker.onerror = fail;
+        worker.onmessageerror = fail;
+        try {
+          worker.postMessage(Object.assign({}, basePayload, { assets: chunk.map((a) => a.id) }));
+        } catch (e) {
+          fail();
+        }
+      });
     });
   }
 

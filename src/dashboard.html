@@ -40,10 +40,10 @@
           <label class="ctl">
             <span>Strategy</span>
             <select id="strategy-select">
-              <option value="auto_adaptive">⚡ Auto-Adaptive (Elite Strategy Router)</option>
-              <option value="sniper">🎯 Sniper 90+ Confluence</option>
-              <option value="turbo_trend">🚀 Turbo Trend Flow</option>
-              <option value="institutional_flow">🏛️ Institutional VWAP Flow</option>
+              <option value="auto_adaptive">Auto-Adaptive (Elite Strategy Router)</option>
+              <option value="sniper">Sniper 90+ Confluence</option>
+              <option value="turbo_trend">Turbo Trend Flow</option>
+              <option value="institutional_flow">Institutional VWAP Flow</option>
               <option value="confluence">Balanced Confluence</option>
               <option value="trend">Trend Master</option>
               <option value="breakout">Breakout Velocity</option>
@@ -55,7 +55,7 @@
             </select>
           </label>
           <button id="refresh-asset" class="ghost-btn">Auto-detect</button>
-          <button id="select-best-asset" class="arm-btn small">🎯 Select Best High-Accuracy Asset</button>
+          <button id="select-best-asset" class="arm-btn small">Select Best High-Accuracy Asset</button>
         </div>
 
         <section class="hero" id="hero" data-dir="WAIT">
@@ -72,7 +72,7 @@
         <!-- Auto-Adaptive System Card -->
         <section class="card adaptive-card" id="adaptive-card">
           <div class="card-header">
-            <h3>⚡ Auto-Adaptive Strategy System</h3>
+            <h3>Auto-Adaptive Strategy System</h3>
             <span id="adaptive-status-badge" class="badge">Active Situation Analysis</span>
           </div>
           <div class="adaptive-body">
@@ -82,7 +82,7 @@
             </div>
             <div class="adaptive-row">
               <span>Auto-Adapted Strategy:</span>
-              <strong id="adaptive-strategy-label">⚡ Auto-Adaptive Engine</strong>
+              <strong id="adaptive-strategy-label">Auto-Adaptive Engine</strong>
             </div>
             <div class="adaptive-row">
               <span>Adaptation Reason:</span>
@@ -95,7 +95,7 @@
         <!-- High-Accuracy Assets Card -->
         <section class="card high-accuracy-card">
           <div class="card-header">
-            <h3>🎯 Top High-Accuracy Assets (Auto-Ranked)</h3>
+            <h3>Top High-Accuracy Assets (Auto-Ranked)</h3>
             <span class="badge green">Sorted by Expected Value</span>
           </div>
           <div class="table-wrap">
@@ -206,7 +206,7 @@
           <button id="test-sound" class="ghost-btn">Test beep</button>
           <label class="check"><input type="checkbox" id="notify-sound" checked /> Sound</label>
           <label class="check"><input type="checkbox" id="notify-desktop" /> Desktop</label>
-          <label class="check"><input type="checkbox" id="auto-high-accuracy" checked /> 🎯 High-Accuracy Asset Filter Only (EV &gt; 0)</label>
+          <label class="check"><input type="checkbox" id="auto-high-accuracy" checked /> High-Accuracy Asset Filter Only (EV &gt; 0)</label>
         </section>
 
         <section>
@@ -344,7 +344,7 @@
           <h2>Per-Asset</h2>
           <div class="table-wrap">
             <table class="table" id="bt-assets">
-              <thead><tr><th>Asset</th><th>Trades</th><th>Win Rate</th><th>P&amp;L</th><th>Max DD</th></tr></thead>
+              <thead><tr><th>Asset</th><th>Trades</th><th>Win Rate</th><th>P&amp;L</th><th>Max DD</th><th>Data</th></tr></thead>
               <tbody></tbody>
             </table>
           </div>
@@ -370,10 +370,12 @@
           </div>
         </section>
 
+        <p class="disclaimer" id="bt-sources"></p>
         <p class="disclaimer">
-          Backtests now use only cached Quotex live/tick-built 1m candles from
-          the platform feed. If no live cache exists yet, open Quotex and let
-          ticks stream for a few minutes first. They are <strong>not</strong> a
+          Backtests cover every catalog asset for the selected class. Cached
+          Quotex live/tick-built 1m candles are preferred whenever they exist;
+          assets without a live cache run on the deterministic per-asset
+          simulator (see the Data column). They are <strong>not</strong> a
           guarantee of future accuracy.
         </p>
       </section>
@@ -459,10 +461,10 @@
             Calibration: shrink engine confidence toward observed hit rate per bucket
           </label>
           <label class="check"><input type="checkbox" id="set-auto-adaptive" checked />
-            ⚡ Enable Auto-Adaptive Strategy Switching on Market Situation
+            Enable Auto-Adaptive Strategy Switching on Market Situation
           </label>
           <label class="check"><input type="checkbox" id="set-auto-high-accuracy" checked />
-            🎯 High-Accuracy Asset Filter Gate for Auto-Trading
+            High-Accuracy Asset Filter Gate for Auto-Trading
           </label>
         </section>
 

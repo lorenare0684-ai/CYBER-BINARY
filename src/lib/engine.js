@@ -231,7 +231,7 @@
       strategyScores: scores,
       reason: bestResult.direction === "WAIT"
         ? `Auto-adapted '${bestLabel}' [${regime}]: No confluence`
-        : `⚡ Auto-adapted '${bestLabel}' for ${regime} regime (Fitness: ${scores[bestStrategy] ? scores[bestStrategy].fitness : 0}/100) · ${bestResult.reason || ""}`,
+        : `Auto-adapted '${bestLabel}' for ${regime} regime (Fitness: ${scores[bestStrategy] ? scores[bestStrategy].fitness : 0}/100) · ${bestResult.reason || ""}`,
     });
   }
 
@@ -314,7 +314,7 @@
       strategyScores: scores,
       reason: bestResult.direction === "WAIT"
         ? `Auto-adapted '${bestLabel}' [${regime}]: No confluence`
-        : `⚡ Auto-adapted '${bestLabel}' for ${regime} regime (Fitness: ${scores[bestStrategy] ? scores[bestStrategy].fitness : 0}/100)`,
+        : `Auto-adapted '${bestLabel}' for ${regime} regime (Fitness: ${scores[bestStrategy] ? scores[bestStrategy].fitness : 0}/100)`,
     });
   }
 
