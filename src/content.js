@@ -84,6 +84,8 @@
   let lastBalance = null;
   let lastOrders = [];
   const pendingWs = Object.create(null);       // page-hook send ack requestId -> resolver
+  const pendingHistory = Object.create(null);  // page-hook history-subscription requestId -> resolver
+  let historyRequestSequence = 0;
   const pendingOrders = Object.create(null);   // broker order-open requestId -> resolver
   const settledOrderIds = Object.create(null); // de-dupe broker close replays
   const settledOrderQueue = [];
@@ -1182,25 +1184,46 @@
   }
 
   function ensureHistorySubscription(det, force, requestedLimit) {
-    if (!det || !QUOTEX || !QUOTEX.subscribeHistory) return false;
+    if (!det || !QUOTEX || !QUOTEX.subscribeHistory) return null;
     const id = det.id;
     const at = historyRequestedAt[id] || 0;
     // Once real history has arrived, live ticks extend the cache; do not pull a
     // 5,000-row batch on every periodic scan. The backtest button can still
     // force one refresh on demand.
-    if (!force && historySeeded[id]) return false;
-    if (!force && Date.now() - at < 30000) return false; // retry initial attachment at most every 30s
+    if (!force && historySeeded[id]) return null;
+    if (!force && Date.now() - at < 30000) return null; // retry initial attachment at most every 30s
     const rawLimit = Number(requestedLimit);
     const limit = Number.isFinite(rawLimit) ? Math.max(60, Math.min(5000, Math.floor(rawLimit))) : 5000;
+    const requestId = "history_" + Date.now() + "_" + (++historyRequestSequence % 1000000);
     historyRequestedAt[id] = Date.now();
     try {
       window.postMessage({
         source: "CYBER_BINARY_CONTENT",
         kind: "subscribe",
-        payload: { asset: id, period: 60, limit },
+        payload: { requestId, asset: id, period: 60, limit },
       }, "*");
-      return true;
-    } catch (_) { return false; }
+      return requestId;
+    } catch (_) {
+      historyRequestedAt[id] = 0;
+      return null;
+    }
+  }
+
+  function requestHistorySubscription(det, requestedLimit) {
+    const requestId = ensureHistorySubscription(det, true, requestedLimit);
+    if (!requestId) return Promise.resolve({ ok: false, requested: false, error: "history request could not be posted" });
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        if (!pendingHistory[requestId]) return;
+        delete pendingHistory[requestId];
+        if (det && det.id) historyRequestedAt[det.id] = 0;
+        resolve({ ok: false, requested: false, asset: det && det.id || activeAsset, error: "history subscription acknowledgement timeout" });
+      }, 4000);
+      pendingHistory[requestId] = (result) => {
+        clearTimeout(timer);
+        resolve(result);
+      };
+    });
   }
 
   function tick() {
@@ -1388,6 +1411,28 @@
           };
           try { pendingWs[requestId](result); } catch (_) {}
           delete pendingWs[requestId];
+        }
+        break;
+      }
+      case "subscribe_result": {
+        const requestId = p && typeof p.requestId === "string" ? p.requestId.slice(0, 128) : "";
+        const asset = p && typeof p.asset === "string" ? p.asset.slice(0, 96) : activeAsset;
+        const detail = p && p.payload && typeof p.payload === "object" && !Array.isArray(p.payload) ? p.payload : {};
+        const result = {
+          ok: p && p.ok === true,
+          requested: p && p.ok === true,
+          requestId,
+          asset,
+          period: Number.isFinite(Number(detail.period)) ? Number(detail.period) : 60,
+          limit: Number.isFinite(Number(detail.limit)) ? Number(detail.limit) : null,
+          error: p && p.ok === true ? null : String(detail.error || "broker history subscription failed").slice(0, 256),
+        };
+        const hasPendingRequest = !!(requestId && pendingHistory[requestId]);
+        if (!result.ok && asset && hasPendingRequest) historyRequestedAt[asset] = 0;
+        if (hasPendingRequest) {
+          const done = pendingHistory[requestId];
+          delete pendingHistory[requestId];
+          try { done(result); } catch (_) {}
         }
         break;
       }
@@ -1702,9 +1747,11 @@
     }
     if (msg && msg.type === "CYBER_REQUEST_HISTORY") {
       const det = ASSETS.get(activeAsset) || ASSETS.ensureRegistered(lastWsSymbol || activeAsset);
-      const requested = ensureHistorySubscription(det, true, msg.limit);
-      sendResponse({ ok: requested, asset: det && det.id || activeAsset, requested });
-      return;
+      requestHistorySubscription(det, msg.limit).then(sendResponse).catch((e) => {
+        sendResponse({ ok: false, requested: false, asset: det && det.id || activeAsset,
+          error: String(e && e.message || e || "history request failed").slice(0, 256) });
+      });
+      return true;
     }
     if (msg && msg.type === "CYBER_SET_STRATEGY") {
       const requested = typeof msg.strategy === "string" ? msg.strategy.trim() : "";
@@ -1727,9 +1774,20 @@
         sendResponse({ ok: false, error: "unknown or invalid asset", asset: activeAsset });
         return;
       }
-      manualAsset = det.id;
+      // The dashboard cannot safely switch the broker's chart. Pinning a
+      // different local feed made the UI display synthetic candles for one
+      // asset while Quotex was trading another. Only acknowledge the symbol
+      // already selected on the authoritative main chart.
+      const matchesMain = !!lastWsSymbol && !!QUOTEX &&
+        QUOTEX.normalizeSymbol(det.id) === QUOTEX.normalizeSymbol(lastWsSymbol);
+      if (!matchesMain) {
+        sendResponse({ ok: false, asset: activeAsset,
+          error: "Select " + det.name + " on the Quotex chart first" });
+        return;
+      }
+      manualAsset = null;
       activateAsset(det.id);
-      sendResponse({ ok: true, asset: det.id, manual: true });
+      sendResponse({ ok: true, asset: det.id, manual: false });
       return;
     }
     if (msg && msg.type === "CYBER_DETECT_ASSET") {

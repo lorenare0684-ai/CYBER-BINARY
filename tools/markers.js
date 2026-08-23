@@ -207,7 +207,12 @@ function hookTests() {
   };
   sandbox.globalThis = sandbox.self;
   sandbox.window = sandbox.self;
-  sandbox.window.addEventListener = (type, fn) => { if (type === "message") msgListener = fn; };
+  sandbox.window.postMessage = sandbox.postMessage;
+  sandbox.window.addEventListener = (type, fn) => {
+    if (type !== "message") return;
+    const previous = msgListener;
+    msgListener = previous ? (event) => { previous(event); fn(event); } : fn;
+  };
   vm.createContext(sandbox);
 
   // load the REAL built hook (adapter + shell)
@@ -215,6 +220,20 @@ function hookTests() {
   const M = sandbox.self.CYBER_MARKERS; // lib loaded inside the hook bundle? no — bundle only has CYBER_QUOTEX
   const HK = sandbox.window.__cyber && sandbox.window.__cyber.markers;
   check("hook exposes markers API", !!HK && typeof HK.applyMarkers === "function", String(HK));
+
+  // History requests are correlated and report the actual socket-send result.
+  // Previously content received an uncorrelated event while the dashboard was
+  // told success merely because postMessage itself succeeded.
+  msgListener({ source: sandbox.window, data: {
+    source: "CYBER_BINARY_CONTENT", kind: "subscribe",
+    payload: { requestId: "history-test-1", asset: "EURUSD_otc", period: 60, limit: 5000 },
+  } });
+  const historyAck = posted.filter((m) => m && m.kind === "subscribe_result").pop();
+  check("history subscription acknowledgement preserves request identity",
+    historyAck && historyAck.payload && historyAck.payload.requestId === "history-test-1");
+  check("history subscription surfaces missing socket failure",
+    historyAck && historyAck.payload && historyAck.payload.ok === false &&
+    /websocket/i.test(String(historyAck.payload.payload && historyAck.payload.payload.error)));
 
   // 1) LightweightCharts.createChart trap
   const t0 = 1717000000000;
@@ -264,7 +283,12 @@ function hookTests() {
     };
     sandbox2.globalThis = sandbox2.self;
     sandbox2.window = sandbox2.self;
-    sandbox2.window.addEventListener = (type, fn) => { if (type === "message") msgListener2 = fn; };
+    sandbox2.window.postMessage = sandbox2.postMessage;
+    sandbox2.window.addEventListener = (type, fn) => {
+      if (type !== "message") return;
+      const previous = msgListener2;
+      msgListener2 = previous ? (event) => { previous(event); fn(event); } : fn;
+    };
     vm.createContext(sandbox2);
     vm.runInContext(fs.readFileSync(path.join(root, "src/page-hook.js"), "utf8"), sandbox2);
     const hk = sandbox2.window.__cyber.markers;

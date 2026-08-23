@@ -6,7 +6,7 @@
  *   - tools/page-hook.shell.js (MAIN-world WebSocket hook shell)
  *
  * Rebuild after any change to either source file.
- * Generated: 2026-08-23T07:03:38.995Z
+ * Generated: 2026-08-23T07:10:09.022Z
  */
 /* ====================================================================
  * Inlined CYBER_QUOTEX adapter (src/lib/quotex.js).
@@ -2875,7 +2875,12 @@
       var r;
       try { r = Q.subscribeHistory(handle.lastWs, sub.asset, sub.period, sub.limit); }
       finally { internalSubscriptionSend = false; }
-      emit("subscribe_result", { ok: !!(r && r.ok), payload: r || {} });
+      emit("subscribe_result", {
+        requestId: sub.requestId != null ? String(sub.requestId).slice(0, 128) : "",
+        asset: sub.asset != null ? String(sub.asset).slice(0, 96) : "",
+        ok: !!(r && r.ok),
+        payload: r || {},
+      });
     } else if (ev.data.kind === "place_ws") {
       var args = ev.data.payload && typeof ev.data.payload === "object" ? ev.data.payload : {};
       var reqId = args.requestId != null ? String(args.requestId).slice(0, 128) : "";

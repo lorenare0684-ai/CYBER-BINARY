@@ -560,9 +560,12 @@ const otcMatrix = HIST.runMatrix({
 if (otcMatrix.count !== 3 || otcMatrix.results.some((row) => !/_otc$/i.test(row.asset))) {
   console.error("historic OTC filter omitted cross-class broker markets"); failed++;
 }
-const safeSummary = HIST.summarize({ results: [{ asset: "A", strategy: "S", kind: "fx", wins: "2", losses: "1", draws: Infinity, pnl: "3" }, null] });
-if (!safeSummary || safeSummary.trades !== 3 || safeSummary.draws !== 0 || safeSummary.pnl !== 3) {
-  console.error("historic summary sanitation failed"); failed++;
+const safeSummary = HIST.summarize({ results: [
+  { asset: "A", strategy: "S", kind: "fx", wins: "2", losses: "1", draws: Infinity, pnl: "3", maxDrawdown: "4.5" },
+  { asset: "B", strategy: "S", kind: "fx", wins: 1, losses: 0, maxDrawdown: 2 }, null,
+] });
+if (!safeSummary || safeSummary.trades !== 4 || safeSummary.draws !== 0 || safeSummary.pnl !== 3 || safeSummary.maxDrawdown !== 4.5) {
+  console.error("historic summary sanitation/drawdown failed"); failed++;
 }
 
 if (failed) {

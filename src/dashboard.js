@@ -508,14 +508,28 @@
 
   function bindSelectors() {
     $("asset-select").addEventListener("change", (e) => {
-      activeAsset = e.target.value;
+      const requested = e.target.value;
+      const previous = activeAsset;
       if (hasChrome) {
-        chrome.runtime.sendMessage({ type: "CYBER_SET_ASSET", asset: activeAsset }).catch(() => {});
-      } else {
-        // Re-seed local demo feed for the new asset.
-        const a = ASSETS.get(activeAsset);
-        if (a) localFeed.setSeries(FEED.syntheticSeries(a, 240));
+        chrome.runtime.sendMessage({ type: "CYBER_SET_ASSET", asset: requested }).then((response) => {
+          if (!response || !response.ok) {
+            e.target.value = previous;
+            const pill = $("link-state");
+            if (pill) {
+              pill.textContent = response && response.error || "Select the asset on Quotex first";
+              pill.className = "pill warn";
+            }
+            return;
+          }
+          activeAsset = response.asset || requested;
+          e.target.value = activeAsset;
+        }).catch(() => { e.target.value = previous; });
+        return;
       }
+      activeAsset = requested;
+      // Re-seed local demo feed for the new asset.
+      const a = ASSETS.get(activeAsset);
+      if (a) localFeed.setSeries(FEED.syntheticSeries(a, 240));
       renderLocalTick();
     });
     $("strategy-select").addEventListener("change", (e) => {
@@ -1213,7 +1227,8 @@
     $("bt-trades").textContent = String(sum.trades || 0);
     $("bt-winrate").textContent = fmtPct(sum && sum.winrate);
     $("bt-pnl").textContent = String(sum && sum.pnl || 0);
-    $("bt-dd").textContent = "—";
+    const maxDrawdown = finite(sum && sum.maxDrawdown, null);
+    $("bt-dd").textContent = maxDrawdown == null ? "—" : maxDrawdown.toFixed(2);
 
     // The matrix does not retain trade chronology, so never fabricate it by
     // grouping every win before every loss. Plot one bounded cumulative point
@@ -1405,11 +1420,28 @@
           "<td>" + liveWR + "</td>" +
           "<td>" + liveT + "</td>";
         tr.addEventListener("click", () => {
+          if (hasChrome) {
+            chrome.runtime.sendMessage({ type: "CYBER_SET_ASSET", asset: a.id }).then((response) => {
+              if (response && response.ok) {
+                activeAsset = response.asset || a.id;
+                const sel = $("asset-select");
+                if (sel) sel.value = activeAsset;
+                activateTab("live");
+              } else {
+                const pill = $("link-state");
+                if (pill) {
+                  pill.textContent = response && response.error || "Select the asset on Quotex first";
+                  pill.className = "pill warn";
+                }
+                activateTab("live");
+              }
+            }).catch(() => {});
+            return;
+          }
           activeAsset = a.id;
           const sel = $("asset-select");
           if (sel) sel.value = a.id;
-          if (hasChrome) chrome.runtime.sendMessage({ type: "CYBER_SET_ASSET", asset: a.id }).catch(() => {});
-          else localFeed.setSeries(FEED.syntheticSeries(a, 240));
+          localFeed.setSeries(FEED.syntheticSeries(a, 240));
           activateTab("live");
         });
         tb.appendChild(tr);
