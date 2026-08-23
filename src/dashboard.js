@@ -1132,17 +1132,27 @@
     const assetPool = ASSETS.list().filter((a) => !kinds || kinds.some((kindName) =>
       typeof ASSETS.matchesKind === "function" ? ASSETS.matchesKind(a, kindName) : a.kind === kindName)).slice(0, 256);
     const minNeeded = Math.max(40, 50 + horizon + 1);
-    // Ask the selected Quotex tab for broker history immediately instead of
-    // assuming its periodic subscription has completed. Poll the genuine
-    // live/storage sources briefly because socket delivery and persistence are
-    // asynchronous and a fixed 1.2-second delay routinely raced them.
-    const requestFreshHistory = hasChrome
-      ? chrome.runtime.sendMessage({ type: "CYBER_REQUEST_HISTORY", limit: 5000 })
-          .then((response) => {
-            if (!response || !response.ok) throw new Error(response && response.error || "The selected Quotex tab could not request history.");
-            return response;
-          })
-      : Promise.resolve({ ok: true });
+    // The history probe only KICKS OFF delivery on the selected Quotex tab;
+    // genuine candles still arrive asynchronously via the live-state push and
+    // chrome.storage. So a rejected probe (no selected tab, page-hook still
+    // loading past its 4s ACK) must NOT abort the poll loop — record why it
+    // failed and keep waiting, since the content script's own periodic
+    // subscription plus a mid-window retry can still land the bars.
+    let historyProbeError = "";
+    const nudgeHistory = () => {
+      if (!hasChrome) return Promise.resolve(true);
+      return chrome.runtime.sendMessage({ type: "CYBER_REQUEST_HISTORY", limit: 5000 })
+        .then((response) => {
+          if (!response || !response.ok) {
+            throw new Error((response && response.error) || "The selected Quotex tab could not request history.");
+          }
+          return true;
+        });
+    };
+    const seedProbe = nudgeHistory().catch((e) => {
+      historyProbeError = String((e && e.message) || e || "history request failed").slice(0, 256);
+      return false;
+    });
 
     const readLiveRows = () => STORE.load().then((snapshot) => {
       const storedByAsset = snapshot && snapshot.candles && typeof snapshot.candles === "object"
@@ -1164,17 +1174,25 @@
 
     const waitForLiveRows = async () => {
       const deadline = Date.now() + 10000;
+      let nudged = false; // a single mid-window retry recovers from a slow page-hook load
       let rows = await readLiveRows();
       while (!rows.some((row) => Array.isArray(row.bars) && row.bars.length >= minNeeded) && Date.now() < deadline) {
         const secondsLeft = Math.max(1, Math.ceil((deadline - Date.now()) / 1000));
-        btn.textContent = "Waiting for broker candles… " + secondsLeft + "s";
+        const bestBars = rows.reduce((m, r) => Math.max(m, Array.isArray(r.bars) ? r.bars.length : 0), 0);
+        btn.textContent = "Waiting for broker candles… " + bestBars + "/" + minNeeded + " (" + secondsLeft + "s)";
+        // If the first probe failed (or simply returned nothing) and we are
+        // past the 4s mark, nudge the selected tab once more before giving up.
+        if (!nudged && (historyProbeError || bestBars < minNeeded) && deadline - Date.now() <= 6000) {
+          nudged = true;
+          nudgeHistory().catch(() => {});
+        }
         await new Promise((resolve) => setTimeout(resolve, 500));
         rows = await readLiveRows();
       }
       return rows;
     };
 
-    const loadLiveCache = requestFreshHistory.then(waitForLiveRows).then((rows) => {
+    const loadLiveCache = seedProbe.then(waitForLiveRows).then((rows) => {
       const cachedByAsset = Object.create(null);
       const liveAssets = [];
       rows.forEach((row) => {
@@ -1185,7 +1203,10 @@
         }
       });
       if (!liveAssets.length) {
-        return { results: [], count: 0, liveOnly: true, error: "No genuine one-minute Quotex history arrived within 10 seconds. Keep the selected trade chart open and connected, then retry; at least " + minNeeded + " bars are required." };
+        const error = historyProbeError
+          ? "Could not pull history from the selected Quotex tab (" + historyProbeError + "). Open a Quotex trade page, keep its chart open and connected, then retry; at least " + minNeeded + " one-minute bars are required."
+          : "No genuine one-minute Quotex history arrived within 10 seconds. Keep the selected trade chart open and connected, then retry; at least " + minNeeded + " bars are required.";
+        return { results: [], count: 0, liveOnly: true, error };
       }
       o.assets = liveAssets;
       o.cachedByAsset = cachedByAsset;
