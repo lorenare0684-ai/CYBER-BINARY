@@ -331,7 +331,10 @@
         if (raw < 1) {
           return { ok: false, reason: `Balance too low for percent staking (${ctx.account.balance.toFixed(2)} at ${pct}% = ${raw.toFixed(2)}; minimum stake is 1)` };
         }
-        const computed = Math.min(ctx.account.balance, raw);
+        // Clamp to the executor's stake ceiling so the controller never
+        // submits an order it already knows will be refused (percent mode on
+        // a huge balance would otherwise compute multi-billion stakes).
+        const computed = Math.min(ctx.account.balance, raw, 1000000);
         s = Object.assign({}, s, { stake: Math.round(computed * 100) / 100 });
       }
       return { ok: true, settings: s };

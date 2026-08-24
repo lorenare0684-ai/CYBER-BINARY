@@ -4,6 +4,14 @@ Chrome extension (Manifest V3) that attaches to a Quotex / QX Broker chart, buil
 
 > Live signal analysis and explicitly armed automated execution for Quotex. This third-party tool can place real trades. Binary options are high risk, losses can quickly outweigh returns, and no result or profit is guaranteed.
 
+## What's new in v2.6.11 — Bug Sweep: New Surfaces Under Adversarial Load
+
+- Audited the previously unreviewed files (background.js ownership/patch plumbing, workers.js pool, historic-worker lifecycle — all sound; the worker's one-shot message guard matches its create-per-chunk consumer).
+- **Percent-stake ceiling**: percent mode on a huge balance (e.g. 1e12 at 2% = 20 billion) computed stakes the executor's own 1,000,000 cap would refuse — fail-safe but a wasted cycle and error log. The controller now clamps to the same ceiling before submitting.
+- New adversarial suite `tools/guard-fuzz.js` (10 probes) targeting the v2.6.9/v2.6.10 surfaces the older fuzz predates: hostile `setAccountInfo` payloads (symbols, NaN, prototypes, giant numbers), NaN/negative/hostile settings keys, percent stakes at extreme balances, and hostile feed timestamps (NaN/Infinity/microsecond epochs) — all fail closed, none throw, no wedged controllers.
+
+Full suite green (15 tools); baseline 57.03% and accuracy 97.13% unchanged.
+
 ## What's new in v2.6.10 — Critical Bug Fixes (post-v2.6.9 audit)
 
 Four real defects found in the newest code, all fixed and regression-locked:
