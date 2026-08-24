@@ -138,6 +138,7 @@
   const lastDomPriceByAsset = Object.create(null);
   const lastVirtualBarByAsset = Object.create(null);
   const lastAutoBarByAsset = Object.create(null);
+  let lastAutoSkipLog = 0; // v2.7.6: throttle auto-skip log messages
   let activeAsset = "EURUSD";
   let lastWsPrice = null;
   let lastWsTickAt = 0;
@@ -929,6 +930,8 @@
       autoController = AUTO.startAuto({
         config: s,
         executeTrade: placeTrade,
+        // v2.7.6: live candle cache for the autoHighAccuracy gate
+        get candlesByAsset() { return liveCandlesByAsset; },
         notifyDesktop: function (signal) {
           try {
             chrome.runtime.sendMessage({
@@ -1152,7 +1155,14 @@
     }
     if (useForEngine) realBarCount[id] = feed.series().length;
     if (useForEngine && feed.series().length >= 2) persistLiveCandles(id, true);
-    if (useForEngine && feed.series().length >= 40) realHistoryReady[id] = true;
+    // v2.7.6: reduced from 40 to 20 bars. 40 was excessive — the engine needs
+    // ~50 bars for indicators to warm up (handled by minBars in analyze()),
+    // but realHistoryReady gates auto-trade EXECUTION, not signal generation.
+    // Signals already require 40+ candles internally; this gate just confirms
+    // the feed has genuine broker data. 20 bars is enough to confirm the
+    // asset is receiving real data while not blocking auto-trade for 40+
+    // minutes after an asset switch.
+    if (useForEngine && feed.series().length >= 20) realHistoryReady[id] = true;
     const newestRealTime = real[real.length - 1].time;
     // v2.6.5: the upper bound tolerates broker-server clock skew (old bound
     // was +1 minute, which made "live" detection fail whenever the server
@@ -1489,12 +1499,37 @@
     // A signal is handed to auto once per closed bar and only by the browser
     // tab selected as primary in background.js. Other open Quotex charts can
     // collect data, but can never place duplicate trades.
-    if (isPrimaryContext && authoritativeMain && realHistoryReady[activeAsset] && liveClosedBar &&
+    // v2.7.6: relaxed the authoritativeMain gate — when manualAsset is set
+    // (dashboard-initiated switch), the WebSocket symbol may lag behind the
+    // active asset by a few seconds. Requiring exact match blocked auto-trade
+    // during the entire transition. Accept the signal when the feed has real
+    // data for the active asset regardless of the WS symbol lag.
+    const autoAuthoritative = authoritativeMain ||
+      (manualAsset && lastWsSymbol && QUOTEX && realHistoryReady[activeAsset]);
+    if (isPrimaryContext && autoAuthoritative && realHistoryReady[activeAsset] && liveClosedBar &&
         autoController && sig && sig.ready && sig.direction !== "WAIT") {
       const autoKey = String(sig.time || 0);
       if (autoKey !== lastAutoBarByAsset[sig.asset]) {
         lastAutoBarByAsset[sig.asset] = autoKey;
         try { autoController.handleSignal(sig); } catch (_) {}
+      }
+    } else if (isPrimaryContext && autoController && sig && sig.ready &&
+               sig.direction !== "WAIT" && !autoAuthoritative) {
+      // v2.7.6: log why auto-trade was skipped so users can debug
+      const reason = !realHistoryReady[activeAsset]
+        ? "waiting for broker history (need 20+ real candles)"
+        : !liveClosedBar
+          ? "no recently closed bar"
+          : "chart asset not confirmed";
+      if (Date.now() - (lastAutoSkipLog || 0) > 30000) {
+        lastAutoSkipLog = Date.now();
+        try {
+          window.postMessage({
+            source: _SRC_OUT,
+            kind: "auto_log",
+            payload: { level: "skip", msg: `Auto-trade skipped: ${reason}`, at: Date.now() },
+          }, "*");
+        } catch (_) {}
       }
     }
   }

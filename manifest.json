@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "CYBER BINARY \u2014 Quotex Trading Automation",
-  "version": "2.7.5",
-  "description": "v2.7.5: Fixed arrows not appearing on Quotex chart — deferred marker replay, periodic re-push, expanded chart detection.",
+  "version": "2.7.6",
+  "description": "v2.7.6: Fixed auto-trading not executing trades — 5 critical bugs fixed: history gate, account mode, cooldown, high-accuracy gate, chart authority check.",
   "permissions": [
     "storage",
     "windows",
