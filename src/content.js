@@ -34,6 +34,34 @@
   window.__CYBER_BINARY__ = true;
 
   const TF_MS = 60000;
+  // The signal engine is intentionally 1m, while the dashboard chart may be
+  // any broker timeframe. Keep this contract explicit so a chart switch can
+  // never silently change the signal clock or expiry math.
+  const ENGINE_TIMEFRAME_SEC = 60;
+
+  function marketSession(ts, assetId) {
+    const id = String(assetId || "").toUpperCase();
+    if (/_OTC$/.test(id) || /CRYPTO|BTC|ETH|XRP|SOL|DOGE/.test(id)) return "otc-24h";
+    const d = new Date(Number(ts) || Date.now());
+    const mins = d.getUTCHours() * 60 + d.getUTCMinutes();
+    if (mins >= 22 * 60 || mins < 7 * 60) return "asia-pacific";
+    if (mins >= 7 * 60 && mins < 13 * 60) return "europe";
+    if (mins >= 13 * 60 && mins < 17 * 60) return "overlap";
+    return "new-york";
+  }
+
+  function noiseScore(candles) {
+    if (!Array.isArray(candles) || candles.length < 8) return 0;
+    const tail = candles.slice(-12);
+    let flips = 0, moves = 0, prev = 0;
+    for (let i = 1; i < tail.length; i++) {
+      const a = Number(tail[i - 1].close), b = Number(tail[i].close);
+      const dir = b > a ? 1 : b < a ? -1 : 0;
+      if (dir && prev && dir !== prev) flips++;
+      if (dir) { moves++; prev = dir; }
+    }
+    return moves ? flips / Math.max(1, moves - 1) : 1;
+  }
   const PRICE_RE = /(?:\d{1,8}(?:[.,]\d{1,8})?)/;
   const ASSETS = self.CYBER_ASSETS;
   const STORE = self.CYBER_STORE;
@@ -601,7 +629,10 @@
     if (!periods) return null;
     let selected = null;
     if (periods[lastWsPeriod] && periods[lastWsPeriod].candles.length) selected = periods[lastWsPeriod];
-    else if (periods[60] && periods[60].candles.length) selected = periods[60];
+    // Never fall back to 1m after the broker switches timeframe. Showing an
+    // older period here is the source of deceptive "1m" candles. Wait for
+    // the matching broker batch instead.
+    else if (lastWsPeriod != null) return null;
     else {
       for (const p in periods) {
         const item = periods[p];
@@ -892,7 +923,7 @@
     const selectedTime = selectedTick && QUOTEX && typeof QUOTEX.toMs === "function"
       ? QUOTEX.toMs(selectedTick.time) : null;
     if (Number.isFinite(selectedPrice) && selectedPrice > 0 && selectedPrice <= 1e12 &&
-        Number.isSafeInteger(selectedTime) && Date.now() - selectedTime >= 0 && Date.now() - selectedTime <= 15000) {
+        Number.isSafeInteger(selectedTime) && Math.abs(Date.now() - selectedTime) <= 120000) {
       lastWsPrice = selectedPrice;
       lastWsTickAt = Date.now();
     }
@@ -925,7 +956,7 @@
     // Only remove the final bar when the feed actually has an in-progress
     // candle. forceClose() can leave an all-closed series; blindly slicing it
     // then delayed every signal by one extra bar.
-    if (full.length > 1 && (!activeFeed.hasCurrent || activeFeed.hasCurrent())) a = full.slice(0, -1);
+    if (full.length > 1 && activeFeed.hasCurrent && activeFeed.hasCurrent()) a = full.slice(0, -1);
     if (a.length < 2) a = full;
     const closed = a.length ? a[a.length - 1] : null;
     const analysisKey = activeAsset + ":" + currentStrategy + ":" +
@@ -962,6 +993,21 @@
         }
         sig.reason = liveGate.reason;
       }
+      // Noise/session safety: do not manufacture a CALL/PUT during a
+      // direction-flipping chop. Session is derived from the broker candle
+      // clock (UTC), not the dashboard machine clock.
+      const session = marketSession(closed && closed.time, activeAsset);
+      const noise = noiseScore(a);
+      if (sig.direction !== "WAIT" && noise >= 0.78 && session !== "overlap") {
+        sig.gateReason = "noise-filter";
+        sig.direction = "WAIT";
+        sig.ready = false;
+        sig.confidence = 0;
+        sig.reason = "Noise filter (rapid direction flips; session " + session + ")";
+      }
+      sig.session = session;
+      sig.noiseScore = noise;
+      sig.engineTimeframeSec = ENGINE_TIMEFRAME_SEC;
       if (closed && closed.time != null) {
         sig.time = closed.time;
         // Signals are decided at the close of this 1m bar, not its open.
@@ -1088,9 +1134,11 @@
     const total = stats.wins + stats.losses;
     const chart = chartForActiveAsset();
     const feedSeries = activeFeed.series().slice(-220);
+    // Display only candles matching the broker's currently selected period.
+    // Do not substitute the 1m engine feed while a new timeframe is loading.
     const chartSeries = (chart && Array.isArray(chart.candles) && chart.candles.length)
       ? chart.candles.slice(-220)
-      : feedSeries;
+      : [];
     const payload = {
       attached: true,
       primary: isPrimaryContext,
@@ -1103,6 +1151,9 @@
       // every accepted Quotex tick instead of waiting for a history refresh.
       chartCandles: chartSeries,
       chartPeriod: chart ? chart.period : 60,
+      chartTimeBasis: "broker-utc",
+      engineTimeframeSec: ENGINE_TIMEFRAME_SEC,
+      session: latestStateSignal && latestStateSignal.session ? latestStateSignal.session : marketSession(Date.now(), activeAsset),
       // Allows the dashboard backtester to consume the already-delivered
       // genuine 1m series directly while the storage write is still settling.
       // Synthetic warm-up bars must never be presented as broker history.

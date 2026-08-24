@@ -711,7 +711,7 @@
       };
       timing.textContent = tradeTimeline(currentCall, !!(currentCall.exit != null || currentCall.exitPrice != null));
     }
-    $("regime-row").textContent = "regime: " + (sig.regime || "—") + " · mtf bias: " + ((sig.metrics && sig.metrics.mtfBias) || 0) + "/" + ((sig.metrics && sig.metrics.mtfChecked) || 0);
+    $("regime-row").textContent = "regime: " + (sig.regime || "—") + " · session: " + (sig.session || state.session || "—") + " · engine: 1m · mtf bias: " + ((sig.metrics && sig.metrics.mtfBias) || 0) + "/" + ((sig.metrics && sig.metrics.mtfChecked) || 0);
 
     // Auto-Adaptive Cockpit UI Update
     const adaptiveCard = $("adaptive-card");
@@ -836,7 +836,7 @@
     if (nextChartKey !== lastChartKey) {
       lastChartKey = nextChartKey;
       lastChartCandles = chartCandles.slice(-500);
-      lastChartMeta = { timeframe: tfLabel(state.chartPeriod || 60), markers };
+      lastChartMeta = { timeframe: tfLabel(state.chartPeriod || 60), markers, timeBasis: state.chartTimeBasis || "broker-utc" };
       drawChart($("chart"), lastChartCandles, lastChartMeta);
     }
     const demoBadge = $("chart-demo-badge");
