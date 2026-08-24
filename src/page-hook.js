@@ -6,7 +6,7 @@
  *   - tools/page-hook.shell.js (MAIN-world WebSocket hook shell)
  *
  * Rebuild after any change to either source file.
- * Generated: 2026-08-24T03:11:36.619Z
+ * Generated: 2026-08-24T05:58:54.842Z
  */
 /* ====================================================================
  * Inlined CYBER_QUOTEX adapter (src/lib/quotex.js).
@@ -314,12 +314,22 @@
       }
       return { type: "unknown", raw: s.length > 240 ? s.slice(0, 240) + "…" : s };
     }
-    // 43<ackId>["event", payload] — Socket.IO acknowledgement packet.
+    // 43<ackId>[...] — Socket.IO acknowledgement packet.
+    //   Two wire shapes exist on Quotex builds:
+    //     a) 43["event", payload] — headered variant, decoded like a 42 event;
+    //     b) 43<ackId>[{order…}]  — a plain ACK body answering an emit that
+    //        carried a callback id. The broker's `orders/open` confirmation
+    //        arrives in this shape, so the whole array is the payload here.
     if (s.indexOf("43") === 0) {
       var ackPacket = socketArrayPacket(s, 2);
       var ack2 = ackPacket && ackPacket.array;
       if (Array.isArray(ack2) && ack2.length >= 1) {
-        return { type: "sio", ack: true, event: String(ack2[0] || ""), payload: ack2.length > 1 ? ack2[1] : null,
+        if (typeof ack2[0] === "string") {
+          return { type: "sio", ack: true, event: String(ack2[0] || ""), payload: ack2.length > 1 ? ack2[1] : null,
+            namespace: ackPacket.namespace, id: ackPacket.id, raw: s };
+        }
+        return { type: "sio", ack: true, event: null, ackBody: true,
+          payload: ack2.length === 1 ? ack2[0] : ack2,
           namespace: ackPacket.namespace, id: ackPacket.id, raw: s };
       }
       return { type: "unknown", raw: s.length > 240 ? s.slice(0, 240) + "…" : s };
@@ -1732,6 +1742,73 @@
     return (Math.floor(nowSec / 60) + minutes + extra) * 60;
   }
 
+  /* ------------------------------------------------------------------
+   * Socket.IO acknowledgement registry.
+   *
+   * `orders/open` is answered by the broker on the emit's callback channel
+   * (`43<ackId>[{order…}]`), and that ACK — not the account-wide
+   * `s_orders/open` push — is the only frame that carries our own
+   * correlation id. Emitting without a callback id means the server never
+   * answers, so every automated trade ended in "broker order confirmation
+   * timeout" even when the order was live on the platform.
+   * ------------------------------------------------------------------ */
+  var PENDING_ACKS = Object.create(null);
+  var pendingAckOrder = [];
+  var nextAckSeq = 1;
+
+  function registerOrderAck(requestId, meta) {
+    // Socket.IO ack ids are per-socket counter integers; keep ours numeric
+    // and far from the page client's own low counters.
+    var ackId = 900000 + (nextAckSeq++ % 90000);
+    meta = meta && typeof meta === "object" ? meta : {};
+    PENDING_ACKS[ackId] = {
+      requestId: String(requestId == null ? "" : requestId),
+      asset: typeof meta.asset === "string" ? meta.asset : "",
+      dir: meta.dir === "PUT" ? "PUT" : (meta.dir === "CALL" ? "CALL" : ""),
+      amount: numberValue(meta.amount) != null ? numberValue(meta.amount) : 0,
+      expirySec: numberValue(meta.expirySec) != null ? numberValue(meta.expirySec) : 0,
+      at: Date.now(),
+    };
+    pendingAckOrder.push(ackId);
+    while (pendingAckOrder.length > 64) delete PENDING_ACKS[pendingAckOrder.shift()];
+    // A callback that is never answered must not linger forever.
+    var staleBefore = Date.now() - 120000;
+    for (var i = pendingAckOrder.length - 1; i >= 0; i--) {
+      var entry = PENDING_ACKS[pendingAckOrder[i]];
+      if (entry && entry.at < staleBefore) {
+        delete PENDING_ACKS[pendingAckOrder[i]];
+        pendingAckOrder.splice(i, 1);
+      }
+    }
+    return ackId;
+  }
+
+  function takeOrderAck(ackId) {
+    var key = String(ackId == null ? "" : ackId);
+    if (!key || !PENDING_ACKS[key]) return null;
+    var entry = PENDING_ACKS[key];
+    delete PENDING_ACKS[key];
+    var at = pendingAckOrder.indexOf(Number(key));
+    if (at >= 0) pendingAckOrder.splice(at, 1);
+    return entry;
+  }
+
+  /** Text of a broker-side rejection carried in an ACK body, or null. */
+  function ackErrorText(body) {
+    if (!body || typeof body !== "object" || Array.isArray(body)) return null;
+    var explicit = body.error != null ? body.error
+      : (body.message != null ? body.message
+        : (body.reason != null ? body.reason : null));
+    var text = explicit != null ? String(explicit) : "";
+    var failed = body.success === false || body.ok === false ||
+      String(body.status || "").toLowerCase() === "error" ||
+      String(body.result || "").toLowerCase() === "error";
+    if (!text && !failed) return null;
+    // A successful order ACK also has prices/ids; never read those as errors.
+    if (!text && (body.openPrice != null || body.id != null)) return null;
+    return (text || "broker rejected the order").slice(0, 240);
+  }
+
   // The `orders/open` payload the server expects. OTC contracts use a duration
   // in seconds with optionType=100. Regular-market contracts use an absolute
   // unix expiry with optionType=1. The old implementation sent duration+type1
@@ -1798,10 +1875,18 @@
     try {
       var payload = buildOrderPayload(args);
       // Send `tick` + `instruments/follow` then `orders/open` — this is the
-      // exact sequence the page uses when the user clicks.
+      // exact sequence the page uses when the user clicks. The orders/open
+      // frame carries a Socket.IO callback id so the broker answers on the
+      // ACK channel; that answer is the authoritative confirmation.
       try { ws.send('42["tick"]'); } catch (_) {}
       try { ws.send('42["instruments/follow","' + payload.asset + '"]'); } catch (_) {}
-      var msg = '42["orders/open",' + JSON.stringify(payload) + ']';
+      var ackId = registerOrderAck(payload.requestId, {
+        asset: payload.asset,
+        dir: payload.action === "put" ? "PUT" : "CALL",
+        amount: payload.amount,
+        expirySec: payload.optionType === 100 ? payload.time : 0,
+      });
+      var msg = '42' + ackId + '["orders/open",' + JSON.stringify(payload) + ']';
       ws.send(msg);
       return {
         ok: true,
@@ -1810,6 +1895,7 @@
         mode: "ws",
         id: String(payload.requestId),
         requestId: String(payload.requestId),
+        ackId: ackId,
         dir: payload.action === "put" ? "PUT" : "CALL",
         asset: payload.asset,
         amount: payload.amount,
@@ -1857,6 +1943,7 @@
       instruments: handlers.onInstruments || function () {},
       balance:   handlers.onBalance   || function () {},
       order:     handlers.onOrder     || function () {},
+      orderError: handlers.onOrderError || function () {},
       frame:     handlers.onFrame     || function () {},
       asset:     handlers.onAsset     || function () {},
     };
@@ -1928,6 +2015,72 @@
         if (!oo) continue;
         try { listeners.order({ kind: "opened", data: oo }); } catch (_) {}
         feed("order_opened", oo, null);
+      }
+    }
+
+    /**
+     * Socket.IO ACK answering one of our own emits. `orders/open` replies on
+     * this channel with the opened deal (or a rejection), and the ack id is
+     * the only value that ties the answer back to the request the extension
+     * is waiting on — the account-wide `s_orders/open` push carries no
+     * client correlation id at all.
+     */
+    function emitOrderAck(frame) {
+      var pending = frame && frame.id != null ? takeOrderAck(frame.id) : null;
+      var requestId = pending ? pending.requestId : null;
+      var body = frame ? frame.payload : null;
+      var failure = ackErrorText(body);
+      if (failure) {
+        try { listeners.orderError({ requestId: requestId, error: failure }); } catch (_) {}
+        feed("order_error", { requestId: requestId, error: failure }, frame || null);
+        return;
+      }
+      var rows = Array.isArray(body) ? body
+        : (body && Array.isArray(body.orders) ? body.orders
+          : (body && Array.isArray(body.deals) ? body.deals : [body]));
+      // Only a single-row ACK can be attributed to our request with certainty.
+      var attributable = !!(requestId && pending && rows.length === 1 && rows[0] &&
+        typeof rows[0] === "object" && !Array.isArray(rows[0]));
+      for (var ai = 0; ai < rows.length && ai < 100; ai++) {
+        var row = rows[ai];
+        if (attributable && ai === 0) {
+          var enriched = {};
+          for (var ak in row) {
+            if (Object.prototype.hasOwnProperty.call(row, ak) && ak !== "__proto__") enriched[ak] = row[ak];
+          }
+          enriched.requestId = row.requestId != null ? row.requestId : requestId;
+          row = enriched;
+        }
+        var ao = parseOrderOpened(row);
+        if (!ao && attributable && ai === 0) {
+          // A bare `{"id":…}` / `{"success":true}` ACK still confirms the
+          // order we sent; fall back to the values of that request.
+          ao = {
+            id: row && row.id != null ? String(row.id).slice(0, 128) : "",
+            requestId: requestId,
+            asset: pending.asset,
+            amount: pending.amount,
+            direction: pending.dir || null,
+            openPrice: 0,
+            openTime: null,
+            closeTime: null,
+            expiryTime: null,
+            duration: pending.expirySec || 0,
+            status: "OPEN",
+          };
+        }
+        if (!ao) continue;
+        if (!ao.requestId && attributable && ai === 0) ao.requestId = requestId;
+        // Fill the fields the broker omits on the ACK from the request that
+        // the ack id proves this answer belongs to.
+        if (attributable && ai === 0) {
+          if (!ao.asset && pending.asset) ao.asset = pending.asset;
+          if (!ao.amount && pending.amount) ao.amount = pending.amount;
+          if (!ao.direction && pending.dir) ao.direction = pending.dir;
+          if (!ao.duration && pending.expirySec) ao.duration = pending.expirySec;
+        }
+        try { listeners.order({ kind: "opened", data: ao }); } catch (_) {}
+        feed("order_opened", ao, frame || null);
       }
     }
 
@@ -2005,11 +2158,28 @@
       }
       // Text Socket.IO event / ACK packet
       if (frame.type === "sio") {
+        // ACK bodies answer one of our own emits (orders/open confirmation).
+        // They have no event name, so they must be routed before the
+        // event-name mapping below would drop them as "unknown".
+        if (frame.ackBody) {
+          emitOrderAck(frame);
+          return;
+        }
         var ev3 = mapEventName(frame.event);
         if (ev3 === "authenticated") {
           try { listeners.status({ state: "authenticated" }); } catch (_) {}
-        } else if (ev3 === "s_authorization") {
-          try { listeners.status({ state: "authenticated" }); } catch (_) {}
+          // The authorization frame doubles as the account snapshot: Quotex
+          // sends {uid, balance, isDemo, currency} here, and for many sessions
+          // it is the ONLY balance frame that ever arrives. Treating it as a
+          // status ping discarded that balance and left the account line stuck
+          // on "waiting for a balance event" even though the broker had already
+          // reported the balance.
+          // (mapEventName maps "s_authorization" -> "authenticated", so this is
+          // the only branch that frame can reach.)
+          if (frame.payload && typeof frame.payload === "object" &&
+              inferEventFromPayload(frame.payload) === "balance") {
+            emitBalance(frame.payload);
+          }
         } else if (ev3 === "balance") {
           emitBalance(frame.payload);
         } else if (ev3 === "instruments") {
@@ -2481,6 +2651,16 @@
     onBalance: function (b) {
       live.balance = b;
       emit("balance", b);
+    },
+    onOrderError: function (e) {
+      // Broker-side rejection of one of our own `orders/open` emits. Surfacing
+      // it lets the extension report the real reason instead of waiting out
+      // the confirmation timeout.
+      if (!e || typeof e !== "object") return;
+      emit("order_error", {
+        requestId: e.requestId != null ? String(e.requestId).slice(0, 128) : null,
+        error: String(e.error || "broker rejected the order").slice(0, 240),
+      });
     },
     onOrder: function (e) {
       if (!e || typeof e !== "object") return;

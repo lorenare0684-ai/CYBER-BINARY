@@ -159,6 +159,16 @@
       live.balance = b;
       emit("balance", b);
     },
+    onOrderError: function (e) {
+      // Broker-side rejection of one of our own `orders/open` emits. Surfacing
+      // it lets the extension report the real reason instead of waiting out
+      // the confirmation timeout.
+      if (!e || typeof e !== "object") return;
+      emit("order_error", {
+        requestId: e.requestId != null ? String(e.requestId).slice(0, 128) : null,
+        error: String(e.error || "broker rejected the order").slice(0, 240),
+      });
+    },
     onOrder: function (e) {
       if (!e || typeof e !== "object") return;
       var data = e.data && typeof e.data === "object" ? e.data : {};

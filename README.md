@@ -4,6 +4,44 @@ Chrome extension (Manifest V3) that attaches to a Quotex / QX Broker chart, buil
 
 > Live signal analysis and explicitly armed automated execution for Quotex. This third-party tool can place real trades. Binary options are high risk, losses can quickly outweigh returns, and no result or profit is guaranteed.
 
+## What's new in v2.6.16 — Auto-Adaptive Router Now Uses Recorded Accuracy
+
+**The bug (user-reported)**: the auto-adaptive strategy system "uses realtime data only and does not choose the best strategy based on historical and live data".
+
+**Root cause — the accuracy term was dead code.** `evaluateAdaptive()` has always had a `strategyWinrates` term in its fitness function, but **nothing in the codebase ever supplied that key** — all four references were reads. So the bonus was permanently `0` and the router picked purely on the current bar's regime + confidence: realtime data only, exactly as reported.
+
+Two further defects would have kept it dead even once wired:
+
+1. **No strategy ever accumulated a record.** Settled outcomes were bucketed under `currentStrategy`, which under auto-adaptive is the literal `"auto_adaptive"` — not the strategy the router actually chose. Every adaptive trade updated one useless key.
+2. **Accuracy could only ever help.** The bonus applied only when `wr > 50`, so a strategy that had been losing steadily scored *exactly* the same as one with no record at all. A router that cannot demote a loser is not selecting on accuracy.
+
+**The fixes**:
+- **Outcomes are attributed to the selected strategy.** A pending entry now records `sig.selectedStrategy` (the concrete strategy the router picked) instead of `"auto_adaptive"`, so each strategy builds its own win/loss record.
+- **`strategyWinrates()` computes the track record** from `stats.byStrategy` — historical rows restored from storage *and* live rows from this session, since `applyStoredStats()` merges stored rows into the same map every settled trade bumps. Small samples are shrunk toward 50% with a Beta(5,5) prior so one lucky trade cannot make a strategy look unbeatable, strategies with fewer than 10 decided trades are omitted rather than guessed at, and draws are excluded (a refunded trade is not an outcome).
+- **The bonus is now symmetric and bounded** in both router paths (`evaluateAdaptive` and `evaluateAdaptiveLeanAt`): a strong record lifts a strategy, a weak one demotes it. Gain and clamp were measured, not guessed — at the first cut's gain 0.5 the bonus moved the pick on only **32%** of bars even when the leader held a 20% record against challengers on 70%, and its ±25 clamp *never bound* (the Beta shrinkage already caps the bonus at |24.5|), so it was dead code rather than a safety limit. At gain **1.5** with a **±50** clamp the bonus decides **85%** of those bars, the clamp genuinely binds (|bonus| reaches 73.5 before clamping), and ±50 is the widest clamp that still guarantees a strategy which **abstains** on the current bar can never be picked on history alone — 0 violations across 100 asset/seed scenarios at ±50, 17 at ±75. Confluence still decides *whether* to trade; accuracy decides *which* strategy trades.
+- Only the live router is fed the map. The backtester still calls `ENG.backtest()` without it, so published baselines are not retro-fitted with future results.
+
+Locked by 3 new checks in `tools/trade-confirm.js` (the router really receives the recorded map, a strong strategy outranks a weak one, small samples are shrunk not reported raw) and 6 in `tools/adaptive-test.js` (accuracy lifts and demotes fitness, comparable candidates are re-ranked, the bonus is bounded, and omitting the map leaves fitness byte-identical). Run against v2.6.15 they fail 3 and 1 checks respectively. Full suite green (18 tools).
+
+## What's new in v2.6.15 — Critical Fix: Broker Confirmation + Chart Alignment
+
+**The bugs (user-reported)**: every automated trade logged `ERROR Trade not confirmed: broker order confirmation timeout`, and the dashboard chart still did not match the Quotex candles.
+
+**Root cause 1 — the confirmation was never received.** `orders/open` was emitted as `42["orders/open",{…}]`, i.e. *without a Socket.IO callback id*, so the broker had no channel to answer on. The one frame that does answer — the ACK `43<ackId>[{order…}]` — was also mis-decoded: the decoder read the ACK body as an event name (`String({…})` → `"[object Object]"`) and dropped it as `unknown`. Result: `waitForBrokerOrder()` could only ever run out its 8s timer, even for orders that were live on the platform.
+
+**Root cause 2 — the dashboard drew a different series than the platform.** For 1m the chart was built purely from broker history batches, so it froze at the last response while Quotex kept drawing the forming candle. For 5m/15m the opposite happened: every resampled tick-built bucket *overwrote* the broker's own candle, so the whole series disagreed. And the time axis was labelled with `toLocaleTimeString()`, i.e. the machine's zone, while the Quotex chart is UTC — every candle looked shifted by the UTC offset.
+
+**The fixes**:
+- **ACK-correlated confirmation**: `placeTradeWs()` now sends `42<ackId>["orders/open",…]` and registers the ack id against the request; `decodeFrame()` returns a real ACK body for `43<ackId>[{…}]` (the headered `43["event",{…}]` variant still decodes as an event); the router attributes the ACK to the request that sent it and emits an `opened` order carrying **our** requestId. A minimal ACK (`{"id":…}`) still confirms, filled from the registered request.
+- **Real rejection reasons**: an error ACK is surfaced as `order_error` → the automation log shows the broker's own text ("Not enough funds") instead of a generic timeout, and the dashboard pill flags the rejection for 60s.
+- **Second confirmation source**: a strictly matching account order-open push (asset + direction + amount, 10s window) now confirms a WS placement too, for broker builds that never echo the client requestId. Both waiters are always released — a superseded waiter can never look "unsent" and trigger a duplicate DOM click.
+- **Chart = broker candles + live forming bar**: closed buckets are never rewritten; only the newest, still-open bucket follows the tick feed, on every timeframe (1m included). The axis is labelled UTC and the header states the basis and the newest candle time (`… · last 09:47 UTC`).
+- **`Account: unknown — waiting for a balance event`**: two independent defects. Quotex reports `{uid, balance, isDemo, currency}` inside the `s_authorization` frame — often the only balance frame a session ever gets — and `mapEventName` routes that frame to `authenticated`, so the status branch swallowed the balance. Separately, the dashboard's documented fallback ("falls back to the extension state's last balance event") read a top-level `state.balance` that `content.js` has never written; it only ever nests the account under `quotex`. The authorization frame now also yields the balance when it carries account fields, and the dashboard reads the account from where it is actually put.
+- **A stale or partial load now says so**: a library that failed to load used to surface as a cryptic `ReferenceError` / `Cannot read properties of undefined` thrown from deep inside an event handler, with nothing pointing at the `<script>` that never ran. The dashboard now checks its required globals up front, names the missing one on screen, and stamps the loaded build version (`v2.6.15`) in the header — so a stale unpacked-extension directory is obvious instead of looking like a bug in the code. `workers.js` stays optional (it has a synchronous fallback).
+- **Timeframe switch pulls its own history**: the history subscription was hard-coded to `period: 60` and keyed per asset, so after switching the platform to 5m/15m — or when attaching to a chart already on that timeframe — nothing ever asked the broker for it and the dashboard sat on "Waiting for candles…". Requests are now per asset **and** timeframe (1m for the engine, the visible period for the chart, smaller row cap, stale-batch refresh), and a failed subscription releases only its own slot.
+
+Locked by 3 new suites — `tools/trade-confirm.js` (35 checks: ACK wire format, correlation, rejection text, un-correlated confirmation, fail-closed timeout, timeframe-scoped history request, authorization-frame balance, 1m/5m chart alignment), `tools/hook-confirm.js` (12 checks: the GENERATED `src/page-hook.js` bundle, driving `place_ws` → socket frame → broker ACK → `order`/`order_error` back to the content script) and `tools/dashboard-chart.js` (12 checks: real render path under TZ=Asia/Kolkata, the account line, plus the startup guard and build stamp). Run against v2.6.14 they fail 21, 5 and 7 checks respectively, including the exact reported symptoms. Full suite green (21 tools); baselines unchanged.
+
 ## What's new in v2.6.14 — Critical Fix: Floating Arrows on the Platform Chart
 
 **The bug (user-reported)**: on the Quotex site, signal arrows were not attached to candles — they stayed frozen in place while the chart was panned/zoomed, "floating on screen".
@@ -269,6 +307,9 @@ node tools/adaptive-test.js          # auto-adaptive strategy & high-accuracy as
 node tools/backtest.js              # legacy single-asset backtest
 node tools/historic.js              # full matrix across 170+ assets × strategies
 node tools/search.js                # bounded parameter grid search
+node tools/trade-confirm.js         # broker ACK confirmation + chart alignment
+node tools/hook-confirm.js          # MAIN-world bundle: place_ws → ACK → order event
+node tools/dashboard-chart.js       # dashboard chart renders the broker's UTC candles
 ```
 
 ## Project layout
@@ -292,6 +333,9 @@ src/lib/workers.js       # parallel backtest (Node worker_threads, browser chunk
 src/lib/quotex.js        # Socket.IO v3 adapter, asset catalog, placeTrade
 icons/
 tools/adaptive-test.js   # v2.6: test suite for adaptive strategies & assets
+tools/trade-confirm.js   # v2.6.15: orders/open ACK correlation + chart series
+tools/hook-confirm.js    # v2.6.15: generated page-hook round trip (socket → ACK)
+tools/dashboard-chart.js # v2.6.15: chart axis/basis under a non-UTC machine zone
 ```
 
 **Live-trading notice.** This is a third-party Quotex signal and automation client. Explicitly armed click mode can place real orders. Binary options have a built-in payout edge against the trader (most brokers require more than 50% wins to break even), so no signal, backtest, or automation result is a profit guarantee. Automation remains off and disarmed by default.

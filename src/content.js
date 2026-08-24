@@ -115,11 +115,12 @@
   let lastOrders = [];
   const pendingWs = Object.create(null);       // page-hook send ack requestId -> resolver
   const pendingHistory = Object.create(null);  // page-hook history-subscription requestId -> resolver
+  const pendingHistoryMeta = Object.create(null); // requestId -> {asset, period} for retry bookkeeping
   let historyRequestSequence = 0;
   const pendingOrders = Object.create(null);   // broker order-open requestId -> resolver
   const settledOrderIds = Object.create(null); // de-dupe broker close replays
   const settledOrderQueue = [];
-  let pendingDomOrder = null;                  // conservative single DOM fallback waiter
+  let pendingOrderEvent = null;                // single broker-order-event fallback waiter
   let placementInFlight = false;               // serialize auto/manual placement paths
   let hudArmPending = false;                    // debounce the explicit HUD arm gesture
   let tickSignalQueued = false;                 // coalesce per-tick dashboard refreshes
@@ -489,6 +490,40 @@
     catch (_) {}
   }
 
+  /** Per-strategy win rate (percent) from settled outcomes — historical
+   * (restored from storage) and live (this session) combined, because
+   * applyStoredStats() merges stored rows into stats.byStrategy and every
+   * settled trade bumps the same map.
+   *
+   * The adaptive router's fitness function has always had a `strategyWinrates`
+   * term, but nothing ever supplied it, so that term was permanently zero and
+   * the router picked purely on the current bar's regime + confidence —
+   * realtime data only. This is the missing input.
+   *
+   * Small samples are shrunk toward 50% (a Beta(5,5) prior) so one lucky trade
+   * cannot make a strategy look unbeatable, and strategies with fewer than
+   * `minSettled` decided trades are omitted rather than guessed at. Draws are
+   * excluded: a refunded trade is not an outcome. */
+  function strategyWinrates(minSettled) {
+    const out = Object.create(null);
+    const src = stats.byStrategy;
+    if (!src || typeof src !== "object") return out;
+    const rawFloor = Number(minSettled);
+    const floor = Number.isFinite(rawFloor) && rawFloor > 0 ? Math.floor(rawFloor) : 10;
+    const PRIOR = 10; // pseudo-observations at 50%
+    for (const id of Object.keys(src)) {
+      const row = src[id];
+      if (!row || typeof row !== "object") continue;
+      const w = Math.max(0, Math.floor(Number(row.w) || 0));
+      const l = Math.max(0, Math.floor(Number(row.l) || 0));
+      const settled = w + l;
+      if (settled < floor) continue;
+      const wr = ((w + PRIOR * 0.5) / (settled + PRIOR)) * 100;
+      if (Number.isFinite(wr)) out[String(id).slice(0, 64)] = Math.round(wr * 10) / 10;
+    }
+    return out;
+  }
+
   /** Push the active asset's markers plus bars from the SAME timeframe shown
    *  by Quotex. Sending 1m bars while the platform displayed 5m/15m made the
    *  overlay project arrows into the wrong horizontal slots. */
@@ -641,27 +676,63 @@
     }
     if (!selected) return null;
 
-    // Quotex sends higher-timeframe history only occasionally, while the 1m
-    // feed receives every live tick. Without this merge a 5m/15m dashboard
-    // ended at the last history response and the next refreshed candle jumped
-    // away from the live feed. Resample the genuine 1m feed into the visible
-    // broker timeframe and replace matching buckets with those live values.
+    // Quotex re-sends history only occasionally, while the 1m feed receives
+    // every live tick. Built from history batches alone, the dashboard chart
+    // froze at the last response while the platform kept drawing the forming
+    // candle — the newest bar (and every bar after it) then disagreed with
+    // the broker chart. Extend the series with the live bar only: closed
+    // buckets stay exactly as the broker sent them, because those are the
+    // candles the dashboard is compared against.
     const period = Number(selected.period);
-    // Never overlay resampled synthetic warm-up bars on genuine higher-
-    // timeframe broker history. Until a real 1m batch arrives, those two
-    // series can have different price levels and create a fake final spike.
-    if (historySeeded[activeAsset] && period > 60 && period % 60 === 0 &&
+    // Never overlay resampled synthetic warm-up bars on genuine broker
+    // history. Until a real 1m batch arrives, those two series can have
+    // different price levels and create a fake final spike.
+    if (historySeeded[activeAsset] && period >= 60 && period % 60 === 0 &&
         self.CYBER_TA && typeof self.CYBER_TA.resample === "function") {
-      const live = self.CYBER_TA.resample(activeFeed.series(), period / 60);
-      if (live.length) {
-        const byTime = Object.create(null);
-        for (const bar of selected.candles) if (bar && Number.isFinite(Number(bar.time))) byTime[Number(bar.time)] = bar;
-        for (const bar of live) if (bar && Number.isFinite(Number(bar.time))) byTime[Number(bar.time)] = bar;
-        const times = Object.keys(byTime).map(Number).sort((a, b) => a - b).slice(-400);
-        return { period, candles: times.map((time) => byTime[time]), ts: Date.now() };
+      const minutes = Math.max(1, Math.round(period / 60));
+      const live = self.CYBER_TA.resample(activeFeed.series(), minutes);
+      const merged = overlayLiveBar(selected.candles, live.length ? live[live.length - 1] : null);
+      if (merged !== selected.candles) {
+        return { period, candles: merged, ts: Date.now() };
       }
     }
     return selected;
+  }
+
+  /**
+   * Extend a broker candle series with the locally forming bar. Historical
+   * buckets are never rewritten — resampled tick bars differ from the
+   * broker's own candles (missed ticks, bid/ask), and overwriting them is
+   * exactly what made the dashboard disagree with the platform chart. Only
+   * the newest, still-open bucket follows the live feed.
+   */
+  function overlayLiveBar(bars, liveBar) {
+    if (!Array.isArray(bars) || !bars.length) return bars;
+    const liveTime = Number(liveBar && liveBar.time);
+    if (!Number.isSafeInteger(liveTime) || liveTime <= 0) return bars;
+    const lastIdx = bars.length - 1;
+    const lastTime = Number(bars[lastIdx] && bars[lastIdx].time);
+    if (!Number.isSafeInteger(lastTime) || liveTime < lastTime) return bars;
+    if (liveTime > lastTime) {
+      // The local bucket is newer than anything the broker has sent yet.
+      return bars.concat([liveBar]);
+    }
+    const bar = bars[lastIdx];
+    const open = Number(bar.open), high = Number(bar.high), low = Number(bar.low);
+    const liveHigh = Number(liveBar.high), liveLow = Number(liveBar.low), liveClose = Number(liveBar.close);
+    if (![open, high, low, liveHigh, liveLow, liveClose].every((n) => Number.isFinite(n) && n > 0 && n <= 1e12)) {
+      return bars;
+    }
+    const next = bars.slice();
+    next[lastIdx] = {
+      time: liveTime,
+      open: open,
+      high: Math.max(high, liveHigh),
+      low: Math.min(low, liveLow),
+      close: liveClose,
+      volume: Number.isFinite(Number(bar.volume)) ? Number(bar.volume) : 0,
+    };
+    return next;
   }
 
   function scheduleTickSignalRefresh() {
@@ -971,6 +1042,10 @@
         params: strat.params,
         weights: strat.weights,
         lean: false,
+        // The adaptive router's fitness function reads this, but nothing ever
+        // supplied it — so historical/live accuracy never influenced which
+        // strategy got picked. Only the router consumes it.
+        strategyWinrates: currentStrategy === "auto_adaptive" ? strategyWinrates() : null,
       });
       sig.asset = asset ? asset.id : activeAsset;
       sig.assetName = asset ? asset.name : activeAsset;
@@ -1067,7 +1142,13 @@
           score: sig.score,
           confidence: sig.confidence,
           regime: sig.regime,
-          strategy: currentStrategy,
+          // Under auto_adaptive, currentStrategy is the literal "auto_adaptive",
+          // so every adaptive outcome was bucketed under that one key and the
+          // strategy the router actually chose never accumulated a record.
+          // Attribute the outcome to the selected strategy so its win rate can
+          // feed the next routing decision.
+          strategy: (sig.selectedStrategy && STRAT.get(sig.selectedStrategy))
+            ? sig.selectedStrategy : currentStrategy,
           payout,
         };
       }
@@ -1318,30 +1399,71 @@
     return true;
   }
 
-  function ensureHistorySubscription(det, force, requestedLimit) {
-    if (!det || !QUOTEX || !QUOTEX.subscribeHistory) return null;
-    const id = det.id;
-    const at = historyRequestedAt[id] || 0;
-    // Once real history has arrived, live ticks extend the cache; do not pull a
-    // 5,000-row batch on every periodic scan. The backtest button can still
-    // force one refresh on demand.
-    if (!force && historySeeded[id]) return null;
-    if (!force && Date.now() - at < 30000) return null; // retry initial attachment at most every 30s
+  function historyKey(id, period) { return id + "@" + period; }
+
+  /**
+   * Ask the broker for real OHLC history on one asset + timeframe.
+   *
+   * The engine needs the 1m series; the dashboard chart needs whichever
+   * timeframe the platform is showing. This used to request `period: 60`
+   * only, keyed per asset — so after a timeframe switch (or when attaching
+   * to a chart already set to 5m/15m) nothing ever asked the broker for that
+   * timeframe and the dashboard sat on "Waiting for candles…" while Quotex
+   * drew candles next to it.
+   */
+  function requestPeriodHistory(id, period, force, requestedLimit) {
+    const safePeriod = Number.isFinite(Number(period)) && Number(period) >= 1
+      ? Math.min(86400, Math.max(1, Math.floor(Number(period)))) : 60;
+    const key = historyKey(id, safePeriod);
+    const at = historyRequestedAt[key] || 0;
+    if (!force) {
+      if (safePeriod === 60) {
+        // Once real history has arrived, live ticks extend the cache; do not
+        // pull a 5,000-row batch on every periodic scan. The backtest button
+        // can still force one refresh on demand.
+        if (historySeeded[id]) return null;
+      } else {
+        // The platform pushes its own updates for the visible chart, so a
+        // cached batch only needs re-pulling when it went stale (idle chart,
+        // reconnect) or never arrived at all.
+        const cached = chartHistory[id] && chartHistory[id][safePeriod];
+        const bars = cached && Array.isArray(cached.candles) ? cached.candles.length : 0;
+        if (bars && Date.now() - (Number(cached.ts) || 0) < 600000) return null;
+      }
+      if (Date.now() - at < 30000) return null; // retry initial attachment at most every 30s
+    }
     const rawLimit = Number(requestedLimit);
-    const limit = Number.isFinite(rawLimit) ? Math.max(60, Math.min(5000, Math.floor(rawLimit))) : 5000;
+    const wanted = Number.isFinite(rawLimit) ? Math.max(60, Math.min(5000, Math.floor(rawLimit))) : 5000;
+    // Higher timeframes need far fewer rows for the same wall-clock window.
+    const limit = safePeriod === 60 ? wanted : Math.max(60, Math.min(wanted, 1000));
     const requestId = "history_" + Date.now() + "_" + (++historyRequestSequence % 1000000);
-    historyRequestedAt[id] = Date.now();
+    historyRequestedAt[key] = Date.now();
     try {
       window.postMessage({
         source: "CYBER_BINARY_CONTENT",
         kind: "subscribe",
-        payload: { requestId, asset: id, period: 60, limit },
+        payload: { requestId, asset: id, period: safePeriod, limit },
       }, "*");
+      pendingHistoryMeta[requestId] = { asset: id, period: safePeriod };
       return requestId;
     } catch (_) {
-      historyRequestedAt[id] = 0;
+      historyRequestedAt[key] = 0;
       return null;
     }
+  }
+
+  function ensureHistorySubscription(det, force, requestedLimit) {
+    if (!det || !QUOTEX || !QUOTEX.subscribeHistory) return null;
+    const id = det.id;
+    const engineRequestId = requestPeriodHistory(id, 60, force, requestedLimit);
+    // Keep the visible timeframe's chart fed too — never at the expense of
+    // the 1m series the engine runs on.
+    const visiblePeriod = Number(lastWsPeriod);
+    if (Number.isFinite(visiblePeriod) && visiblePeriod >= 1 && visiblePeriod <= 86400 &&
+        Math.floor(visiblePeriod) !== 60) {
+      requestPeriodHistory(id, Math.floor(visiblePeriod), force, requestedLimit);
+    }
+    return engineRequestId;
   }
 
   function requestHistorySubscription(det, requestedLimit) {
@@ -1351,7 +1473,9 @@
       const timer = setTimeout(() => {
         if (!pendingHistory[requestId]) return;
         delete pendingHistory[requestId];
-        if (det && det.id) historyRequestedAt[det.id] = 0;
+        const meta = pendingHistoryMeta[requestId];
+        delete pendingHistoryMeta[requestId];
+        if (meta) historyRequestedAt[historyKey(meta.asset, meta.period)] = 0;
         resolve({ ok: false, requested: false, asset: det && det.id || activeAsset, error: "history subscription acknowledgement timeout" });
       }, 4000);
       pendingHistory[requestId] = (result) => {
@@ -1499,16 +1623,20 @@
               order: data,
             });
             delete pendingOrders[req];
-          } else if (pendingDomOrder && Date.now() - pendingDomOrder.at < 10000 &&
+          } else if (pendingOrderEvent && Date.now() - pendingOrderEvent.at < 10000 &&
               data.asset && (data.direction === "CALL" || data.direction === "PUT") &&
-              QUOTEX.normalizeSymbol(pendingDomOrder.asset) === QUOTEX.normalizeSymbol(data.asset) &&
-              pendingDomOrder.dir === data.direction && Number(data.amount) > 0 &&
-              Math.abs(Number(data.amount) - pendingDomOrder.amount) <=
-                Math.max(0.000001, Math.abs(pendingDomOrder.amount) * 0.000001)) {
-            const done = pendingDomOrder.resolve;
-            pendingDomOrder = null;
+              QUOTEX.normalizeSymbol(pendingOrderEvent.asset) === QUOTEX.normalizeSymbol(data.asset) &&
+              pendingOrderEvent.dir === data.direction && Number(data.amount) > 0 &&
+              Math.abs(Number(data.amount) - pendingOrderEvent.amount) <=
+                Math.max(0.000001, Math.abs(pendingOrderEvent.amount) * 0.000001)) {
+            // Some broker builds push `s_orders/open` for the account without
+            // echoing the client requestId, so a strictly matching order event
+            // is the fallback confirmation for BOTH placement paths.
+            const done = pendingOrderEvent.resolve;
+            const waiterMode = pendingOrderEvent.mode === "ws" ? "ws_event" : "dom";
+            pendingOrderEvent = null;
             done({
-              ok: true, confirmed: true, mode: "dom", id: data.id || null,
+              ok: true, confirmed: true, mode: waiterMode, id: data.id || null,
               asset: data.asset, dir: data.direction, amount: data.amount,
               openPrice: data.openPrice, openTime: lifecycle.openTime,
               expiryTime: lifecycle.expiryTime,
@@ -1517,6 +1645,24 @@
           }
         }
         try { chrome.runtime.sendMessage({ type: "CYBER_QUOTEX_TRADE_RESULT", payload: order }).catch(() => {}); } catch (_) {}
+        break;
+      }
+      case "order_error": {
+        // The broker answered our own `orders/open` emit with a rejection.
+        // Report the real reason instead of letting the waiter run out its
+        // full timeout with a generic "confirmation timeout".
+        const reqId = p && p.requestId != null ? String(p.requestId).slice(0, 128) : "";
+        const reason = String(p && p.error || "broker rejected the order").slice(0, 240);
+        if (reqId && pendingOrders[reqId]) {
+          const rejectOrder = pendingOrders[reqId];
+          delete pendingOrders[reqId];
+          // Resolve the correlated waiter only. The race in
+          // waitForBrokerOrder() releases the asset/amount fallback itself;
+          // resolving that one first would win the race with a result that
+          // has no `sent` flag and send the caller down the DOM retry path.
+          rejectOrder({ ok: false, confirmed: false, sent: true, mode: "ws", requestId: reqId, error: reason });
+        }
+        try { chrome.runtime.sendMessage({ type: "CYBER_QUOTEX_TRADE_ERROR", payload: { requestId: reqId, error: reason } }).catch(() => {}); } catch (_) {}
         break;
       }
       case "quotex_status": {
@@ -1564,7 +1710,15 @@
           error: p && p.ok === true ? null : String(detail.error || "broker history subscription failed").slice(0, 256),
         };
         const hasPendingRequest = !!(requestId && pendingHistory[requestId]);
-        if (!result.ok && asset && hasPendingRequest) historyRequestedAt[asset] = 0;
+        // A failed subscription must release its own asset+timeframe slot,
+        // otherwise the 30s retry throttle blocks the visible chart's batch.
+        const requestMeta = requestId ? pendingHistoryMeta[requestId] : null;
+        if (!result.ok && requestMeta) {
+          historyRequestedAt[historyKey(requestMeta.asset, requestMeta.period)] = 0;
+        } else if (!result.ok && asset && hasPendingRequest) {
+          historyRequestedAt[historyKey(asset, result.period || 60)] = 0;
+        }
+        if (requestId) delete pendingHistoryMeta[requestId];
         if (hasPendingRequest) {
           const done = pendingHistory[requestId];
           delete pendingHistory[requestId];
@@ -1611,22 +1765,87 @@
     return String(Date.now() * 1000 + Math.floor(Math.random() * 1000));
   }
 
-  function waitForBrokerOrder(requestId, timeoutMs) {
+  /**
+   * Register the strict asset+direction+amount waiter that a broker
+   * `order_opened` push resolves. Both placement paths use it: a DOM click
+   * carries no client correlation id at all, and some broker builds push
+   * `s_orders/open` without echoing the requestId of a WS placement.
+   */
+  function waitForOrderEvent(meta, timeoutMs, mode, timeoutResult) {
     return new Promise((resolve) => {
+      let waiter = null;
+      const timer = setTimeout(() => {
+        if (pendingOrderEvent !== waiter) return;
+        pendingOrderEvent = null;
+        resolve(timeoutResult || { ok: false, confirmed: false, mode: mode || "dom", error: "broker did not confirm the order" });
+      }, timeoutMs || 8000);
+      waiter = {
+        at: Date.now(), mode: mode || "dom",
+        asset: meta.asset, dir: meta.dir, amount: meta.amount,
+        resolve: (result) => { clearTimeout(timer); resolve(result); },
+      };
+      pendingOrderEvent = waiter;
+    });
+  }
+
+  function cancelOrderEventWaiter(result) {
+    if (!pendingOrderEvent) return;
+    const done = pendingOrderEvent.resolve;
+    pendingOrderEvent = null;
+    done(result || { ok: false, confirmed: false, error: "confirmation superseded" });
+  }
+
+  /**
+   * Wait for the broker to confirm one placement. Two independent sources can
+   * confirm it, and the first one wins:
+   *   1. the Socket.IO ACK / order-open event carrying our requestId;
+   *   2. a strictly matching account order-open push (asset+dir+amount).
+   * Returns { promise, cancel } so callers always release both waiters.
+   */
+  function waitForBrokerOrder(requestId, meta, timeoutMs) {
+    const ms = timeoutMs || 8000;
+    const timeoutResult = { ok: false, confirmed: false, sent: true, error: "broker order confirmation timeout" };
+    const correlated = new Promise((resolve) => {
       const timer = setTimeout(() => {
         if (pendingOrders[requestId]) delete pendingOrders[requestId];
-        resolve({ ok: false, confirmed: false, sent: true, error: "broker order confirmation timeout" });
-      }, timeoutMs || 8000);
+        resolve(Object.assign({ mode: "ws" }, timeoutResult));
+      }, ms);
       pendingOrders[requestId] = (result) => {
         clearTimeout(timer);
         resolve(result);
       };
     });
+    const fallback = meta
+      ? waitForOrderEvent(meta, ms, "ws", Object.assign({ mode: "ws" }, timeoutResult))
+      : null;
+    const cleanup = () => {
+      // `sent: true` keeps a superseded waiter from ever looking like an
+      // unsent frame, which would trigger the DOM retry path.
+      cancelOrderEventWaiter({ ok: false, confirmed: false, sent: true, mode: "ws", error: "confirmation superseded" });
+      if (pendingOrders[requestId]) {
+        const drop = pendingOrders[requestId];
+        delete pendingOrders[requestId];
+        try { drop(Object.assign({ mode: "ws" }, timeoutResult, { error: "confirmation superseded" })); } catch (_) {}
+      }
+    };
+    const promise = (fallback ? Promise.race([correlated, fallback]) : correlated)
+      .then((result) => { cleanup(); return result; });
+    return {
+      promise,
+      cancel: (result) => {
+        cleanup();
+        return result;
+      },
+    };
   }
 
   async function sendWsTrade(orderArgs) {
     const requestId = nextRequestId();
-    const confirmation = waitForBrokerOrder(requestId, 8000);
+    // The strict asset+direction+amount waiter is registered BEFORE the frame
+    // goes out so an order-open push that arrives immediately is never missed.
+    const confirmation = waitForBrokerOrder(requestId, {
+      asset: orderArgs.asset, dir: orderArgs.dir, amount: orderArgs.stake,
+    }, 8000);
     const sent = await new Promise((resolve) => {
       pendingWs[requestId] = resolve;
       const timer = setTimeout(() => {
@@ -1670,18 +1889,14 @@
         // The MAIN-world ACK can time out after ws.send() succeeded. A
         // correlated broker order-open event is still authoritative; wait for
         // it instead of discarding an already received confirmation.
-        confirmed = await confirmation;
+        confirmed = await confirmation.promise;
         if (!confirmed || !confirmed.ok) return confirmed || sent;
       } else {
-        const cancelConfirmation = pendingOrders[requestId];
-        if (cancelConfirmation) {
-          delete pendingOrders[requestId];
-          cancelConfirmation({ ok: false, confirmed: false, sent: false, error: "page socket send failed" });
-        }
+        confirmation.cancel({ ok: false, confirmed: false, sent: false, error: "page socket send failed" });
         return sent || { ok: false, error: "page socket send failed" };
       }
     } else {
-      confirmed = await confirmation;
+      confirmed = await confirmation.promise;
     }
     if (confirmed && confirmed.ok) {
       const confirmedDir = String(confirmed.dir || "").toUpperCase();
@@ -1703,19 +1918,8 @@
   }
 
   function waitForDomOrder(meta, timeoutMs) {
-    return new Promise((resolve) => {
-      let waiter = null;
-      const timer = setTimeout(() => {
-        if (pendingDomOrder !== waiter) return;
-        pendingDomOrder = null;
-        resolve({ ok: false, confirmed: false, clicked: true, mode: "dom", error: "broker did not confirm DOM click" });
-      }, timeoutMs || 8000);
-      waiter = {
-        at: Date.now(), asset: meta.asset, dir: meta.dir, amount: meta.amount,
-        resolve: (result) => { clearTimeout(timer); resolve(result); },
-      };
-      pendingDomOrder = waiter;
-    });
+    return waitForOrderEvent(meta, timeoutMs, "dom",
+      { ok: false, confirmed: false, clicked: true, mode: "dom", error: "broker did not confirm DOM click" });
   }
 
   async function confirmPrimaryOwnership(expectedPrimaryEpoch) {
@@ -1795,11 +1999,7 @@
       expirySec,
     });
     if (!domResult || !domResult.ok) {
-      if (pendingDomOrder) {
-        const cancelDomWait = pendingDomOrder.resolve;
-        pendingDomOrder = null;
-        cancelDomWait({ ok: false, confirmed: false, mode: "dom", error: "DOM placement failed" });
-      }
+      cancelOrderEventWaiter({ ok: false, confirmed: false, mode: "dom", error: "DOM placement failed" });
       const failure = String(domResult && domResult.error || "DOM placement failed");
       // Missing/rejected controls are deterministic page-integration failures,
       // not market rejections. Continuing to attempt every new candle only

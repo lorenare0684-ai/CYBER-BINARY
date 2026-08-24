@@ -13,6 +13,46 @@
   const QUOTEX = self.CYBER_QUOTEX || null;
   const AS = self.CYBER_ASSET_SELECTOR || null;
 
+  /**
+   * A library that failed to load used to surface as a cryptic
+   * "STRAT is not defined" / "Cannot read properties of undefined" thrown from
+   * deep inside an event handler, with nothing pointing at the <script> that
+   * never ran. Check up front and name the culprit instead.
+   */
+  function fatalStartup(message) {
+    try {
+      const box = document.createElement("div");
+      box.id = "startup-error";
+      box.setAttribute("style",
+        "position:fixed;left:0;right:0;top:0;z-index:9999;padding:14px 18px;" +
+        "background:#3b0d12;border-bottom:1px solid #ff5c6c;color:#ffd9dd;" +
+        "font:13px/1.5 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap");
+      box.textContent = message;
+      (document.body || document.documentElement).appendChild(box);
+    } catch (_) {
+      /* DOM not ready — the console error below still lands. */
+    }
+    throw new Error("CYBER BINARY dashboard could not start: " + message);
+  }
+
+  // WORKERS is intentionally absent: line ~1398 guards it
+  // (`WORKERS && WORKERS.runBrowser`) and falls back to running the matrix
+  // synchronously, so a missing workers.js must not abort the dashboard.
+  // QUOTEX / AS are already `|| null` and optional by design.
+  const missingLibs = [
+    ["CYBER_FEED", FEED], ["CYBER_ENGINE", ENG], ["CYBER_ASSETS", ASSETS],
+    ["CYBER_STRATEGIES", STRAT], ["CYBER_STORE", STORE], ["CYBER_HIST", HIST],
+    ["CYBER_AUTO", AUTO],
+  ].filter(([, lib]) => !lib).map(([name]) => name);
+
+  if (missingLibs.length) {
+    fatalStartup(
+      "missing " + missingLibs.join(", ") + ".\n" +
+      "dashboard.html loads these from src/lib/ — reload the unpacked extension " +
+      "at chrome://extensions so every file is present, then reopen the dashboard."
+    );
+  }
+
   // Active local feed (for the dashboard's own chart when live data is missing).
   const localFeed = FEED.createFeed({ tfMs: 60000, max: 400 });
   localFeed.setSeries(FEED.syntheticSeries(ASSETS.get("EURUSD"), 240));
@@ -35,6 +75,7 @@
   let qxInstruments = [];
   let qxBalance = null;
   let qxOrders = [];
+  let lastOrderError = null;   // last broker-side order rejection {error, at}
   let pendingLiveState = null;
   let liveRenderQueued = false;
   let demoTimer = null;
@@ -54,6 +95,15 @@
     if (sec === 60) return "1m";
     if (sec % 60 === 0) return (sec / 60) + "m";
     return sec + "s";
+  }
+
+  /** Candle axis label. UTC by default — the broker chart is a UTC chart. */
+  function axisTimeLabel(time, utc) {
+    const d = new Date(Number(time));
+    if (!Number.isFinite(d.getTime())) return "";
+    const two = (n) => (n < 10 ? "0" + n : String(n));
+    if (utc !== false) return two(d.getUTCHours()) + ":" + two(d.getUTCMinutes());
+    return two(d.getHours()) + ":" + two(d.getMinutes());
   }
 
   function $(id) { return document.getElementById(id); }
@@ -383,10 +433,12 @@
     ctx.fillStyle = "rgba(255,255,255,0.45)";
     ctx.font = "9px system-ui, sans-serif";
     const labelEvery = Math.max(1, Math.floor(view.length / 6));
+    // The Quotex platform charts in UTC. Labelling the same epochs in the
+    // machine's local zone shifted every candle by the UTC offset, so the
+    // dashboard never lined up with the broker chart side by side.
+    const useUtc = o.timeBasis !== "local";
     for (let i = 0; i < view.length; i += labelEvery) {
-      const d = new Date(view[i].time);
-      const lbl = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-      ctx.fillText(lbl, xFor(i), priceH + 12);
+      ctx.fillText(axisTimeLabel(view[i].time, useUtc), xFor(i), priceH + 12);
     }
 
     if (useMacd && self.CYBER_TA) {
@@ -433,7 +485,9 @@
 
     ctx.fillStyle = "rgba(255,255,255,0.35)";
     ctx.font = "9px system-ui, sans-serif";
-    ctx.fillText("CYBER BINARY · " + (o.label || o.timeframe || "1m") + " · " + view.length + " bars", padL + 4, 12);
+    const newestLabel = view.length ? axisTimeLabel(view[view.length - 1].time, o.timeBasis !== "local") : "";
+    ctx.fillText("CYBER BINARY · " + (o.label || o.timeframe || "1m") + " · " + view.length + " bars" +
+      (newestLabel ? " · last " + newestLabel + " UTC" : ""), padL + 4, 12);
   }
 
   /* ---------- tab routing ---------- */
@@ -687,8 +741,18 @@
       liveCandlesByAsset[activeAsset] = state.candles.slice(-500);
     }
 
-    if (state.balance && typeof state.balance === "object") {
-      const b = state.balance;
+    // content.js nests the broker account under `quotex`; nothing has ever
+    // written a top-level `balance`. Reading only the top level left
+    // lastLiveBalance permanently null, so renderAccountLine()'s documented
+    // fallback ("falls back to the extension state's last balance event")
+    // could never fire and the line stayed on "waiting for a balance event".
+    const balanceSource = (state.balance && typeof state.balance === "object")
+      ? state.balance
+      : (state.quotex && typeof state.quotex === "object" &&
+         state.quotex.balance && typeof state.quotex.balance === "object"
+        ? state.quotex.balance : null);
+    if (balanceSource) {
+      const b = balanceSource;
       lastLiveBalance = {
         isDemo: typeof b.isDemo === "boolean" ? b.isDemo : null,
         balance: Number(b.balance),
@@ -985,6 +1049,15 @@
       cls += "warn"; label = "Quotex · fallback";
     } else {
       cls += "dim";
+    }
+    // A broker-side order rejection stays visible for 60s so the real reason
+    // is never hidden behind a generic "confirmation timeout" in the log.
+    if (lastOrderError && Date.now() - lastOrderError.at <= 60000) {
+      cls = "pill warn";
+      label = "Quotex · order rejected";
+      pill.title = lastOrderError.error;
+    } else {
+      pill.title = "";
     }
     pill.className = cls;
     pill.textContent = label;
@@ -1770,6 +1843,16 @@
         qxOrders = mergeOrders([msg.payload].concat(qxOrders));
         if (activeTab === "instruments") refreshInstrumentsTab();
       }
+      if (msg && msg.type === "CYBER_QUOTEX_TRADE_ERROR" && msg.payload &&
+          typeof msg.payload === "object" && !Array.isArray(msg.payload)) {
+        // The broker rejected an order the extension sent. Show the real
+        // reason instead of a generic confirmation timeout.
+        lastOrderError = {
+          error: String(msg.payload.error || "broker rejected the order").slice(0, 240),
+          at: Date.now(),
+        };
+        paintQuotexPill();
+      }
     });
     chrome.runtime.sendMessage({ type: "CYBER_GET_STATE" }, (res) => {
       if (chrome.runtime.lastError) return;
@@ -1795,6 +1878,25 @@
     else setTimeout(run, 16);
   }, { passive: true });
 
+  // Show the build that actually loaded. A stale unpacked-extension directory
+  // (files copied by hand, or an older folder left loaded in Chrome) otherwise
+  // looks identical to a current one, and any error it throws gets blamed on
+  // the code in the repo instead of the copy on disk.
+  function paintBuildStamp() {
+    const kicker = $("app-kicker");
+    if (!kicker) return;
+    let version = "";
+    try {
+      if (hasChrome && chrome.runtime && typeof chrome.runtime.getManifest === "function") {
+        const m = chrome.runtime.getManifest();
+        version = m && m.version ? String(m.version).slice(0, 32) : "";
+      }
+    } catch (_) { /* not in an extension context */ }
+    const label = "Auto-Adaptive Engine & High-Accuracy Assets" + (version ? " · v" + version : "");
+    kicker.textContent = label;
+    if (version) kicker.title = "Loaded extension build v" + version;
+  }
+
   refreshSelectors();
   bindSelectors();
   bindAutoTab();
@@ -1805,6 +1907,7 @@
   bindSettingsTab();
   loadAutoSettings();
   scale();
+  paintBuildStamp();
   paintQuotexPill();
   if (activeTab === "instruments") refreshInstrumentsTab();
 
