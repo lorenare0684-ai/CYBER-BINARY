@@ -127,6 +127,7 @@
         horizon,
         minConf,
         minBars,
+        lean: false,  // Match live signal path (content.js uses lean: false)
       });
       out.push({
         asset: a.id, name: a.name, kind: a.kind,
@@ -211,6 +212,7 @@
               horizon: opts.horizon || 3,
               minConf: opts.minConf || 0,
               minBars: opts.minBars != null ? opts.minBars : 200,
+              lean: false,  // Match live signal path (content.js uses lean: false)
             });
             out.push({
               asset: j.aid, name: currentMeta.name, kind: currentMeta.kind,
