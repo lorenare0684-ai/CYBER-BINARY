@@ -325,7 +325,13 @@
         if (ctx.account.balance == null || !(ctx.account.balance > 0)) {
           return { ok: false, reason: "Percent staking needs a detected balance (no balance event yet)" };
         }
-        const computed = Math.max(1, Math.min(ctx.account.balance, ctx.account.balance * pct / 100));
+        const raw = ctx.account.balance * pct / 100;
+        // v2.6.10: never let the minimum-stake floor exceed funds — a 0.50
+        // balance must be refused, not staked at 1.00.
+        if (raw < 1) {
+          return { ok: false, reason: `Balance too low for percent staking (${ctx.account.balance.toFixed(2)} at ${pct}% = ${raw.toFixed(2)}; minimum stake is 1)` };
+        }
+        const computed = Math.min(ctx.account.balance, raw);
         s = Object.assign({}, s, { stake: Math.round(computed * 100) / 100 });
       }
       return { ok: true, settings: s };

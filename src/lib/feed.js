@@ -149,6 +149,13 @@
       const parsedTickTime = ts != null ? numberValue(ts) : Date.now();
       const tickTime = parsedTickTime == null ? NaN : parsedTickTime;
       const t = bucket(tickTime);
+      // v2.6.10: a glitched timestamp hours in the future would open a
+      // far-ahead bucket that then swallows every real tick (canIngest
+      // rejects t < current.time forever). Refuse buckets more than 10
+      // minutes ahead of LOCAL wall-clock — measured against the clock, not
+      // against feed history, so a lagging history (reconnect/gap) still
+      // accepts fresh ticks while a far-future glitch never opens a bucket.
+      if (t - bucket(Date.now()) > Math.max(10 * tf, 600000)) return null;
       last = price;
       let closed = null;
       if (!current || current.time !== t) {

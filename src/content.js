@@ -563,6 +563,11 @@
           try { chrome.runtime.sendMessage({ type: "CYBER_AUTO_STATE", payload: state }).catch(() => {}); } catch (_) {}
         },
       });
+
+    // v2.6.10: a balance event may have arrived before the controller
+    // existed; push the detected account immediately so the account gate
+    // and percent staking work from the first armed signal.
+    syncAutoAccount();
       autoController.setMode(s.autoMode || "off");
       autoController.setArmed(isPrimaryContext && !!s.armed);
     }
@@ -799,7 +804,7 @@
   function confirmationLifecycle(data) {
     const receivedAt = Date.now();
     const rawOpen = Number(data && data.openTime);
-    const openTime = Number.isSafeInteger(rawOpen) && rawOpen >= receivedAt - 86400000 && rawOpen <= receivedAt + 300000
+    const openTime = Number.isSafeInteger(rawOpen) && rawOpen >= receivedAt - 86400000 && rawOpen <= receivedAt + 86400000
       ? rawOpen : receivedAt;
     const rawExpiry = Number(data && (data.expiryTime || data.closeTime));
     const duration = Math.max(0, Math.min(86400, Math.floor(Number(data && data.duration) || 0)));
@@ -1212,7 +1217,12 @@
     while (Math.abs(ts) >= 1e14) ts /= 1000;
     if (Math.abs(ts) < 1e11) ts *= 1000;
     ts = Math.floor(ts);
-    if (!Number.isSafeInteger(ts) || ts < Date.now() - 7 * 86400000 || ts > Date.now() + 86400000 ||
+    // v2.6.10: history batches tolerate 24h of server clock skew, but a LIVE
+    // quote running ahead by more than 10 minutes is a glitch: accepting it
+    // would open a far-future bucket that swallows every subsequent real
+    // tick (canIngest rejects t < current.time forever). 10 minutes covers
+    // any realistic broker-vs-client drift on a real-time stream.
+    if (!Number.isSafeInteger(ts) || ts < Date.now() - 7 * 86400000 || ts > Date.now() + 600000 ||
         (typeof targetFeed.canIngest === "function" && !targetFeed.canIngest(ts))) return false;
 
     // Before genuine 1m history is available the feed contains a synthetic

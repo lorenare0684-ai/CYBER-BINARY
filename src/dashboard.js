@@ -937,7 +937,7 @@
       modeSelect.value = mode;
     }
 
-    renderAccountLine(s.account || null);
+    renderAccountLine(source.account || null);
     $("auto-mode-label").textContent = mode.toUpperCase();
     $("auto-hero").dataset.dir = mode === "click" ? "CALL" : mode === "alerts" ? "WAIT" : "PUT";
     $("auto-reason").textContent = autoState.armed

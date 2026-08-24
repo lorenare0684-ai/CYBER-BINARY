@@ -4,6 +4,18 @@ Chrome extension (Manifest V3) that attaches to a Quotex / QX Broker chart, buil
 
 > Live signal analysis and explicitly armed automated execution for Quotex. This third-party tool can place real trades. Binary options are high risk, losses can quickly outweigh returns, and no result or profit is guaranteed.
 
+## What's new in v2.6.10 — Critical Bug Fixes (post-v2.6.9 audit)
+
+Four real defects found in the newest code, all fixed and regression-locked:
+
+- **Future-tick feed poisoning**: widening the clock-skew tolerance to 24h (v2.6.5) accidentally let a single glitched quote with a far-future timestamp open a feed bucket hours ahead — every subsequent real tick was then rejected forever. Live quotes now use a 10-minute forward bound (candle batches keep the 24h server-skew tolerance), and the feed itself refuses any bucket more than 10 minutes ahead of wall-clock — while still accepting normal ticks, realistic server skew, and fresh ticks over lagging history (reconnect case). Locked by `tools/tick-guard-test.js` (7 proofs).
+- **Percent stake could exceed funds**: a sub-minimum balance (e.g. 0.50 at 2% = 0.01) was clamped UP to the 1.00 minimum stake, staking more than the account holds. Now refused with an explicit reason.
+- **Account detection race**: if the broker's balance event arrived before the auto controller was created, the account stayed "unknown" (gate closed) until the next balance event — potentially minutes with auto armed. The detected account is now pushed at controller creation.
+- **Order settlement skew**: order-open timestamps were accepted only within +5 minutes of local receive time; a larger broker clock skew silently dropped settlements. Aligned to the 24h tolerance.
+- Also: `updateAutoUI` null-guarded (`source.account` after normalization).
+
+Full suite green (14 tools); baseline 57.03% and accuracy 97.13% unchanged.
+
 ## What's new in v2.6.9 — Auto Live/Demo Account Detection
 
 The auto-trader now knows WHICH account it is touching and how much money is in it:
