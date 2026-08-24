@@ -251,6 +251,12 @@
     cachedAnalysisKey = "";
     lastHudFingerprint = "";
     lastStateFingerprint = "";
+    // v2.7.2: invalidate detection cache when asset changes so the next
+    // scan finds the correct element for the new asset's display.
+    cachedAssetElement = null;
+    cachedAssetElementText = null;
+    lastDomAssetResult = null;
+    lastDomAssetScan = 0;
     ensureHistorySubscription(ASSETS.get(activeAsset) || ASSETS.ensureRegistered(activeAsset));
     return true;
   }
@@ -283,28 +289,198 @@
   let lastDomAssetResult = null;
 
   /**
-   * v2.3: text-based fallback. The modern Quotex UI ships hashed CSS-module
-   * class names, so `[class*='asset']` style selectors miss it. Instead scan
-   * small leaf nodes for strings that match the (now complete) asset catalog
-   * — "EUR/USD", "EUR/USD OTC", "Bitcoin (OTC)", "Apple", "S&P 500" — and
-   * prefer the shortest match (most specific label).
+  /**
+   * v2.7.2: Improved asset detection with caching, MutationObserver,
+   * URL patterns, and TradingView chart widget extraction.
+   *
+   * Detection priority:
+   * 1. WebSocket symbol (authoritative, instant)
+   * 2. Cached DOM element (fast, ~0ms)
+   * 3. URL pattern extraction (fast, ~0ms)
+   * 4. TradingView chart widget symbol (fast, ~1ms)
+   * 5. CSS selector scan (medium, ~5ms)
+   * 6. Full text scan (slow, ~20ms, throttled)
+   */
+
+  // Cached element that previously showed the asset name. Re-checked first
+  // before doing an expensive full scan.
+  let cachedAssetElement = null;
+  let cachedAssetElementText = null;
+  let cachedAssetElementAt = 0;
+
+  // MutationObserver for real-time asset change detection
+  let assetMutationObserver = null;
+  let assetMutationDetected = null;
+  let assetMutationAt = 0;
+
+  function setupAssetMutationObserver() {
+    if (assetMutationObserver) return;
+    if (typeof MutationObserver === "undefined") return;
+    try {
+      assetMutationObserver = new MutationObserver((mutations) => {
+        // Only process if mutations touch text content in the header/top area
+        for (const m of mutations) {
+          const target = m.target;
+          if (!target || !target.isConnected) continue;
+          try {
+            const r = target.getBoundingClientRect();
+            if (r.top > 300) continue; // only care about top-of-page elements
+          } catch (_) { continue; }
+          if (m.type === "characterData" || (m.type === "childList" && m.addedNodes.length)) {
+            const text = visibleText(target);
+            if (!text || text.length < 3 || text.length > 40) continue;
+            const det = ASSETS.detect(text);
+            if (det) {
+              assetMutationDetected = det;
+              assetMutationAt = Date.now();
+              return; // early exit - we found it
+            }
+          }
+        }
+      });
+      // Observe the body subtree for text changes
+      const observeTarget = document.body || document.documentElement;
+      if (observeTarget) {
+        assetMutationObserver.observe(observeTarget, {
+          characterData: true,
+          childList: true,
+          subtree: true,
+          characterDataOldValue: false,
+        });
+      }
+    } catch (_) {}
+  }
+
+  /**
+   * Extract asset from Quotex URL patterns.
+   * Common patterns: /trade/EURUSD_otc, /trade?asset=EURUSD, #EURUSD
+   */
+  function detectAssetFromUrl() {
+    try {
+      const url = location.href;
+      const pathname = location.pathname || "";
+      const search = location.search || "";
+      const hash = location.hash || "";
+
+      // Pattern: /trade/ASSET_SYMBOL
+      const pathMatch = pathname.match(/\/(?:trade|platform|chart)\/([A-Za-z0-9_\-]+(?:\/[A-Za-z0-9_\-]+)*)/);
+      if (pathMatch) {
+        const det = ASSETS.detect(pathMatch[1].replace(/\//g, ""));
+        if (det) return det;
+      }
+
+      // Pattern: ?asset=SYMBOL or ?symbol=SYMBOL
+      const paramMatch = search.match(/[?&](?:asset|symbol|pair|instrument)=([A-Za-z0-9_\-]+)/i);
+      if (paramMatch) {
+        const det = ASSETS.detect(decodeURIComponent(paramMatch[1]));
+        if (det) return det;
+      }
+
+      // Pattern: #ASSET_SYMBOL (hash routing)
+      if (hash.length > 1) {
+        const det = ASSETS.detect(hash.slice(1).replace(/\//g, ""));
+        if (det) return det;
+      }
+
+      // Pattern: full URL contains asset name
+      const det = ASSETS.detect(url);
+      if (det) return det;
+    } catch (_) {}
+    return null;
+  }
+
+  /**
+   * Extract the current symbol from TradingView chart widgets.
+   * Quotex uses TradingView-style charts that store the symbol internally.
+   */
+  function detectAssetFromChartWidget() {
+    try {
+      // Method 1: Look for TradingView iframe and its data attributes
+      const iframes = document.querySelectorAll("iframe");
+      for (let i = 0; i < iframes.length && i < 5; i++) {
+        const src = iframes[i].src || iframes[i].getAttribute("src") || "";
+        if (/tradingview|chart/i.test(src)) {
+          const symbolMatch = src.match(/symbol[=:]([A-Za-z0-9_:]+)/i);
+          if (symbolMatch) {
+            const det = ASSETS.detect(symbolMatch[1].replace(/:/g, "/"));
+            if (det) return det;
+          }
+        }
+      }
+
+      // Method 2: Look for chart container data attributes
+      const chartEls = document.querySelectorAll("[class*='chart'], [id*='chart'], [data-symbol], [data-asset]");
+      for (let i = 0; i < chartEls.length && i < 10; i++) {
+        const el = chartEls[i];
+        const sym = el.getAttribute("data-symbol") || el.getAttribute("data-asset") ||
+                    el.getAttribute("data-pair") || el.getAttribute("data-instrument") || "";
+        if (sym && sym.length >= 3 && sym.length <= 30) {
+          const det = ASSETS.detect(sym);
+          if (det) return det;
+        }
+      }
+
+      // Method 3: Look for symbol in chart title/legend elements
+      const legendEls = document.querySelectorAll(
+        "[class*='legend'] [class*='symbol'], [class*='chart-header'] span, " +
+        "[class*='chart-title'], [class*='study-title'], [class*='series-title']"
+      );
+      for (let i = 0; i < legendEls.length && i < 10; i++) {
+        const t = visibleText(legendEls[i]);
+        if (t && t.length >= 3 && t.length <= 30) {
+          const det = ASSETS.detect(t);
+          if (det) return det;
+        }
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  /**
+   * v2.7.2: Check cached element first — avoids expensive full scans when
+   * the asset label element is already known and still showing the same text.
+   */
+  function checkCachedAssetElement() {
+    if (!cachedAssetElement || !cachedAssetElement.isConnected) {
+      cachedAssetElement = null;
+      return null;
+    }
+    const t = visibleText(cachedAssetElement);
+    if (!t || t.length < 2 || t.length > 40) return null;
+    const det = ASSETS.detect(t);
+    if (!det) return null;
+    // Verify OTC consistency
+    const wantsOtc = /OTC|\(OT\)/i.test(t);
+    const isOtc = /_otc$/i.test(det.id);
+    if (wantsOtc !== isOtc) { cachedAssetElement = null; return null; }
+    cachedAssetElementText = t;
+    cachedAssetElementAt = Date.now();
+    return det;
+  }
+
+  /**
+   * v2.3 + v2.7.2 improvements: text-based fallback with improved scoring.
+   * The modern Quotex UI ships hashed CSS-module class names, so selectors
+   * miss it. Scans small leaf nodes for catalog matches with contextual
+   * scoring: proximity to price/time elements, position, aria attributes.
    */
   function scanDomForAssetText(force) {
     const now = Date.now();
-    if (!force && now - lastDomTextScan < 2000) return null; // throttle
+    if (!force && now - lastDomTextScan < 1500) return null; // 1.5s throttle
     lastDomTextScan = now;
     let best = null;
     let bestScore = -Infinity;
     const nodes = document.querySelectorAll("span, div, button, a, h1, h2, h3, td, p");
-    for (let i = 0; i < nodes.length && i < 800; i++) {
+    const maxNodes = Math.min(nodes.length, 600); // reduced from 800
+    for (let i = 0; i < maxNodes; i++) {
       const el = nodes[i];
       if (el.id === "qx-info-panel" || (el.closest && el.closest("#qx-info-panel"))) continue;
-      if (el.closest && el.closest("[role='dialog'], [role='listbox'], [role='menu'], [class*='asset-list'], [class*='instruments-list']")) continue;
-      if (el.children.length > 2) continue; // skip containers with many children
-      if (!el.offsetParent && el.getClientRects().length === 0) continue; // hidden
+      if (el.closest && el.closest("[role='dialog'], [role='listbox'], [role='menu'], [class*='asset-list'], [class*='instruments-list'], [class*='modal']")) continue;
+      if (el.children.length > 2) continue;
+      if (!el.offsetParent && el.getClientRects().length === 0) continue;
       const t = visibleText(el);
       if (!t || t.length < 2 || t.length > 40) continue;
-      if (/^[\d.,\s%+\-—:]+$/.test(t)) continue; // pure price/percent text
+      if (/^[\d.,\s%+\-—:]+$/.test(t)) continue;
       const det = ASSETS.detect(t);
       if (!det) continue;
       const wantsOtc = /OTC|\(OT\)/i.test(t);
@@ -316,59 +492,123 @@
       if (/active|current|selected|chosen|true/i.test(meta)) score += 100;
       if (/symbol|pair|asset.?name|trading.?pair/i.test(meta)) score += 30;
       if (/^(BUTTON|A|TD)$/.test(String(el.tagName || ""))) score -= 25;
+      // v2.7.2: proximity scoring — elements near the top of the page are
+      // more likely to be the main chart header showing the current asset
       try {
         const r = el.getBoundingClientRect();
-        if (r.top >= 0 && r.top < 240) score += 12;
+        if (r.top >= 0 && r.top < 120) score += 20;      // very top (header)
+        else if (r.top >= 120 && r.top < 240) score += 12; // upper area
+        else if (r.top > 400) score -= 15;                 // far down = less likely
+        // v2.7.2: bonus for left-aligned elements (chart header is usually left)
+        if (r.left >= 0 && r.left < 300) score += 8;
       } catch (_) {}
+      // v2.7.2: bonus for elements near price displays (siblings/parent with price text)
+      try {
+        const parent = el.parentElement;
+        if (parent && parent.children.length <= 8) {
+          const parentText = visibleText(parent);
+          if (parentText && /[\d.,]{3,}/.test(parentText) && /\d+\.\d+/.test(parentText)) {
+            score += 15; // parent contains price-like text
+          }
+        }
+      } catch (_) {}
+      // v2.7.2: early termination for very high confidence matches
+      if (score > 140) { best = det; bestScore = score; break; }
       if (score > bestScore) { bestScore = score; best = det; }
+    }
+    // Cache the winning element for fast subsequent checks
+    if (best && bestScore > 0) {
+      // Find the actual element that matched (re-scan briefly)
+      for (let i = 0; i < maxNodes; i++) {
+        const el = nodes[i];
+        if (!el.offsetParent && el.getClientRects().length === 0) continue;
+        const t = visibleText(el);
+        if (t && ASSETS.detect(t) === best) {
+          cachedAssetElement = el;
+          cachedAssetElementText = t;
+          cachedAssetElementAt = Date.now();
+          break;
+        }
+      }
     }
     return best;
   }
 
   function detectAssetFromDom(force) {
-    // A full selector/text scan can allocate thousands of nodes on the broker
-    // page. Cache even a miss so the several callers in one poll cycle do not
-    // repeat the same expensive work.
     const now = Date.now();
-    if (!force && now - lastDomAssetScan < 2000) return lastDomAssetResult;
+    if (!force && now - lastDomAssetScan < 1500) return lastDomAssetResult;
     lastDomAssetScan = now;
     let found = null;
 
-    // First choice: the adapter's canonical DOM helpers.
-    if (QUOTEX && QUOTEX.findAssetHeader) {
+    // v2.7.2: Priority 1 — check MutationObserver result (instant)
+    if (assetMutationDetected && now - assetMutationAt < 3000) {
+      found = assetMutationDetected;
+      assetMutationDetected = null;
+    }
+
+    // v2.7.2: Priority 2 — check cached element (instant, ~0ms)
+    if (!found) found = checkCachedAssetElement();
+
+    // Priority 3: the adapter's canonical DOM helpers.
+    if (!found && QUOTEX && QUOTEX.findAssetHeader) {
       const h = QUOTEX.findAssetHeader();
       if (h && h.text) found = assetFromText(h.text);
     }
-    const sels = [
-      "[class*='current-symbol']",
-      "[class*='asset-select']",
-      "[class*='pair-name']",
-      "[class*='symbol-name']",
-      "[class*='assetName']",
-      "[class*='asset-name']",
-      "[class*='symbol']",
-      "[class*='asset'] [class*='name']",
-      "[class*='trading-pair']",
-      "[class*='active-asset']",
-      "header [class*='active']",
-      "[data-testid*='asset']",
-      "[data-test*='symbol']",
-    ];
-    for (let si = 0; !found && si < sels.length; si++) {
-      const els = document.querySelectorAll(sels[si]);
-      for (let ei = 0; ei < els.length && ei < 100; ei++) {
-        const t = visibleText(els[ei]);
-        if (t && t.length >= 2 && t.length < 48) {
-          found = assetFromText(t);
-          if (found) break;
+
+    // v2.7.2: Priority 4 — URL pattern extraction (fast, ~0ms)
+    if (!found) found = detectAssetFromUrl();
+
+    // v2.7.2: Priority 5 — TradingView chart widget (fast, ~1ms)
+    if (!found) found = detectAssetFromChartWidget();
+
+    // Priority 6: CSS selector scan
+    if (!found) {
+      const sels = [
+        "[class*='current-symbol']",
+        "[class*='asset-select']",
+        "[class*='pair-name']",
+        "[class*='symbol-name']",
+        "[class*='assetName']",
+        "[class*='asset-name']",
+        "[class*='symbol']",
+        "[class*='asset'] [class*='name']",
+        "[class*='trading-pair']",
+        "[class*='active-asset']",
+        "header [class*='active']",
+        "[data-testid*='asset']",
+        "[data-test*='symbol']",
+      ];
+      for (let si = 0; !found && si < sels.length; si++) {
+        const els = document.querySelectorAll(sels[si]);
+        for (let ei = 0; ei < els.length && ei < 50; ei++) {
+          const t = visibleText(els[ei]);
+          if (t && t.length >= 2 && t.length < 48) {
+            found = assetFromText(t);
+            if (found) {
+              // Cache this element for fast subsequent checks
+              cachedAssetElement = els[ei];
+              cachedAssetElementText = t;
+              cachedAssetElementAt = Date.now();
+              break;
+            }
+          }
         }
       }
     }
-    // Hashed-class fallback — match visible text against the catalog.
+
+    // Priority 7: Hashed-class text scan (slowest, throttled)
     if (!found) found = scanDomForAssetText(true);
+
+    // Priority 8: page title and URL
     if (!found) found = ASSETS.detect(document.title);
     if (!found) found = ASSETS.detect(location.href);
+
+    // Priority 9: WebSocket symbol (authoritative)
     if (!found && lastWsSymbol) found = assetFromText(lastWsSymbol);
+
+    // v2.7.2: set up MutationObserver on first successful detection
+    if (found && !assetMutationObserver) setupAssetMutationObserver();
+
     lastDomAssetResult = found || null;
     return lastDomAssetResult;
   }
@@ -2287,5 +2527,17 @@
     } else {
       attach();
     }
+    // v2.7.2: invalidate cached DOM element and re-detect on URL changes.
+    // Quotex uses client-side routing; navigating between assets may change
+    // the URL without a full page reload.
+    const invalidateAssetCache = () => {
+      cachedAssetElement = null;
+      cachedAssetElementText = null;
+      lastDomAssetResult = null;
+      lastDomAssetScan = 0;
+      lastDomTextScan = 0;
+    };
+    window.addEventListener("popstate", invalidateAssetCache);
+    window.addEventListener("hashchange", invalidateAssetCache);
   }
 })();
