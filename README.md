@@ -18,7 +18,7 @@ Chrome extension (Manifest V3) that attaches to a Quotex / QX Broker chart, buil
 - **Second confirmation source**: a strictly matching account order-open push (asset + direction + amount, 10s window) now confirms a WS placement too, for broker builds that never echo the client requestId. Both waiters are always released — a superseded waiter can never look "unsent" and trigger a duplicate DOM click.
 - **Chart = broker candles + live forming bar**: closed buckets are never rewritten; only the newest, still-open bucket follows the tick feed, on every timeframe (1m included). The axis is labelled UTC and the header states the basis and the newest candle time (`… · last 09:47 UTC`).
 
-Locked by 2 new suites — `tools/trade-confirm.js` (27 checks: ACK wire format, correlation, rejection text, un-correlated confirmation, fail-closed timeout, 1m/5m chart alignment) and `tools/dashboard-chart.js` (6 checks: real render path under TZ=Asia/Kolkata). Run against v2.6.14 they fail 19 and 2 checks respectively, including the exact reported symptoms. Full suite green (17 tools); baselines unchanged.
+Locked by 3 new suites — `tools/trade-confirm.js` (27 checks: ACK wire format, correlation, rejection text, un-correlated confirmation, fail-closed timeout, 1m/5m chart alignment), `tools/hook-confirm.js` (12 checks: the GENERATED `src/page-hook.js` bundle, driving `place_ws` → socket frame → broker ACK → `order`/`order_error` back to the content script) and `tools/dashboard-chart.js` (6 checks: real render path under TZ=Asia/Kolkata). Run against v2.6.14 they fail 19, 5 and 2 checks respectively, including the exact reported symptoms. Full suite green (21 tools); baselines unchanged.
 
 ## What's new in v2.6.14 — Critical Fix: Floating Arrows on the Platform Chart
 
@@ -286,6 +286,7 @@ node tools/backtest.js              # legacy single-asset backtest
 node tools/historic.js              # full matrix across 170+ assets × strategies
 node tools/search.js                # bounded parameter grid search
 node tools/trade-confirm.js         # broker ACK confirmation + chart alignment
+node tools/hook-confirm.js          # MAIN-world bundle: place_ws → ACK → order event
 node tools/dashboard-chart.js       # dashboard chart renders the broker's UTC candles
 ```
 
@@ -311,6 +312,7 @@ src/lib/quotex.js        # Socket.IO v3 adapter, asset catalog, placeTrade
 icons/
 tools/adaptive-test.js   # v2.6: test suite for adaptive strategies & assets
 tools/trade-confirm.js   # v2.6.15: orders/open ACK correlation + chart series
+tools/hook-confirm.js    # v2.6.15: generated page-hook round trip (socket → ACK)
 tools/dashboard-chart.js # v2.6.15: chart axis/basis under a non-UTC machine zone
 ```
 
