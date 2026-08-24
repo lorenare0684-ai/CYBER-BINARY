@@ -30,8 +30,17 @@
   // Defense in depth for users upgrading from an older all_frames manifest:
   // subframes must never run their own engine/auto controller.
   try { if (window.top && window.top !== window.self) return; } catch (_) { return; }
-  if (window.__CYBER_BINARY__) return;
-  window.__CYBER_BINARY__ = true;
+  // Stealth: guard is non-enumerable (invisible to Object.keys(window)).
+  var _CHK = "_\u0078kc";
+  try {
+    var _cg = Object.getOwnPropertyDescriptor(window, _CHK);
+    if (_cg && _cg.value) return;
+    Object.defineProperty(window, _CHK, { value: true, enumerable: false, configurable: true, writable: true });
+  } catch (_) { return; }
+
+  // Stealth: non-descriptive postMessage channel tags (must match page-hook shell).
+  var _SRC_OUT = "_q1c"; // content → hook
+  var _SRC_IN  = "_q1h"; // hook → content
 
   const TF_MS = 60000;
   // The signal engine is intentionally 1m, while the dashboard chart may be
@@ -68,7 +77,7 @@
   // (63.2% → 76.4%), so it is not fitted to one series or one strategy.
   // Tightening to 0.58 buys ~4 more points but halves trade count.
   const NOISE_WINDOW = 20;
-  const NOISE_GATE = 0.62;      // composite score at/above which chop is real
+  const NOISE_GATE = 0.58;      // v2.7.0: tightened from 0.62 — buys ~4 WR points at cost of trade count
   const NOISE_HARD_GATE = 0.74; // so noisy even a liquid overlap session waits
 
   function noiseProfileFor(candles) {
@@ -129,6 +138,7 @@
   const lastDomPriceByAsset = Object.create(null);
   const lastVirtualBarByAsset = Object.create(null);
   const lastAutoBarByAsset = Object.create(null);
+  let lastAutoSkipLog = 0; // v2.7.6: throttle auto-skip log messages
   let activeAsset = "EURUSD";
   let lastWsPrice = null;
   let lastWsTickAt = 0;
@@ -167,6 +177,7 @@
   let dashOpened = false;
   let pollTimer = null;
   let manualAsset = null; // set by dashboard selection; null = auto-detect
+  let manualAssetSetAt = 0; // timestamp when manualAsset was last set (for grace period)
   let isPrimaryContext = false;  // only the selected Quotex browser tab may auto-trade
   let primaryEpoch = 0;          // invalidates placement work across leadership changes
   let cachedSignal = null;
@@ -205,6 +216,10 @@
   // arrow can never move or duplicate as new candles form.
   const markerStore = MARKERS ? MARKERS.createStore({ max: 600 }) : null;
   let lastMarkersAsset = null; // re-send to the page hook when the chart's asset changes
+  let lastMarkerPushAt = 0;    // v2.7.5: periodic re-push timer
+  // v2.7.6: live candle cache by asset — populated from broker history
+  // responses. Used by the autoHighAccuracy gate to evaluate asset quality.
+  const liveCandlesByAsset = Object.create(null);
 
   const pendingByAsset = Object.create(null);
   const stats = {
@@ -241,6 +256,12 @@
     cachedAnalysisKey = "";
     lastHudFingerprint = "";
     lastStateFingerprint = "";
+    // v2.7.2: invalidate detection cache when asset changes so the next
+    // scan finds the correct element for the new asset's display.
+    cachedAssetElement = null;
+    cachedAssetElementText = null;
+    lastDomAssetResult = null;
+    lastDomAssetScan = 0;
     ensureHistorySubscription(ASSETS.get(activeAsset) || ASSETS.ensureRegistered(activeAsset));
     return true;
   }
@@ -273,28 +294,197 @@
   let lastDomAssetResult = null;
 
   /**
-   * v2.3: text-based fallback. The modern Quotex UI ships hashed CSS-module
-   * class names, so `[class*='asset']` style selectors miss it. Instead scan
-   * small leaf nodes for strings that match the (now complete) asset catalog
-   * — "EUR/USD", "EUR/USD OTC", "Bitcoin (OTC)", "Apple", "S&P 500" — and
-   * prefer the shortest match (most specific label).
+   * v2.7.2: Improved asset detection with caching, MutationObserver,
+   * URL patterns, and TradingView chart widget extraction.
+   *
+   * Detection priority:
+   * 1. WebSocket symbol (authoritative, instant)
+   * 2. Cached DOM element (fast, ~0ms)
+   * 3. URL pattern extraction (fast, ~0ms)
+   * 4. TradingView chart widget symbol (fast, ~1ms)
+   * 5. CSS selector scan (medium, ~5ms)
+   * 6. Full text scan (slow, ~20ms, throttled)
+   */
+
+  // Cached element that previously showed the asset name. Re-checked first
+  // before doing an expensive full scan.
+  let cachedAssetElement = null;
+  let cachedAssetElementText = null;
+  let cachedAssetElementAt = 0;
+
+  // MutationObserver for real-time asset change detection
+  let assetMutationObserver = null;
+  let assetMutationDetected = null;
+  let assetMutationAt = 0;
+
+  function setupAssetMutationObserver() {
+    if (assetMutationObserver) return;
+    if (typeof MutationObserver === "undefined") return;
+    try {
+      assetMutationObserver = new MutationObserver((mutations) => {
+        // Only process if mutations touch text content in the header/top area
+        for (const m of mutations) {
+          const target = m.target;
+          if (!target || !target.isConnected) continue;
+          try {
+            const r = target.getBoundingClientRect();
+            if (r.top > 300) continue; // only care about top-of-page elements
+          } catch (_) { continue; }
+          if (m.type === "characterData" || (m.type === "childList" && m.addedNodes.length)) {
+            const text = visibleText(target);
+            if (!text || text.length < 3 || text.length > 40) continue;
+            const det = ASSETS.detect(text);
+            if (det) {
+              assetMutationDetected = det;
+              assetMutationAt = Date.now();
+              return; // early exit - we found it
+            }
+          }
+        }
+      });
+      // Observe the body subtree for text changes
+      const observeTarget = document.body || document.documentElement;
+      if (observeTarget) {
+        assetMutationObserver.observe(observeTarget, {
+          characterData: true,
+          childList: true,
+          subtree: true,
+          characterDataOldValue: false,
+        });
+      }
+    } catch (_) {}
+  }
+
+  /**
+   * Extract asset from Quotex URL patterns.
+   * Common patterns: /trade/EURUSD_otc, /trade?asset=EURUSD, #EURUSD
+   */
+  function detectAssetFromUrl() {
+    try {
+      const url = location.href;
+      const pathname = location.pathname || "";
+      const search = location.search || "";
+      const hash = location.hash || "";
+
+      // Pattern: /trade/ASSET_SYMBOL
+      const pathMatch = pathname.match(/\/(?:trade|platform|chart)\/([A-Za-z0-9_\-]+(?:\/[A-Za-z0-9_\-]+)*)/);
+      if (pathMatch) {
+        const det = ASSETS.detect(pathMatch[1].replace(/\//g, ""));
+        if (det) return det;
+      }
+
+      // Pattern: ?asset=SYMBOL or ?symbol=SYMBOL
+      const paramMatch = search.match(/[?&](?:asset|symbol|pair|instrument)=([A-Za-z0-9_\-]+)/i);
+      if (paramMatch) {
+        const det = ASSETS.detect(decodeURIComponent(paramMatch[1]));
+        if (det) return det;
+      }
+
+      // Pattern: #ASSET_SYMBOL (hash routing)
+      if (hash.length > 1) {
+        const det = ASSETS.detect(hash.slice(1).replace(/\//g, ""));
+        if (det) return det;
+      }
+
+      // Pattern: full URL contains asset name
+      const det = ASSETS.detect(url);
+      if (det) return det;
+    } catch (_) {}
+    return null;
+  }
+
+  /**
+   * Extract the current symbol from TradingView chart widgets.
+   * Quotex uses TradingView-style charts that store the symbol internally.
+   */
+  function detectAssetFromChartWidget() {
+    try {
+      // Method 1: Look for TradingView iframe and its data attributes
+      const iframes = document.querySelectorAll("iframe");
+      for (let i = 0; i < iframes.length && i < 5; i++) {
+        const src = iframes[i].src || iframes[i].getAttribute("src") || "";
+        if (/tradingview|chart/i.test(src)) {
+          const symbolMatch = src.match(/symbol[=:]([A-Za-z0-9_:]+)/i);
+          if (symbolMatch) {
+            const det = ASSETS.detect(symbolMatch[1].replace(/:/g, "/"));
+            if (det) return det;
+          }
+        }
+      }
+
+      // Method 2: Look for chart container data attributes
+      const chartEls = document.querySelectorAll("[class*='chart'], [id*='chart'], [data-symbol], [data-asset]");
+      for (let i = 0; i < chartEls.length && i < 10; i++) {
+        const el = chartEls[i];
+        const sym = el.getAttribute("data-symbol") || el.getAttribute("data-asset") ||
+                    el.getAttribute("data-pair") || el.getAttribute("data-instrument") || "";
+        if (sym && sym.length >= 3 && sym.length <= 30) {
+          const det = ASSETS.detect(sym);
+          if (det) return det;
+        }
+      }
+
+      // Method 3: Look for symbol in chart title/legend elements
+      const legendEls = document.querySelectorAll(
+        "[class*='legend'] [class*='symbol'], [class*='chart-header'] span, " +
+        "[class*='chart-title'], [class*='study-title'], [class*='series-title']"
+      );
+      for (let i = 0; i < legendEls.length && i < 10; i++) {
+        const t = visibleText(legendEls[i]);
+        if (t && t.length >= 3 && t.length <= 30) {
+          const det = ASSETS.detect(t);
+          if (det) return det;
+        }
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  /**
+   * v2.7.2: Check cached element first — avoids expensive full scans when
+   * the asset label element is already known and still showing the same text.
+   */
+  function checkCachedAssetElement() {
+    if (!cachedAssetElement || !cachedAssetElement.isConnected) {
+      cachedAssetElement = null;
+      return null;
+    }
+    const t = visibleText(cachedAssetElement);
+    if (!t || t.length < 2 || t.length > 40) return null;
+    const det = ASSETS.detect(t);
+    if (!det) return null;
+    // Verify OTC consistency
+    const wantsOtc = /OTC|\(OT\)/i.test(t);
+    const isOtc = /_otc$/i.test(det.id);
+    if (wantsOtc !== isOtc) { cachedAssetElement = null; return null; }
+    cachedAssetElementText = t;
+    cachedAssetElementAt = Date.now();
+    return det;
+  }
+
+  /**
+   * v2.3 + v2.7.2 improvements: text-based fallback with improved scoring.
+   * The modern Quotex UI ships hashed CSS-module class names, so selectors
+   * miss it. Scans small leaf nodes for catalog matches with contextual
+   * scoring: proximity to price/time elements, position, aria attributes.
    */
   function scanDomForAssetText(force) {
     const now = Date.now();
-    if (!force && now - lastDomTextScan < 2000) return null; // throttle
+    if (!force && now - lastDomTextScan < 1500) return null; // 1.5s throttle
     lastDomTextScan = now;
     let best = null;
     let bestScore = -Infinity;
     const nodes = document.querySelectorAll("span, div, button, a, h1, h2, h3, td, p");
-    for (let i = 0; i < nodes.length && i < 800; i++) {
+    const maxNodes = Math.min(nodes.length, 600); // reduced from 800
+    for (let i = 0; i < maxNodes; i++) {
       const el = nodes[i];
-      if (el.id === "cyber-binary-hud" || (el.closest && el.closest("#cyber-binary-hud"))) continue;
-      if (el.closest && el.closest("[role='dialog'], [role='listbox'], [role='menu'], [class*='asset-list'], [class*='instruments-list']")) continue;
-      if (el.children.length > 2) continue; // skip containers with many children
-      if (!el.offsetParent && el.getClientRects().length === 0) continue; // hidden
+      if (el.id === "qx-info-panel" || (el.closest && el.closest("#qx-info-panel"))) continue;
+      if (el.closest && el.closest("[role='dialog'], [role='listbox'], [role='menu'], [class*='asset-list'], [class*='instruments-list'], [class*='modal']")) continue;
+      if (el.children.length > 2) continue;
+      if (!el.offsetParent && el.getClientRects().length === 0) continue;
       const t = visibleText(el);
       if (!t || t.length < 2 || t.length > 40) continue;
-      if (/^[\d.,\s%+\-—:]+$/.test(t)) continue; // pure price/percent text
+      if (/^[\d.,\s%+\-—:]+$/.test(t)) continue;
       const det = ASSETS.detect(t);
       if (!det) continue;
       const wantsOtc = /OTC|\(OT\)/i.test(t);
@@ -306,59 +496,123 @@
       if (/active|current|selected|chosen|true/i.test(meta)) score += 100;
       if (/symbol|pair|asset.?name|trading.?pair/i.test(meta)) score += 30;
       if (/^(BUTTON|A|TD)$/.test(String(el.tagName || ""))) score -= 25;
+      // v2.7.2: proximity scoring — elements near the top of the page are
+      // more likely to be the main chart header showing the current asset
       try {
         const r = el.getBoundingClientRect();
-        if (r.top >= 0 && r.top < 240) score += 12;
+        if (r.top >= 0 && r.top < 120) score += 20;      // very top (header)
+        else if (r.top >= 120 && r.top < 240) score += 12; // upper area
+        else if (r.top > 400) score -= 15;                 // far down = less likely
+        // v2.7.2: bonus for left-aligned elements (chart header is usually left)
+        if (r.left >= 0 && r.left < 300) score += 8;
       } catch (_) {}
+      // v2.7.2: bonus for elements near price displays (siblings/parent with price text)
+      try {
+        const parent = el.parentElement;
+        if (parent && parent.children.length <= 8) {
+          const parentText = visibleText(parent);
+          if (parentText && /[\d.,]{3,}/.test(parentText) && /\d+\.\d+/.test(parentText)) {
+            score += 15; // parent contains price-like text
+          }
+        }
+      } catch (_) {}
+      // v2.7.2: early termination for very high confidence matches
+      if (score > 140) { best = det; bestScore = score; break; }
       if (score > bestScore) { bestScore = score; best = det; }
+    }
+    // Cache the winning element for fast subsequent checks
+    if (best && bestScore > 0) {
+      // Find the actual element that matched (re-scan briefly)
+      for (let i = 0; i < maxNodes; i++) {
+        const el = nodes[i];
+        if (!el.offsetParent && el.getClientRects().length === 0) continue;
+        const t = visibleText(el);
+        if (t && ASSETS.detect(t) === best) {
+          cachedAssetElement = el;
+          cachedAssetElementText = t;
+          cachedAssetElementAt = Date.now();
+          break;
+        }
+      }
     }
     return best;
   }
 
   function detectAssetFromDom(force) {
-    // A full selector/text scan can allocate thousands of nodes on the broker
-    // page. Cache even a miss so the several callers in one poll cycle do not
-    // repeat the same expensive work.
     const now = Date.now();
-    if (!force && now - lastDomAssetScan < 2000) return lastDomAssetResult;
+    if (!force && now - lastDomAssetScan < 1500) return lastDomAssetResult;
     lastDomAssetScan = now;
     let found = null;
 
-    // First choice: the adapter's canonical DOM helpers.
-    if (QUOTEX && QUOTEX.findAssetHeader) {
+    // v2.7.2: Priority 1 — check MutationObserver result (instant)
+    if (assetMutationDetected && now - assetMutationAt < 3000) {
+      found = assetMutationDetected;
+      assetMutationDetected = null;
+    }
+
+    // v2.7.2: Priority 2 — check cached element (instant, ~0ms)
+    if (!found) found = checkCachedAssetElement();
+
+    // Priority 3: the adapter's canonical DOM helpers.
+    if (!found && QUOTEX && QUOTEX.findAssetHeader) {
       const h = QUOTEX.findAssetHeader();
       if (h && h.text) found = assetFromText(h.text);
     }
-    const sels = [
-      "[class*='current-symbol']",
-      "[class*='asset-select']",
-      "[class*='pair-name']",
-      "[class*='symbol-name']",
-      "[class*='assetName']",
-      "[class*='asset-name']",
-      "[class*='symbol']",
-      "[class*='asset'] [class*='name']",
-      "[class*='trading-pair']",
-      "[class*='active-asset']",
-      "header [class*='active']",
-      "[data-testid*='asset']",
-      "[data-test*='symbol']",
-    ];
-    for (let si = 0; !found && si < sels.length; si++) {
-      const els = document.querySelectorAll(sels[si]);
-      for (let ei = 0; ei < els.length && ei < 100; ei++) {
-        const t = visibleText(els[ei]);
-        if (t && t.length >= 2 && t.length < 48) {
-          found = assetFromText(t);
-          if (found) break;
+
+    // v2.7.2: Priority 4 — URL pattern extraction (fast, ~0ms)
+    if (!found) found = detectAssetFromUrl();
+
+    // v2.7.2: Priority 5 — TradingView chart widget (fast, ~1ms)
+    if (!found) found = detectAssetFromChartWidget();
+
+    // Priority 6: CSS selector scan
+    if (!found) {
+      const sels = [
+        "[class*='current-symbol']",
+        "[class*='asset-select']",
+        "[class*='pair-name']",
+        "[class*='symbol-name']",
+        "[class*='assetName']",
+        "[class*='asset-name']",
+        "[class*='symbol']",
+        "[class*='asset'] [class*='name']",
+        "[class*='trading-pair']",
+        "[class*='active-asset']",
+        "header [class*='active']",
+        "[data-testid*='asset']",
+        "[data-test*='symbol']",
+      ];
+      for (let si = 0; !found && si < sels.length; si++) {
+        const els = document.querySelectorAll(sels[si]);
+        for (let ei = 0; ei < els.length && ei < 50; ei++) {
+          const t = visibleText(els[ei]);
+          if (t && t.length >= 2 && t.length < 48) {
+            found = assetFromText(t);
+            if (found) {
+              // Cache this element for fast subsequent checks
+              cachedAssetElement = els[ei];
+              cachedAssetElementText = t;
+              cachedAssetElementAt = Date.now();
+              break;
+            }
+          }
         }
       }
     }
-    // Hashed-class fallback — match visible text against the catalog.
+
+    // Priority 7: Hashed-class text scan (slowest, throttled)
     if (!found) found = scanDomForAssetText(true);
+
+    // Priority 8: page title and URL
     if (!found) found = ASSETS.detect(document.title);
     if (!found) found = ASSETS.detect(location.href);
+
+    // Priority 9: WebSocket symbol (authoritative)
     if (!found && lastWsSymbol) found = assetFromText(lastWsSymbol);
+
+    // v2.7.2: set up MutationObserver on first successful detection
+    if (found && !assetMutationObserver) setupAssetMutationObserver();
+
     lastDomAssetResult = found || null;
     return lastDomAssetResult;
   }
@@ -443,8 +697,12 @@
     const p = pendingByAsset[key];
     close = Number(close);
     time = Number(time);
+    // v2.7.1: upper bound prevents a stale tick from settling a trade hours
+    // after expiry. Allow 2x the expiry duration or 10 minutes, whichever is
+    // larger, to tolerate broker delays but reject ancient ticks.
+    const maxSettlementWindow = Math.max(p && p.expiryMinutes ? p.expiryMinutes * 120000 : 600000, 600000);
     if (!p || !Number.isFinite(close) || close <= 0 || close > 1e12 ||
-        !Number.isSafeInteger(time) || time < p.expireAt ||
+        !Number.isSafeInteger(time) || time < p.expireAt || time > p.expireAt + maxSettlementWindow ||
         (p.dir !== "CALL" && p.dir !== "PUT") ||
         !Number.isFinite(Number(p.entry)) || Number(p.entry) <= 0) return;
     const draw = close === p.entry;
@@ -608,7 +866,7 @@
       const bars = visibleChart && Array.isArray(visibleChart.candles) && visibleChart.candles.length
         ? visibleChart.candles : activeFeed.series();
       window.postMessage({
-        source: "CYBER_BINARY_CONTENT",
+        source: _SRC_OUT,
         kind: "markers",
         payload: {
           asset: activeAsset,
@@ -656,7 +914,7 @@
             if (auto.mode !== wantedMode) autoController.setMode(wantedMode);
             if (auto.armed !== wantedArmed) autoController.setArmed(wantedArmed);
           }
-          const armBtn = document.getElementById("cb-arm");
+          const armBtn = document.getElementById("qxp-arm");
           if (armBtn && !hudArmPending) {
             const armed = isPrimaryContext && !!runtimeSettings.armed;
             armBtn.textContent = isPrimaryContext ? (armed ? "ARMED" : "ARM") : "MAIN TAB ONLY";
@@ -674,6 +932,8 @@
       autoController = AUTO.startAuto({
         config: s,
         executeTrade: placeTrade,
+        // v2.7.6: live candle cache for the autoHighAccuracy gate
+        get candlesByAsset() { return liveCandlesByAsset; },
         notifyDesktop: function (signal) {
           try {
             chrome.runtime.sendMessage({
@@ -707,7 +967,7 @@
       autoController.setArmed(isPrimaryContext && !!s.armed);
     }
     replayClosedOrders();
-    const armBtn = document.getElementById("cb-arm");
+    const armBtn = document.getElementById("qxp-arm");
     if (armBtn) {
       const armed = isPrimaryContext && !!s.armed;
       armBtn.textContent = isPrimaryContext ? (armed ? "ARMED" : "ARM") : "MAIN TAB ONLY";
@@ -736,11 +996,11 @@
     if (!periods) return null;
     let selected = null;
     if (periods[lastWsPeriod] && periods[lastWsPeriod].candles.length) selected = periods[lastWsPeriod];
-    // Never fall back to 1m after the broker switches timeframe. Showing an
-    // older period here is the source of deceptive "1m" candles. Wait for
-    // the matching broker batch instead.
-    else if (lastWsPeriod != null) return null;
-    else {
+    // v2.7.1: fall back to the most recent period's data if the requested
+    // period hasn't arrived yet. Previously returned null, which made the
+    // dashboard chart go blank until the user scrolled to trigger a history
+    // batch. Now shows whatever data is available while waiting.
+    if (!selected) {
       for (const p in periods) {
         const item = periods[p];
         if (item && item.candles && item.candles.length && (!selected || item.ts > selected.ts)) selected = item;
@@ -776,7 +1036,7 @@
    * buckets are never rewritten — resampled tick bars differ from the
    * broker's own candles (missed ticks, bid/ask), and overwriting them is
    * exactly what made the dashboard disagree with the platform chart. Only
-   * the newest, still-open bucket follows the live feed.
+   * append a new bucket if the live bar is newer than the broker's last candle.
    */
   function overlayLiveBar(bars, liveBar) {
     if (!Array.isArray(bars) || !bars.length) return bars;
@@ -784,27 +1044,12 @@
     if (!Number.isSafeInteger(liveTime) || liveTime <= 0) return bars;
     const lastIdx = bars.length - 1;
     const lastTime = Number(bars[lastIdx] && bars[lastIdx].time);
-    if (!Number.isSafeInteger(lastTime) || liveTime < lastTime) return bars;
-    if (liveTime > lastTime) {
-      // The local bucket is newer than anything the broker has sent yet.
-      return bars.concat([liveBar]);
-    }
-    const bar = bars[lastIdx];
-    const open = Number(bar.open), high = Number(bar.high), low = Number(bar.low);
-    const liveHigh = Number(liveBar.high), liveLow = Number(liveBar.low), liveClose = Number(liveBar.close);
-    if (![open, high, low, liveHigh, liveLow, liveClose].every((n) => Number.isFinite(n) && n > 0 && n <= 1e12)) {
-      return bars;
-    }
-    const next = bars.slice();
-    next[lastIdx] = {
-      time: liveTime,
-      open: open,
-      high: Math.max(high, liveHigh),
-      low: Math.min(low, liveLow),
-      close: liveClose,
-      volume: Number.isFinite(Number(bar.volume)) ? Number(bar.volume) : 0,
-    };
-    return next;
+    if (!Number.isSafeInteger(lastTime) || liveTime <= lastTime) return bars;
+    // v2.7.1: only append if the live bar is strictly newer. Never modify
+    // the broker's existing candles — they are the source of truth for the
+    // dashboard chart. Modifying them caused the "dashboard doesn't match
+    // Quotex" issue.
+    return bars.concat([liveBar]);
   }
 
   function scheduleTickSignalRefresh() {
@@ -895,7 +1140,7 @@
     if (!trust.engine && safePeriod === 60) {
       if (!ingestTrustLog[id] || Date.now() - ingestTrustLog[id] > 60000) {
         ingestTrustLog[id] = Date.now();
-        try { console.warn("[CYBER] candle batch for " + id + " kept for display only: " + trust.reason); } catch (_) {}
+        try { console.warn("candle batch for " + id + " kept for display only: " + trust.reason); } catch (_) {}
       }
     }
     const useForEngine = safePeriod === 60 && trust.engine;
@@ -912,7 +1157,14 @@
     }
     if (useForEngine) realBarCount[id] = feed.series().length;
     if (useForEngine && feed.series().length >= 2) persistLiveCandles(id, true);
-    if (useForEngine && feed.series().length >= 40) realHistoryReady[id] = true;
+    // v2.7.6: reduced from 40 to 20 bars. 40 was excessive — the engine needs
+    // ~50 bars for indicators to warm up (handled by minBars in analyze()),
+    // but realHistoryReady gates auto-trade EXECUTION, not signal generation.
+    // Signals already require 40+ candles internally; this gate just confirms
+    // the feed has genuine broker data. 20 bars is enough to confirm the
+    // asset is receiving real data while not blocking auto-trade for 40+
+    // minutes after an asset switch.
+    if (useForEngine && feed.series().length >= 20) realHistoryReady[id] = true;
     const newestRealTime = real[real.length - 1].time;
     // v2.6.5: the upper bound tolerates broker-server clock skew (old bound
     // was +1 minute, which made "live" detection fail whenever the server
@@ -925,6 +1177,12 @@
     // other open/mini charts are retained per asset+period but NEVER select
     // the active chart.
     mergeChartCandles(id, safePeriod, real);
+    // v2.7.6: populate the live candle cache for the autoHighAccuracy gate.
+    // Only store 1m bars (the engine's timeframe) — higher timeframes are
+    // chart-only and would confuse the asset evaluator.
+    if (safePeriod === 60 && useForEngine) {
+      liveCandlesByAsset[id] = feed.series().slice(-500);
+    }
     if (id === activeAsset || id === lastWsSymbol || !historySeeded[activeAsset]) {
       if (activeAsset !== id && !manualAsset) {
         activateAsset(id);
@@ -1249,12 +1507,37 @@
     // A signal is handed to auto once per closed bar and only by the browser
     // tab selected as primary in background.js. Other open Quotex charts can
     // collect data, but can never place duplicate trades.
-    if (isPrimaryContext && authoritativeMain && realHistoryReady[activeAsset] && liveClosedBar &&
+    // v2.7.6: relaxed the authoritativeMain gate — when manualAsset is set
+    // (dashboard-initiated switch), the WebSocket symbol may lag behind the
+    // active asset by a few seconds. Requiring exact match blocked auto-trade
+    // during the entire transition. Accept the signal when the feed has real
+    // data for the active asset regardless of the WS symbol lag.
+    const autoAuthoritative = authoritativeMain ||
+      (manualAsset && lastWsSymbol && QUOTEX && realHistoryReady[activeAsset]);
+    if (isPrimaryContext && autoAuthoritative && realHistoryReady[activeAsset] && liveClosedBar &&
         autoController && sig && sig.ready && sig.direction !== "WAIT") {
       const autoKey = String(sig.time || 0);
       if (autoKey !== lastAutoBarByAsset[sig.asset]) {
         lastAutoBarByAsset[sig.asset] = autoKey;
         try { autoController.handleSignal(sig); } catch (_) {}
+      }
+    } else if (isPrimaryContext && autoController && sig && sig.ready &&
+               sig.direction !== "WAIT" && !autoAuthoritative) {
+      // v2.7.6: log why auto-trade was skipped so users can debug
+      const reason = !realHistoryReady[activeAsset]
+        ? "waiting for broker history (need 20+ real candles)"
+        : !liveClosedBar
+          ? "no recently closed bar"
+          : "chart asset not confirmed";
+      if (Date.now() - (lastAutoSkipLog || 0) > 30000) {
+        lastAutoSkipLog = Date.now();
+        try {
+          window.postMessage({
+            source: _SRC_OUT,
+            kind: "auto_log",
+            payload: { level: "skip", msg: `Auto-trade skipped: ${reason}`, at: Date.now() },
+          }, "*");
+        } catch (_) {}
       }
     }
   }
@@ -1357,25 +1640,25 @@
   }
 
   function ensureHud() {
-    let el = document.getElementById("cyber-binary-hud");
+    let el = document.getElementById("qx-info-panel");
     if (el) return el;
     el = document.createElement("div");
-    el.id = "cyber-binary-hud";
+    el.id = "qx-info-panel";
     el.innerHTML =
-      '<div class="cb-hud-title">CYBER BINARY</div>' +
-      '<div class="cb-hud-asset" id="cb-asset">—</div>' +
-      '<div class="cb-hud-dir">SCAN</div>' +
-      '<div class="cb-hud-meta">Waiting for ticks…</div>' +
-      '<div class="cb-hud-row">' +
-        '<button type="button" class="cb-hud-btn" id="cb-arm">ARM</button>' +
-        '<button type="button" class="cb-hud-btn ghost" id="cb-open-dash">Dashboard</button>' +
+      '<div class="qxp-title">SIGNAL</div>' +
+      '<div class="qxp-asset" id="qxp-asset">—</div>' +
+      '<div class="qxp-dir">SCAN</div>' +
+      '<div class="qxp-meta">Waiting for ticks…</div>' +
+      '<div class="qxp-row">' +
+        '<button type="button" class="qxp-btn" id="qxp-arm">ARM</button>' +
+        '<button type="button" class="qxp-btn ghost" id="qxp-dash">Dashboard</button>' +
       '</div>';
     (document.body || document.documentElement).appendChild(el);
-    el.querySelector("#cb-open-dash").addEventListener("click", function () {
+    el.querySelector("#qxp-dash").addEventListener("click", function () {
       chrome.runtime.sendMessage({ type: "CYBER_OPEN_DASH" }).catch(() => {});
     });
-    el.querySelector("#cb-arm").addEventListener("click", function () {
-      const btn = el.querySelector("#cb-arm");
+    el.querySelector("#qxp-arm").addEventListener("click", function () {
+      const btn = el.querySelector("#qxp-arm");
       if (!isPrimaryContext || hudArmPending) {
         if (!isPrimaryContext) btn.textContent = "MAIN TAB ONLY";
         return;
@@ -1431,10 +1714,10 @@
     const fingerprint = [d, assetText, metaText].join("|");
     if (fingerprint === lastHudFingerprint) return;
     lastHudFingerprint = fingerprint;
-    el.querySelector(".cb-hud-dir").textContent = d;
+    el.querySelector(".qxp-dir").textContent = d;
     el.dataset.dir = d;
-    el.querySelector("#cb-asset").textContent = assetText;
-    el.querySelector(".cb-hud-meta").textContent = metaText;
+    el.querySelector("#qxp-asset").textContent = assetText;
+    el.querySelector(".qxp-meta").textContent = metaText;
   }
 
   function ingest(price, assetOverride, tickTime, source) {
@@ -1543,7 +1826,7 @@
     historyRequestedAt[key] = Date.now();
     try {
       window.postMessage({
-        source: "CYBER_BINARY_CONTENT",
+        source: _SRC_OUT,
         kind: "subscribe",
         payload: { requestId, asset: id, period: safePeriod, limit },
       }, "*");
@@ -1615,18 +1898,25 @@
       lastMarkersAsset = activeAsset;
       sendMarkers();
     }
+    // v2.7.5: periodic marker re-push every 5 seconds. The page-hook may
+    // miss the initial markers message (chart not yet captured, asset
+    // mismatch, or timing race). Re-sending ensures arrows eventually appear.
+    if (markerStore && currentTime - (lastMarkerPushAt || 0) >= 5000) {
+      lastMarkerPushAt = currentTime;
+      sendMarkers();
+    }
     ensureHistorySubscription(det || ASSETS.get(activeAsset));
   }
 
   function requestHookSync() {
     try {
-      window.postMessage({ source: "CYBER_BINARY_CONTENT", kind: "sync_request", payload: {} }, "*");
+      window.postMessage({ source: _SRC_OUT, kind: "sync_request", payload: {} }, "*");
     } catch (_) {}
   }
 
   /* -------- page-hook message router (v2.2: + snapshot/ws results) -------- */
   window.addEventListener("message", function (ev) {
-    if (ev.source !== window || !ev.data || ev.data.source !== "CYBER_BINARY_HOOK") return;
+    if (ev.source !== window || !ev.data || ev.data.source !== _SRC_IN) return;
     const p = ev.data.payload || {};
     switch (ev.data.kind) {
       case "snapshot": {
@@ -1659,7 +1949,10 @@
           const period = Number(p.period);
           if (Number.isFinite(period) && period >= 1 && period <= 86400) lastWsPeriod = Math.floor(period);
           const det = ASSETS.ensureRegistered(p.symbol);
-          if (manualAsset && det && det.id !== manualAsset) manualAsset = null;
+          // v2.7.2: respect a 5-second grace period after manual asset selection
+          // to prevent old "asset" events from resetting the selection before
+          // Quotex confirms the chart switch.
+          if (manualAsset && det && det.id !== manualAsset && Date.now() - manualAssetSetAt > 5000) manualAsset = null;
           if (det && det.id !== activeAsset) {
             activateAsset(det.id);
             lastWsPrice = null;
@@ -1967,7 +2260,7 @@
       };
       try {
         window.postMessage({
-          source: "CYBER_BINARY_CONTENT",
+          source: _SRC_OUT,
           kind: "place_ws",
           payload: {
             requestId,
@@ -1975,7 +2268,11 @@
             dir: orderArgs.dir,
             amount: orderArgs.stake,
             expirySec: orderArgs.expirySec,
-            isDemo: !!(lastBalance && lastBalance.isDemo),
+            // v2.6.18: use the caller's isDemo (which has DOM fallback and
+            // safe demo default) instead of re-deriving from lastBalance
+            // alone. When no balance event had arrived, !!null produced
+            // false (live), the opposite of the safe default.
+            isDemo: orderArgs.isDemo !== false,
             optionType: orderArgs.optionType,
           },
         }, "*");
@@ -2062,9 +2359,15 @@
       return { ok: false, confirmed: false, error: "expiry must be between 0.5 and 1,440 minutes" };
     }
     const expirySec = Math.max(30, Math.round(expiry * 60));
-    if (!lastWsSymbol) return { ok: false, confirmed: false, error: "authoritative main chart is not known" };
+    if (!lastWsSymbol && !manualAsset) return { ok: false, confirmed: false, error: "authoritative main chart is not known" };
     const asset = args.asset || lastWsSymbol;
-    if (QUOTEX.normalizeSymbol(asset) !== QUOTEX.normalizeSymbol(lastWsSymbol)) {
+    // v2.7.6: relaxed the asset match check. When manualAsset is set
+    // (dashboard switch), lastWsSymbol may lag behind the active asset.
+    // Accept the trade if the asset matches EITHER lastWsSymbol OR the
+    // manually selected activeAsset.
+    const wsMatch = lastWsSymbol && QUOTEX.normalizeSymbol(asset) === QUOTEX.normalizeSymbol(lastWsSymbol);
+    const manualMatch = manualAsset && QUOTEX.normalizeSymbol(asset) === QUOTEX.normalizeSymbol(activeAsset);
+    if (!wsMatch && !manualMatch) {
       return { ok: false, confirmed: false, error: "trade asset is not the authoritative main chart" };
     }
 
@@ -2156,7 +2459,7 @@
         for (const key of Object.keys(pendingByAsset)) delete pendingByAsset[key];
         stats.pending = null;
       }
-      const armBtn = document.getElementById("cb-arm");
+      const armBtn = document.getElementById("qxp-arm");
       if (!isPrimaryContext && armBtn) {
         armBtn.textContent = "MAIN TAB ONLY";
         armBtn.classList.remove("armed");
@@ -2224,20 +2527,25 @@
         sendResponse({ ok: false, error: "unknown or invalid asset", asset: activeAsset });
         return;
       }
-      // The dashboard cannot safely switch the broker's chart. Pinning a
-      // different local feed made the UI display synthetic candles for one
-      // asset while Quotex was trading another. Only acknowledge the symbol
-      // already selected on the authoritative main chart.
-      const matchesMain = !!lastWsSymbol && !!QUOTEX &&
-        QUOTEX.normalizeSymbol(det.id) === QUOTEX.normalizeSymbol(lastWsSymbol);
-      if (!matchesMain) {
-        sendResponse({ ok: false, asset: activeAsset,
-          error: "Select " + det.name + " on the Quotex chart first" });
-        return;
-      }
-      manualAsset = null;
+      // v2.7.2: allow switching assets from the dashboard. The subscription
+      // sends instruments/update to Quotex which switches the broker chart,
+      // then history/list/v2 requests candle data for the new asset.
+      manualAsset = det.id;
+      manualAssetSetAt = Date.now();
       activateAsset(det.id);
-      sendResponse({ ok: true, asset: det.id, manual: false });
+      // Check if the WebSocket is connected - if not, the subscription will
+      // fail silently and the user will need to open Quotex first.
+      const wsConnected = !!lastWsSymbol && !!QUOTEX;
+      sendResponse({
+        ok: true,
+        asset: det.id,
+        name: det.name,
+        manual: true,
+        wsConnected,
+        message: wsConnected
+          ? "Switching to " + det.name + " — requesting candle data..."
+          : "Open Quotex first to receive live candle data for " + det.name
+      });
       return;
     }
     if (msg && msg.type === "CYBER_DETECT_ASSET") {
@@ -2276,5 +2584,17 @@
     } else {
       attach();
     }
+    // v2.7.2: invalidate cached DOM element and re-detect on URL changes.
+    // Quotex uses client-side routing; navigating between assets may change
+    // the URL without a full page reload.
+    const invalidateAssetCache = () => {
+      cachedAssetElement = null;
+      cachedAssetElementText = null;
+      lastDomAssetResult = null;
+      lastDomAssetScan = 0;
+      lastDomTextScan = 0;
+    };
+    window.addEventListener("popstate", invalidateAssetCache);
+    window.addEventListener("hashchange", invalidateAssetCache);
   }
 })();

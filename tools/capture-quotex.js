@@ -76,7 +76,7 @@ async function main() {
       self.__cyberCapture.wrapWs = function () {
         try {
           var OrigWs = window.WebSocket;
-          if (!OrigWs || OrigWs.__cyberWrapped) return;
+          if (!OrigWs || OrigWs._qxW) return;
           var Wrapped = function (url, protocols) {
             var ws = protocols === undefined ? new OrigWs(url) : new OrigWs(url, protocols);
             try {
@@ -96,7 +96,7 @@ async function main() {
             return ws;
           };
           Wrapped.prototype = OrigWs.prototype;
-          Wrapped.__cyberWrapped = true;
+          Wrapped._qxW = true;
           Object.defineProperty(window, "WebSocket", { value: Wrapped, writable: true, configurable: true });
         } catch (_) {}
       };
@@ -104,7 +104,7 @@ async function main() {
       window.addEventListener("message", function (ev) {
         try {
           var d = ev.data;
-          if (!d || d.source !== "CYBER_BINARY_HOOK") return;
+          if (!d || d.source !== "_q1h") return;
           self.__cyberCapture.counts[d.kind] = (self.__cyberCapture.counts[d.kind] || 0) + 1;
           if (d.kind === "candle" && d.payload) {
             var p = d.payload;
@@ -161,7 +161,7 @@ async function main() {
   // Mirror the extension: ask the hook to subscribe 1m history per asset.
   const subscribe = (asset) => page.evaluate((a) => {
     window.postMessage({
-      source: "CYBER_BINARY_CONTENT", kind: "subscribe",
+      source: "_q1c", kind: "subscribe",
       payload: { requestId: "capture_" + a + "_" + Date.now(), asset: a, period: 60, limit: 5000 },
     }, "*");
   }, asset);

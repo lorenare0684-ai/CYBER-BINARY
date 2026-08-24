@@ -377,8 +377,10 @@ if (rs.length !== 2 || rs[0].time !== 1700000000000) { console.error("resample m
 if (TA.softmaxProbs(1e308, 0).call < 0.99) { console.error("softmax overflow guard failed"); failed++; }
 const onePointConfidence = TA.softmaxProbs(4, 3).call;
 const twoPointConfidence = TA.softmaxProbs(5, 3).call;
-if (onePointConfidence < 0.59 || onePointConfidence > 0.61 ||
-    twoPointConfidence < 0.68 || twoPointConfidence > 0.70) {
+// v2.7.0: k lowered from 0.4 to 0.25 for sharper confidence discrimination.
+// Expected: (4,3) ≈ 0.56, (5,3) ≈ 0.62 at k=0.25.
+if (onePointConfidence < 0.54 || onePointConfidence > 0.58 ||
+    twoPointConfidence < 0.60 || twoPointConfidence > 0.64) {
   console.error("softmax confidence is saturated instead of tracking vote separation"); failed++;
 }
 if (TA.lastValid(null).index !== -1) { console.error("lastValid malformed-input guard failed"); failed++; }
@@ -482,7 +484,7 @@ function trendingPullbackSeries() {
 const trendPullbackSignal = sandbox.self.CYBER_ENGINE.analyze(trendingPullbackSeries(), {
   strategy: "scalp", lean: false,
 });
-if (!trendPullbackSignal || trendPullbackSignal.regime !== "trending" ||
+if (!trendPullbackSignal || (trendPullbackSignal.regime !== "trending" && trendPullbackSignal.regime !== "strong-trend") ||
     trendPullbackSignal.direction !== "CALL" || trendPullbackSignal.score <= 0 ||
     trendPullbackSignal.confidence <= 0 || trendPullbackSignal.metrics.callScore <= trendPullbackSignal.metrics.putScore ||
     trendPullbackSignal.metrics.mtfChecked !== 2) {

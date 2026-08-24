@@ -127,6 +127,7 @@
         horizon,
         minConf,
         minBars,
+        lean: false,  // Match live signal path (content.js uses lean: false)
       });
       out.push({
         asset: a.id, name: a.name, kind: a.kind,
@@ -211,6 +212,7 @@
               horizon: opts.horizon || 3,
               minConf: opts.minConf || 0,
               minBars: opts.minBars != null ? opts.minBars : 200,
+              lean: false,  // Match live signal path (content.js uses lean: false)
             });
             out.push({
               asset: j.aid, name: currentMeta.name, kind: currentMeta.kind,
@@ -360,7 +362,7 @@
     const assets = uniqueById(Array.isArray(opts.assets) ? opts.assets : ASSETS.list(),
       resolveAsset, 256)
       .filter((a) => matchesKinds(a, opts.kinds));
-    const strategies = uniqueById(Array.isArray(opts.strategies) ? opts.strategies : STRAT.list(),
+    const strategies = uniqueById(Array.isArray(opts.strategies) ? opts.strategies : STRATEGIES.list(),
       resolveStrategy, 128);
     if (!assets.length || !strategies.length) {
       return Promise.resolve({ results: [], count: 0 });

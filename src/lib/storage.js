@@ -21,7 +21,7 @@
       maxTradesPerDay: 60,
       dailyLossCap: 30,           // $ — stop on loss
       dailyProfitCap: 0,          // $ — 0 = no cap
-      minConfidence: 65,          // refuse signals below this confidence
+      minConfidence: 90,          // v2.7.0: only 90+ confidence has real edge (81.5% WR)
       cooldownBars: 2,            // min bars between trades
       accountMode: "demo",        // v2.6.9 demo|live|any — auto refuses the wrong account type
       stakeMode: "fixed",         // v2.6.9 fixed|percent

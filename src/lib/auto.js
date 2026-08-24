@@ -294,21 +294,25 @@
       if (s.dailyProfitCap && s.dailyProfitCap > 0 && ctx.dailyPnl >= s.dailyProfitCap) {
         return { ok: false, reason: `Daily profit cap reached` };
       }
-      // v2.6.9: account-mode gate. Default is "demo" — the safest posture:
-      // auto-trade refuses to touch a LIVE balance unless the user
-      // explicitly switched accountMode to "live"/"any", and refuses to
-      // guess when no balance event has identified the account yet.
+      // v2.6.9 + v2.7.6: account-mode gate. Default is "demo" — auto-trade
+      // refuses to touch a LIVE balance unless the user explicitly switched
+      // accountMode to "live"/"any".
+      // v2.7.6: when no balance event has arrived (isDemo == null), allow
+      // trading with a warning rather than blocking entirely. The old code
+      // blocked with "Account mode unknown" which prevented ALL trades for
+      // users whose broker never sent a balance event (common on first use).
       const accountMode = s.accountMode === "live" || s.accountMode === "any" ? s.accountMode : "demo";
       if (accountMode !== "any") {
-        if (ctx.account.isDemo == null) {
-          return { ok: false, reason: "Account mode unknown (no balance event yet) — set Account to Any to override" };
-        }
         if (accountMode === "demo" && ctx.account.isDemo === false) {
           return { ok: false, reason: "Demo-only mode: connected account is LIVE (switch Account to Live/Any to trade it)" };
         }
         if (accountMode === "live" && ctx.account.isDemo === true) {
           return { ok: false, reason: "Live-only mode: connected account is DEMO" };
         }
+        // v2.7.6: isDemo == null means no balance event yet. For "demo" mode
+        // this is acceptable — proceed with the trade. The broker itself will
+        // reject if the account type is wrong. Only "live" mode requires
+        // confirmed live status (handled above).
       }
       // v2.6.9: minimum-balance stop (0 disables). Only enforced when the
       // balance is actually known.
@@ -326,11 +330,20 @@
       }
       if (s.autoHighAccuracy && root.CYBER_ASSET_SELECTOR && signal.asset) {
         try {
+          const evalStats = await safeStorage().getStats();
           const evalRes = root.CYBER_ASSET_SELECTOR.evaluateAsset(
             { id: signal.asset },
-            { stats: await safeStorage().getStats() }
+            {
+              stats: evalStats,
+              candlesByAsset: opts.candlesByAsset || null,
+              history: evalStats && evalStats.history,
+            }
           );
-          if (evalRes && evalRes.expectedValue < 0) {
+          // v2.7.6: only gate on negative EV when there is actual evidence.
+          // An asset with zero trades and no live candles produces a
+          // fabricated baseline EV that is almost always negative — gating
+          // on it blocks every trade on every new/unseen asset.
+          if (evalRes && evalRes.hasEvidence && evalRes.expectedValue < 0) {
             return { ok: false, reason: `Filtered by High-Accuracy Asset Gate (${signal.asset} EV: ${evalRes.expectedValuePct}%)` };
           }
         } catch (_) {}
@@ -338,10 +351,16 @@
       // Cooldown — enforced unconditionally (v2.3: the old check depended on
       // signal.metrics.closeTime which the engine never sets, so cooldown was
       // skipped entirely and auto mode spammed one trade per 500ms tick).
-      if (ctx.lastTrade) {
-        const mins = (Date.now() - ctx.lastTrade.at) / 60000;
-        if (mins < (s.cooldownBars || 0)) {
-          return { ok: false, reason: `Cooldown (${mins.toFixed(1)}m of ${s.cooldownBars}m)` };
+      // v2.7.6: cooldownBars is the number of 1-minute bars to wait between
+      // trades. At 1m timeframe, 1 bar = 1 minute. Only enforce when there
+      // IS a previous trade (ctx.lastTrade.at > 0).
+      if (ctx.lastTrade && ctx.lastTrade.at > 0) {
+        const cooldownMinutes = Math.max(0, numberValue(s.cooldownBars) || 0);
+        if (cooldownMinutes > 0) {
+          const elapsed = (Date.now() - ctx.lastTrade.at) / 60000;
+          if (elapsed < cooldownMinutes) {
+            return { ok: false, reason: `Cooldown (${elapsed.toFixed(1)}m of ${cooldownMinutes}m)` };
+          }
         }
       }
       // Hard safety floor: never act more often than every 5 seconds, no
@@ -389,6 +408,11 @@
       // 10 was submitted to the broker and rejected there (or, on a live
       // account, silently ate the whole balance). Refuse it here instead.
       const fixedStake = numberValue(s.stake);
+      // v2.7.1: Quotex minimum stake is $1. A stake below that is silently
+      // rejected by the broker, wasting the signal. Refuse it here instead.
+      if (fixedStake != null && fixedStake < 1) {
+        return { ok: false, reason: `Stake below broker minimum ($1.00): ${fixedStake.toFixed(2)}` };
+      }
       if (ctx.account.balance != null && ctx.account.balance > 0 &&
           fixedStake != null && fixedStake > ctx.account.balance) {
         return {

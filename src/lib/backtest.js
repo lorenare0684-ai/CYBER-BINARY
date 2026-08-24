@@ -104,6 +104,7 @@
       horizon: o.horizon,
       minConf: o.minConf,
       minBars: o.minBars,
+      lean: false,  // Match live signal path (content.js uses lean: false)
     });
     return {
       asset: asset.id,
@@ -161,6 +162,7 @@
           horizon: o.horizon,
           minConf: o.minConf,
           minBars: o.minBars,
+          lean: false,  // Match live signal path (content.js uses lean: false)
         });
         results.push({
           asset: a.id,

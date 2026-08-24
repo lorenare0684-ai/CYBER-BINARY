@@ -6,7 +6,7 @@
  *   - tools/page-hook.shell.js (MAIN-world WebSocket hook shell)
  *
  * Rebuild after any change to either source file.
- * Generated: 2026-08-24T05:58:54.842Z
+ * Generated: 2026-08-24T19:02:12.394Z
  */
 /* ====================================================================
  * Inlined CYBER_QUOTEX adapter (src/lib/quotex.js).
@@ -1003,7 +1003,12 @@
     else if (explicitLoss) netProfit = profit != null && profit < 0 ? profit : (amount > 0 ? -amount : null);
     else if (explicitWin && profit != null) netProfit = amount > 0 && profit >= amount ? profit - amount : profit;
     else if (profit != null && profit < 0) netProfit = profit;
-    else if (amount > 0 && profit === 0) netProfit = -amount;
+    else if (amount > 0 && profit === 0) {
+      // v2.7.1: profit=0 could be a loss OR a draw/refund. Without an explicit
+      // draw flag, we cannot distinguish. Treat as unknown (null) rather than
+      // fabricating a loss, which would freeze the asset and corrupt P&L.
+      netProfit = null;
+    }
     else if (amount > 0 && profit != null && profit > amount) netProfit = profit - amount;
     else if (profit != null) netProfit = profit;
     var draw = explicitDraw || (!explicitWin && !explicitLoss && netProfit === 0);
@@ -1738,8 +1743,13 @@
     // expiry, rounded to the minute. Epoch arithmetic avoids local-time DST
     // jumps that Date#setMinutes can introduce.
     var nowSec = Math.floor(baseNow / 1000);
-    var extra = nowSec % 60 >= 30 ? 1 : 0;
-    return (Math.floor(nowSec / 60) + minutes + extra) * 60;
+    // v2.7.1: round up to the next minute boundary if not exactly on one.
+    // The old logic added an extra minute when past the 30-second mark, which
+    // caused a 1-minute expiry at 10:00:31 to become 10:02 instead of 10:01.
+    var currentMinute = Math.floor(nowSec / 60);
+    var secondsIntoMinute = nowSec % 60;
+    var baseMinute = secondsIntoMinute > 0 ? currentMinute + 1 : currentMinute;
+    return (baseMinute + minutes) * 60;
   }
 
   /* ------------------------------------------------------------------
@@ -1854,7 +1864,7 @@
       amount: amount,
       time: timeField,
       action: action,
-      isDemo: brokerBool(args.isDemo, false) ? 1 : 0,
+      isDemo: isDemo,
       tournamentId: 0,
       requestId: requestNumber,
       optionType: optionType,
@@ -2387,7 +2397,9 @@
     "wss://ws3.qxbroker.com/socket.io/?EIO=3&transport=websocket",
   ];
 
-  root.CYBER_QUOTEX = {
+  // Non-enumerable so Object.keys(window) / for-in cannot fingerprint the extension.
+  Object.defineProperty(root, "CYBER_QUOTEX", {
+    value: {
     isQuotexPage: isQuotexPage,
     isQuotexHost: isQuotexHost,
     attachPageSocket: attachPageSocket,
@@ -2483,7 +2495,7 @@
     EXTRA_SYMBOLS: EXTRA_SYMBOLS,
     ID_TO_SYMBOL: ID_TO_SYMBOL,
     KNOWN_TIMEFRAMES: KNOWN_TIMEFRAMES,
-  };
+  }, enumerable: false, writable: true, configurable: true });
 })(typeof self !== "undefined" ? self : this);
 
 
@@ -2515,19 +2527,31 @@
  */
 (function () {
   try { if (window.top && window.top !== window.self) return; } catch (_) { return; }
-  if (window.__CYBER_WS_HOOK__) return;
-  window.__CYBER_WS_HOOK__ = true;
+  // Stealth: guard flag is non-enumerable so Object.keys(window) cannot see it.
+  var _G = typeof window !== "undefined" ? window : (typeof self !== "undefined" ? self : this);
+  var _HK = "_\u0078k7";
+  try {
+    var _gd = Object.getOwnPropertyDescriptor(_G, _HK);
+    if (_gd && _gd.value) return;
+    Object.defineProperty(_G, _HK, { value: true, enumerable: false, configurable: true, writable: true });
+  } catch (_) { return; }
 
-  var Q = window.CYBER_QUOTEX;
+  var Q = _G.CYBER_QUOTEX;
   if (!Q || typeof Q.createRouter !== "function") {
     // Should never happen (adapter is inlined above), but keep a graceful
     // fallback for third-party tampering.
     return;
   }
 
+  // Stealth: postMessage uses a non-descriptive source tag so broker
+  // fingerprinting scripts cannot grep for the extension's name.
+  var _SRC_OUT = "_q1h";
+  var _SRC_IN = "_q1c";
+  var _cyberFrames = []; // closure-scoped; never leaks to window
+
   function emit(kind, payload) {
     try {
-      window.postMessage({ source: "CYBER_BINARY_HOOK", kind: kind, payload: payload }, "*");
+      window.postMessage({ source: _SRC_OUT, kind: kind, payload: payload }, "*");
     } catch (_) {}
   }
 
@@ -2580,6 +2604,9 @@
       event: hit.event || null,
       main: true,
     });
+    // v2.7.5: chart asset changed — try to apply any markers that were
+    // deferred during the previous chart mismatch.
+    try { MARKERS.reapplyPendingMarkers(); } catch (_) {}
     return true;
   }
 
@@ -2682,13 +2709,12 @@
       // Do not allocate/debug-log high-frequency quote or candle events.
       if (label === "tick" || label === "candles") return;
       try {
-        if (!window.__cyber_frames) window.__cyber_frames = [];
-        window.__cyber_frames.unshift({
+        _cyberFrames.unshift({
           at: Date.now(),
           label: label,
           preview: frame && frame.raw ? String(frame.raw).slice(0, 160) : "",
         });
-        if (window.__cyber_frames.length > 20) window.__cyber_frames.length = 20;
+        if (_cyberFrames.length > 20) _cyberFrames.length = 20;
       } catch (_) {}
     },
   };
@@ -2717,6 +2743,12 @@
    *   c. a bounded React-fiber scan of the chart container (bundled builds
    *      that never expose the library globally).
    * ==================================================================== */
+  // Stealth: WeakSet tracks wrapped/hooked objects without leaving enumerable
+  // properties on the page's own objects (no __cyberWrapped / __cyberHooked).
+  var _wrappedSet = typeof WeakSet !== "undefined" ? new WeakSet() : null;
+  function _isWrapped(o) { return _wrappedSet ? _wrappedSet.has(o) : false; }
+  function _markWrapped(o) { if (_wrappedSet && o) try { _wrappedSet.add(o); } catch (_) {} }
+
   var MARKERS = (function () {
     var chart = null;        // selected (largest visible) lightweight-charts IChartApi
     var chartContainer = null;
@@ -2728,6 +2760,7 @@
     var lwcModule = null;     // window.LightweightCharts module ref (v5 createSeriesMarkers)
     var markersPlugin = null; // v5 ISeriesMarkersPluginApi bound to `series`
     var pluginSeries = null;  // series the markers plugin was created for
+    var pendingMarkersPayload = null; // v2.7.5: deferred markers during chart mismatch
     var rangeBoundChart = null; // chart whose timeScale redraw subscription is installed
     var CALL_COLOR = "#3dff9a";
     var PUT_COLOR = "#ff5d7a";
@@ -2759,8 +2792,8 @@
     }
 
     function hookSeries(s) {
-      if (!s || typeof s !== "object" || s.__cyberHooked) return s;
-      s.__cyberHooked = true;
+      if (!s || typeof s !== "object" || _isWrapped(s)) return s;
+      _markWrapped(s);
       var origSetData = s.setData;
       if (typeof origSetData === "function") {
         s.setData = function (data) {
@@ -2786,7 +2819,24 @@
               var sym2 = (live.activeChart && live.activeChart.symbol) || live.lastWsSymbol || "EURUSD";
               var norm2 = Q.normalizeCandles({ raw: [bar] });
               if (norm2.length) {
-                routerHandlers.onCandle({ asset: sym2, period: live.lastWsPeriod || 60, candles: norm2, verified: true });
+                // v2.7.1: MERGE the update into existing candles instead of replacing.
+                // series.update() fires on every tick for the forming candle;
+                // replacing would wipe history and only keep that one bar.
+                var p2 = live.lastWsPeriod || 60;
+                var k2 = sym2 + "@" + p2;
+                var existing = live.candles[k2] || [];
+                var merged = existing.slice();
+                var newBar = norm2[0];
+                if (merged.length && merged[merged.length - 1].time === newBar.time) {
+                  // Update the forming candle in place
+                  merged[merged.length - 1] = newBar;
+                } else {
+                  // New candle bucket
+                  merged.push(newBar);
+                }
+                // Keep bounded
+                if (merged.length > 5000) merged = merged.slice(-5000);
+                routerHandlers.onCandle({ asset: sym2, period: p2, candles: merged, verified: true });
               }
             }
           } catch (_) {}
@@ -2855,6 +2905,9 @@
       if (mode === "overlay") bindOverlayRangeWatcher();
       series = findExistingSeries(c);
       if (series) hookSeries(series);
+      // v2.7.5: a new chart was captured — try to apply any deferred markers
+      // that were waiting for a chart mismatch to resolve.
+      try { reapplyPendingMarkers(); } catch (_) {}
       // Wrap series adders so a re-created main series (asset / timeframe
       // switch) is captured too. Candlestick/bar adders REPLACE the marker
       // target (they are the price chart); overlays (line/area/…) only fill
@@ -2864,7 +2917,7 @@
         "addAreaSeries", "addBaselineSeries", "addHistogramSeries", "addSeries"];
       for (var i = 0; i < names.length; i++) (function (n) {
         var orig = c[n];
-        if (typeof orig !== "function" || orig.__cyberWrapped) return;
+        if (typeof orig !== "function" || _isWrapped(orig)) return;
         c[n] = function () {
           var s = orig.apply(this, arguments);
           if (isSeriesLike(s)) {
@@ -2881,7 +2934,7 @@
           }
           return s;
         };
-        try { c[n].__cyberWrapped = true; } catch (_) {}
+        _markWrapped(c[n]);
       })(names[i]);
       if (series) applyNative();
       return true;
@@ -2942,11 +2995,37 @@
         markers: Array.isArray(payload.markers) ? payload.markers.slice(-MAX) : [],
         bars: Array.isArray(payload.bars) ? payload.bars.slice(-400) : [],
       } : null;
+      // v2.7.5: defer markers on chart mismatch instead of silently clearing.
+      // When the user switches assets from the dashboard, the content script
+      // sends markers before Quotex confirms the chart switch. Storing them
+      // and applying when the chart catches up ensures arrows always appear.
       var chartMismatch = !!(lastPayload && lastPayload.asset && live.activeChart && live.activeChart.symbol &&
         Q.normalizeSymbol(lastPayload.asset) !== Q.normalizeSymbol(live.activeChart.symbol));
-      nativeList = chartMismatch ? [] : normalize(lastPayload && lastPayload.markers);
+      if (chartMismatch) {
+        // Store for later — applyNative will get them when the chart switches
+        pendingMarkersPayload = lastPayload;
+        nativeList = [];
+      } else {
+        pendingMarkersPayload = null;
+        nativeList = normalize(lastPayload && lastPayload.markers);
+      }
       // The platform may have recreated the main series (asset/timeframe
       // switch) since the last markers message — re-resolve it if needed.
+      if (!series && chart) series = findExistingSeries(chart);
+      applyNative();
+    }
+
+    /** v2.7.5: re-apply deferred markers when the chart switches to the
+     *  matching asset. Called from the asset-change detection path. */
+    function reapplyPendingMarkers() {
+      if (!pendingMarkersPayload) return;
+      var pending = pendingMarkersPayload;
+      var matchesNow = !!(pending.asset && live.activeChart && live.activeChart.symbol &&
+        Q.normalizeSymbol(pending.asset) === Q.normalizeSymbol(live.activeChart.symbol));
+      if (!matchesNow) return;
+      pendingMarkersPayload = null;
+      lastPayload = pending;
+      nativeList = normalize(pending.markers);
       if (!series && chart) series = findExistingSeries(chart);
       applyNative();
     }
@@ -3255,6 +3334,61 @@
           if (captureChart(cands[j])) found = true;
         }
       } catch (_) {}
+      // d) v2.7.5: scan element properties for chart instances (non-React).
+      // Some Quotex builds store the chart on the container element directly
+      // as a property (e.g. el._chart, el.chart, el._chartInstance).
+      try {
+        var containers = document.querySelectorAll("[class*='chart'], [class*='trading'], [id*='chart']");
+        for (var ci = 0; ci < containers.length && ci < 40; ci++) {
+          var cel = containers[ci];
+          var ckeys = [];
+          try { ckeys = Object.keys(cel); } catch (_) {}
+          for (var ck = 0; ck < ckeys.length && ck < 30; ck++) {
+            var cv = null;
+            try { cv = cel[ckeys[ck]]; } catch (_) {}
+            if (cv && isChartLike(cv) && captureChart(cv, cel)) found = true;
+          }
+          // Also check underscore-prefixed properties
+          var propNames = ["_chart", "chart", "_chartInstance", "chartInstance", "_lwc", "lwc", "_tvChart"];
+          for (var pi = 0; pi < propNames.length; pi++) {
+            var pv = null;
+            try { pv = cel[propNames[pi]]; } catch (_) {}
+            if (pv && isChartLike(pv) && captureChart(pv, cel)) found = true;
+          }
+        }
+      } catch (_) {}
+      // e) v2.7.5: deep property scan on the largest canvas's ancestors.
+      // Some bundled chart libraries store the API on a parent element's
+      // internal property that React fiber doesn't expose.
+      if (!found) {
+        try {
+          var bigCanvas = null, bigArea = 0;
+          var allC = document.querySelectorAll("canvas");
+          for (var bc = 0; bc < allC.length; bc++) {
+            try {
+              var br = allC[bc].getBoundingClientRect();
+              var ba = br.width > 200 && br.height > 100 ? br.width * br.height : 0;
+              if (ba > bigArea) { bigCanvas = allC[bc]; bigArea = ba; }
+            } catch (_) {}
+          }
+          if (bigCanvas) {
+            var walk = bigCanvas;
+            for (var wd = 0; walk && wd < 12; wd++) {
+              var wkeys = [];
+              try { wkeys = Object.getOwnPropertyNames(walk); } catch (_) {}
+              for (var wk = 0; wk < wkeys.length && wk < 50; wk++) {
+                var wv = null;
+                try { wv = walk[wkeys[wk]]; } catch (_) {}
+                if (wv && typeof wv === "object" && !Array.isArray(wv) && isChartLike(wv)) {
+                  if (captureChart(wv, walk)) { found = true; break; }
+                }
+              }
+              if (found) break;
+              walk = walk.parentElement;
+            }
+          }
+        } catch (_) {}
+      }
       return found;
     }
 
@@ -3333,7 +3467,7 @@
           set: function (v) {
             _lwc = v;
             if (name === "LightweightCharts") lwcModule = v;
-            if (v && typeof v.createChart === "function" && !v.__cyberWrapped) {
+            if (v && typeof v.createChart === "function" && !_isWrapped(v)) {
               var origCreate = v.createChart;
               v.createChart = function () {
                 var container = arguments[0];
@@ -3341,11 +3475,11 @@
                 try { captureChart(c, container); } catch (_) {}
                 return c;
               };
-              try { v.__cyberWrapped = true; } catch (_) {}
+              _markWrapped(v);
             }
           },
         });
-        if (_lwc && typeof _lwc.createChart === "function" && !_lwc.__cyberWrapped) {
+        if (_lwc && typeof _lwc.createChart === "function" && !_isWrapped(_lwc)) {
           if (name === "LightweightCharts") lwcModule = _lwc;
           var origCreate2 = _lwc.createChart;
           _lwc.createChart = function () {
@@ -3354,7 +3488,7 @@
             try { captureChart(c, container); } catch (_) {}
             return c;
           };
-          try { _lwc.__cyberWrapped = true; } catch (_) {}
+          _markWrapped(_lwc);
         }
       } catch (_) {}
     }
@@ -3369,6 +3503,7 @@
     return {
       captureChart: captureChart,
       applyMarkers: applyMarkers,
+      reapplyPendingMarkers: reapplyPendingMarkers,
       hasChart: hasChart,
       isChartLike: isChartLike,
       mode: function () { return mode; },
@@ -3393,7 +3528,7 @@
       lastWsPeriod: live.lastWsPeriod,
       activeChart: live.activeChart,
       socket: !!handle.lastWs,
-      frames: (window.__cyber_frames || []).slice(0, 12),
+      frames: _cyberFrames.slice(0, 12),
     };
   }
 
@@ -3454,6 +3589,13 @@
         } catch (_) {}
         return nativeSend(data);
       };
+      // Stealth: make the wrapped send look native to toString() probes.
+      try {
+        Object.defineProperty(ws.send, "toString", {
+          value: function () { return "function send() { [native code] }"; },
+          configurable: true, writable: true,
+        });
+      } catch (_) {}
       ws.addEventListener("open", function () {
         if (brokerSocket && handle.lastWs === ws) try { emit("quotex_status", { state: "open", url: url || "" }); } catch (_) {}
       });
@@ -3473,23 +3615,35 @@
     Wrapped.CLOSING = Native.CLOSING;
     Wrapped.CLOSED = Native.CLOSED;
     try { Object.setPrototypeOf(Wrapped, Native); } catch (_) {}
+    // Stealth: make toString() and name indistinguishable from the real constructor.
+    try {
+      Object.defineProperty(Wrapped, "name", { value: "WebSocket", configurable: true });
+      Object.defineProperty(Wrapped, "toString", {
+        value: function () { return "function WebSocket() { [native code] }"; },
+        configurable: true, writable: true,
+      });
+    } catch (_) {}
     handle.wrapper = Wrapped;
     window.WebSocket = Wrapped;
   }
 
+  // Stealth: internal handle is non-enumerable (invisible to Object.keys(window)).
   try {
-    window.__cyber = {
-      adapter: Q,
-      handle: handle,
-      router: router,
-      live: live,
-      snapshot: snapshot,
-      markers: MARKERS,
-      detach: function () {
-        if (handle.wrapper && window.WebSocket === handle.wrapper) window.WebSocket = handle.native;
-        window.__CYBER_WS_HOOK__ = false;
+    Object.defineProperty(_G, "_\u0078kh", {
+      value: {
+        adapter: Q,
+        handle: handle,
+        router: router,
+        live: live,
+        snapshot: snapshot,
+        markers: MARKERS,
+        detach: function () {
+          if (handle.wrapper && window.WebSocket === handle.wrapper) window.WebSocket = handle.native;
+          try { Object.defineProperty(_G, _HK, { value: false, enumerable: false, configurable: true, writable: true }); } catch (_) {}
+        },
       },
-    };
+      enumerable: false, configurable: true, writable: true,
+    });
   } catch (_) {}
 
   // v2.3.3: try to capture the platform chart (web component / React fiber /
@@ -3507,7 +3661,7 @@
   //                     page's own socket (mirrors the web client's frames).
   //   - place_ws      → send a real `orders/open` frame on the page socket.
   window.addEventListener("message", function (ev) {
-    if (ev.source !== window || !ev.data || ev.data.source !== "CYBER_BINARY_CONTENT") return;
+    if (ev.source !== window || !ev.data || ev.data.source !== _SRC_IN) return;
     if (ev.data.kind === "sync_request") {
       emit("snapshot", snapshot());
     } else if (ev.data.kind === "subscribe") {
