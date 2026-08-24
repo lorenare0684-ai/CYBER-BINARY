@@ -310,7 +310,24 @@
               var sym2 = (live.activeChart && live.activeChart.symbol) || live.lastWsSymbol || "EURUSD";
               var norm2 = Q.normalizeCandles({ raw: [bar] });
               if (norm2.length) {
-                routerHandlers.onCandle({ asset: sym2, period: live.lastWsPeriod || 60, candles: norm2, verified: true });
+                // v2.7.1: MERGE the update into existing candles instead of replacing.
+                // series.update() fires on every tick for the forming candle;
+                // replacing would wipe history and only keep that one bar.
+                var p2 = live.lastWsPeriod || 60;
+                var k2 = sym2 + "@" + p2;
+                var existing = live.candles[k2] || [];
+                var merged = existing.slice();
+                var newBar = norm2[0];
+                if (merged.length && merged[merged.length - 1].time === newBar.time) {
+                  // Update the forming candle in place
+                  merged[merged.length - 1] = newBar;
+                } else {
+                  // New candle bucket
+                  merged.push(newBar);
+                }
+                // Keep bounded
+                if (merged.length > 5000) merged = merged.slice(-5000);
+                routerHandlers.onCandle({ asset: sym2, period: p2, candles: merged, verified: true });
               }
             }
           } catch (_) {}

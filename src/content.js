@@ -745,11 +745,11 @@
     if (!periods) return null;
     let selected = null;
     if (periods[lastWsPeriod] && periods[lastWsPeriod].candles.length) selected = periods[lastWsPeriod];
-    // Never fall back to 1m after the broker switches timeframe. Showing an
-    // older period here is the source of deceptive "1m" candles. Wait for
-    // the matching broker batch instead.
-    else if (lastWsPeriod != null) return null;
-    else {
+    // v2.7.1: fall back to the most recent period's data if the requested
+    // period hasn't arrived yet. Previously returned null, which made the
+    // dashboard chart go blank until the user scrolled to trigger a history
+    // batch. Now shows whatever data is available while waiting.
+    if (!selected) {
       for (const p in periods) {
         const item = periods[p];
         if (item && item.candles && item.candles.length && (!selected || item.ts > selected.ts)) selected = item;
@@ -785,7 +785,7 @@
    * buckets are never rewritten — resampled tick bars differ from the
    * broker's own candles (missed ticks, bid/ask), and overwriting them is
    * exactly what made the dashboard disagree with the platform chart. Only
-   * the newest, still-open bucket follows the live feed.
+   * append a new bucket if the live bar is newer than the broker's last candle.
    */
   function overlayLiveBar(bars, liveBar) {
     if (!Array.isArray(bars) || !bars.length) return bars;
@@ -793,27 +793,12 @@
     if (!Number.isSafeInteger(liveTime) || liveTime <= 0) return bars;
     const lastIdx = bars.length - 1;
     const lastTime = Number(bars[lastIdx] && bars[lastIdx].time);
-    if (!Number.isSafeInteger(lastTime) || liveTime < lastTime) return bars;
-    if (liveTime > lastTime) {
-      // The local bucket is newer than anything the broker has sent yet.
-      return bars.concat([liveBar]);
-    }
-    const bar = bars[lastIdx];
-    const open = Number(bar.open), high = Number(bar.high), low = Number(bar.low);
-    const liveHigh = Number(liveBar.high), liveLow = Number(liveBar.low), liveClose = Number(liveBar.close);
-    if (![open, high, low, liveHigh, liveLow, liveClose].every((n) => Number.isFinite(n) && n > 0 && n <= 1e12)) {
-      return bars;
-    }
-    const next = bars.slice();
-    next[lastIdx] = {
-      time: liveTime,
-      open: open,
-      high: Math.max(high, liveHigh),
-      low: Math.min(low, liveLow),
-      close: liveClose,
-      volume: Number.isFinite(Number(bar.volume)) ? Number(bar.volume) : 0,
-    };
-    return next;
+    if (!Number.isSafeInteger(lastTime) || liveTime <= lastTime) return bars;
+    // v2.7.1: only append if the live bar is strictly newer. Never modify
+    // the broker's existing candles — they are the source of truth for the
+    // dashboard chart. Modifying them caused the "dashboard doesn't match
+    // Quotex" issue.
+    return bars.concat([liveBar]);
   }
 
   function scheduleTickSignalRefresh() {
