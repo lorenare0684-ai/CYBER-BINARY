@@ -115,6 +115,7 @@
   let lastOrders = [];
   const pendingWs = Object.create(null);       // page-hook send ack requestId -> resolver
   const pendingHistory = Object.create(null);  // page-hook history-subscription requestId -> resolver
+  const pendingHistoryMeta = Object.create(null); // requestId -> {asset, period} for retry bookkeeping
   let historyRequestSequence = 0;
   const pendingOrders = Object.create(null);   // broker order-open requestId -> resolver
   const settledOrderIds = Object.create(null); // de-dupe broker close replays
@@ -1354,30 +1355,71 @@
     return true;
   }
 
-  function ensureHistorySubscription(det, force, requestedLimit) {
-    if (!det || !QUOTEX || !QUOTEX.subscribeHistory) return null;
-    const id = det.id;
-    const at = historyRequestedAt[id] || 0;
-    // Once real history has arrived, live ticks extend the cache; do not pull a
-    // 5,000-row batch on every periodic scan. The backtest button can still
-    // force one refresh on demand.
-    if (!force && historySeeded[id]) return null;
-    if (!force && Date.now() - at < 30000) return null; // retry initial attachment at most every 30s
+  function historyKey(id, period) { return id + "@" + period; }
+
+  /**
+   * Ask the broker for real OHLC history on one asset + timeframe.
+   *
+   * The engine needs the 1m series; the dashboard chart needs whichever
+   * timeframe the platform is showing. This used to request `period: 60`
+   * only, keyed per asset — so after a timeframe switch (or when attaching
+   * to a chart already set to 5m/15m) nothing ever asked the broker for that
+   * timeframe and the dashboard sat on "Waiting for candles…" while Quotex
+   * drew candles next to it.
+   */
+  function requestPeriodHistory(id, period, force, requestedLimit) {
+    const safePeriod = Number.isFinite(Number(period)) && Number(period) >= 1
+      ? Math.min(86400, Math.max(1, Math.floor(Number(period)))) : 60;
+    const key = historyKey(id, safePeriod);
+    const at = historyRequestedAt[key] || 0;
+    if (!force) {
+      if (safePeriod === 60) {
+        // Once real history has arrived, live ticks extend the cache; do not
+        // pull a 5,000-row batch on every periodic scan. The backtest button
+        // can still force one refresh on demand.
+        if (historySeeded[id]) return null;
+      } else {
+        // The platform pushes its own updates for the visible chart, so a
+        // cached batch only needs re-pulling when it went stale (idle chart,
+        // reconnect) or never arrived at all.
+        const cached = chartHistory[id] && chartHistory[id][safePeriod];
+        const bars = cached && Array.isArray(cached.candles) ? cached.candles.length : 0;
+        if (bars && Date.now() - (Number(cached.ts) || 0) < 600000) return null;
+      }
+      if (Date.now() - at < 30000) return null; // retry initial attachment at most every 30s
+    }
     const rawLimit = Number(requestedLimit);
-    const limit = Number.isFinite(rawLimit) ? Math.max(60, Math.min(5000, Math.floor(rawLimit))) : 5000;
+    const wanted = Number.isFinite(rawLimit) ? Math.max(60, Math.min(5000, Math.floor(rawLimit))) : 5000;
+    // Higher timeframes need far fewer rows for the same wall-clock window.
+    const limit = safePeriod === 60 ? wanted : Math.max(60, Math.min(wanted, 1000));
     const requestId = "history_" + Date.now() + "_" + (++historyRequestSequence % 1000000);
-    historyRequestedAt[id] = Date.now();
+    historyRequestedAt[key] = Date.now();
     try {
       window.postMessage({
         source: "CYBER_BINARY_CONTENT",
         kind: "subscribe",
-        payload: { requestId, asset: id, period: 60, limit },
+        payload: { requestId, asset: id, period: safePeriod, limit },
       }, "*");
+      pendingHistoryMeta[requestId] = { asset: id, period: safePeriod };
       return requestId;
     } catch (_) {
-      historyRequestedAt[id] = 0;
+      historyRequestedAt[key] = 0;
       return null;
     }
+  }
+
+  function ensureHistorySubscription(det, force, requestedLimit) {
+    if (!det || !QUOTEX || !QUOTEX.subscribeHistory) return null;
+    const id = det.id;
+    const engineRequestId = requestPeriodHistory(id, 60, force, requestedLimit);
+    // Keep the visible timeframe's chart fed too — never at the expense of
+    // the 1m series the engine runs on.
+    const visiblePeriod = Number(lastWsPeriod);
+    if (Number.isFinite(visiblePeriod) && visiblePeriod >= 1 && visiblePeriod <= 86400 &&
+        Math.floor(visiblePeriod) !== 60) {
+      requestPeriodHistory(id, Math.floor(visiblePeriod), force, requestedLimit);
+    }
+    return engineRequestId;
   }
 
   function requestHistorySubscription(det, requestedLimit) {
@@ -1387,7 +1429,9 @@
       const timer = setTimeout(() => {
         if (!pendingHistory[requestId]) return;
         delete pendingHistory[requestId];
-        if (det && det.id) historyRequestedAt[det.id] = 0;
+        const meta = pendingHistoryMeta[requestId];
+        delete pendingHistoryMeta[requestId];
+        if (meta) historyRequestedAt[historyKey(meta.asset, meta.period)] = 0;
         resolve({ ok: false, requested: false, asset: det && det.id || activeAsset, error: "history subscription acknowledgement timeout" });
       }, 4000);
       pendingHistory[requestId] = (result) => {
@@ -1622,7 +1666,15 @@
           error: p && p.ok === true ? null : String(detail.error || "broker history subscription failed").slice(0, 256),
         };
         const hasPendingRequest = !!(requestId && pendingHistory[requestId]);
-        if (!result.ok && asset && hasPendingRequest) historyRequestedAt[asset] = 0;
+        // A failed subscription must release its own asset+timeframe slot,
+        // otherwise the 30s retry throttle blocks the visible chart's batch.
+        const requestMeta = requestId ? pendingHistoryMeta[requestId] : null;
+        if (!result.ok && requestMeta) {
+          historyRequestedAt[historyKey(requestMeta.asset, requestMeta.period)] = 0;
+        } else if (!result.ok && asset && hasPendingRequest) {
+          historyRequestedAt[historyKey(asset, result.period || 60)] = 0;
+        }
+        if (requestId) delete pendingHistoryMeta[requestId];
         if (hasPendingRequest) {
           const done = pendingHistory[requestId];
           delete pendingHistory[requestId];

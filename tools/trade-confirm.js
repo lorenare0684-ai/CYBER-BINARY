@@ -394,7 +394,15 @@ function contentTests() {
 
     // --- E. higher timeframe: broker 5m candles stay intact, only the
     //        forming 5m bucket follows the live 1m feed.
+    postedMessages.length = 0;
     hookMsg("asset", { symbol: "EURUSD_otc", period: 300, main: true });
+    forceTick();
+    await settle();
+    const fiveMinSubs = postedMessages.filter((m) => m && m.kind === "subscribe" &&
+      m.payload && Number(m.payload.period) === 300);
+    check("switching the platform timeframe requests that timeframe's history",
+      fiveMinSubs.length >= 1 && fiveMinSubs[0].payload.asset === "EURUSD_otc",
+      JSON.stringify(postedMessages.filter((m) => m && m.kind === "subscribe").map((m) => m.payload)));
     const fiveMin = Math.floor(fakeNow / 300000) * 300000;
     const broker5m = [];
     let p5 = 1.09;
