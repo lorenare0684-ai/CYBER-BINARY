@@ -989,7 +989,12 @@
     else if (explicitLoss) netProfit = profit != null && profit < 0 ? profit : (amount > 0 ? -amount : null);
     else if (explicitWin && profit != null) netProfit = amount > 0 && profit >= amount ? profit - amount : profit;
     else if (profit != null && profit < 0) netProfit = profit;
-    else if (amount > 0 && profit === 0) netProfit = -amount;
+    else if (amount > 0 && profit === 0) {
+      // v2.7.1: profit=0 could be a loss OR a draw/refund. Without an explicit
+      // draw flag, we cannot distinguish. Treat as unknown (null) rather than
+      // fabricating a loss, which would freeze the asset and corrupt P&L.
+      netProfit = null;
+    }
     else if (amount > 0 && profit != null && profit > amount) netProfit = profit - amount;
     else if (profit != null) netProfit = profit;
     var draw = explicitDraw || (!explicitWin && !explicitLoss && netProfit === 0);
@@ -1724,8 +1729,13 @@
     // expiry, rounded to the minute. Epoch arithmetic avoids local-time DST
     // jumps that Date#setMinutes can introduce.
     var nowSec = Math.floor(baseNow / 1000);
-    var extra = nowSec % 60 >= 30 ? 1 : 0;
-    return (Math.floor(nowSec / 60) + minutes + extra) * 60;
+    // v2.7.1: round up to the next minute boundary if not exactly on one.
+    // The old logic added an extra minute when past the 30-second mark, which
+    // caused a 1-minute expiry at 10:00:31 to become 10:02 instead of 10:01.
+    var currentMinute = Math.floor(nowSec / 60);
+    var secondsIntoMinute = nowSec % 60;
+    var baseMinute = secondsIntoMinute > 0 ? currentMinute + 1 : currentMinute;
+    return (baseMinute + minutes) * 60;
   }
 
   /* ------------------------------------------------------------------
