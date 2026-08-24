@@ -151,15 +151,39 @@
     const fixed = n.toFixed(places);
     return fixed.includes(".") ? fixed.replace(/0+$/, "").replace(/\.$/, "") : fixed;
   }
-  function fmtTime(ts) {
+  /**
+   * v2.6.17: every timestamp the dashboard shows is a BROKER timestamp, and
+   * Quotex is a UTC platform on a 24-hour clock — its charts, expiries and
+   * price updates are all UTC and it does not adapt to the machine's zone.
+   *
+   * These two used to render with toLocaleTimeString()/toLocaleString(), i.e.
+   * the machine's zone and locale. On a UTC+5:30 machine a 09:47 UTC entry
+   * read "3:17:00 pm": every trade time, expiry, history row and automation
+   * log line was offset from the platform (and in 12-hour form on an en-US
+   * locale), so entries could not be matched against the Quotex candle they
+   * belong to. The chart axis was already UTC — these are what still leaked.
+   *
+   * Fixed-width 24-hour UTC, explicitly suffixed so the basis is never in
+   * doubt. Same reading as `axisTimeLabel()`, which draws the chart axis.
+   */
+  function two(n) { return n < 10 ? "0" + n : String(n); }
+  /** 24-hour UTC clock without the suffix, for lines that state UTC once. */
+  function fmtClock(ts) {
     if (ts == null || ts === "") return "—";
     const d = new Date(ts);
-    return Number.isFinite(d.getTime()) ? d.toLocaleTimeString() : "—";
+    if (!Number.isFinite(d.getTime())) return "—";
+    return two(d.getUTCHours()) + ":" + two(d.getUTCMinutes()) + ":" + two(d.getUTCSeconds());
+  }
+  function fmtTime(ts) {
+    const clock = fmtClock(ts);
+    return clock === "—" ? "—" : clock + " UTC";
   }
   function fmtDate(ts) {
     if (ts == null || ts === "") return "—";
     const d = new Date(ts);
-    return Number.isFinite(d.getTime()) ? d.toLocaleString() : "—";
+    if (!Number.isFinite(d.getTime())) return "—";
+    return d.getUTCFullYear() + "-" + two(d.getUTCMonth() + 1) + "-" + two(d.getUTCDate()) +
+      " " + two(d.getUTCHours()) + ":" + two(d.getUTCMinutes()) + ":" + two(d.getUTCSeconds()) + " UTC";
   }
   function fmtDuration(minutes, entryTime, expiryTime) {
     let mins = Number(minutes);
@@ -167,6 +191,33 @@
     if (!Number.isFinite(mins) || mins <= 0) return "—";
     return (Math.round(mins * 10) / 10) + "m";
   }
+  /**
+   * v2.6.17: the strategy behind a row/signal, by label.
+   *
+   * Rows record the concrete strategy id; under auto_adaptive that is the
+   * strategy the router PICKED, never the literal "auto_adaptive". Resolve it
+   * to the preset's human label so the UI reads "Sniper 90+ Confluence"
+   * rather than "sniper" — and never shows the router as if it were a
+   * strategy that generated a signal.
+   */
+  function strategyLabel(id, fallbackLabel) {
+    if (typeof fallbackLabel === "string" && fallbackLabel) return fallbackLabel;
+    if (typeof id !== "string" || !id) return "";
+    if (id === "auto_adaptive") return "";
+    const preset = STRAT && typeof STRAT.get === "function" ? STRAT.get(id.slice(0, 64)) : null;
+    return (preset && preset.label) || id;
+  }
+
+  /** The strategy that produced a signal payload, resolved to a label. */
+  function signalStrategyLabel(sig, state) {
+    if (!sig || typeof sig !== "object") sig = {};
+    const label = strategyLabel(sig.selectedStrategy, sig.selectedStrategyLabel) ||
+      strategyLabel(state && state.selectedStrategy, state && state.selectedStrategyLabel) ||
+      strategyLabel(sig.strategy) ||
+      strategyLabel(state && state.strategy);
+    return label || "—";
+  }
+
   function tradeOutcome(h) {
     if (!h || typeof h !== "object") return { label: "UNKNOWN", cls: "" };
     const hasWon = Object.prototype.hasOwnProperty.call(h, "won");
@@ -182,10 +233,12 @@
     const exitTime = h.exitTime != null ? h.exitTime : (includeExit ? h.at : null);
     const entry = h.entryPrice != null ? h.entryPrice : h.entry;
     const exit = h.exitPrice != null ? h.exitPrice : h.exit;
-    let text = "Entry " + fmtTime(entryTime) + " @ " + fmtPx(entry);
-    text += " · Expiry " + fmtTime(expiryTime) + " (" + fmtDuration(h.expiryMinutes, entryTime, expiryTime) + ")";
-    if (includeExit || exit != null) text += " · Exit " + fmtTime(exitTime) + " @ " + fmtPx(exit);
-    return text;
+    // One "UTC" for the whole line rather than three: these are broker clock
+    // times on the same 24-hour UTC basis as the chart axis and Quotex itself.
+    let text = "Entry " + fmtClock(entryTime) + " @ " + fmtPx(entry);
+    text += " · Expiry " + fmtClock(expiryTime) + " (" + fmtDuration(h.expiryMinutes, entryTime, expiryTime) + ")";
+    if (includeExit || exit != null) text += " · Exit " + fmtClock(exitTime) + " @ " + fmtPx(exit);
+    return text + " UTC";
   }
 
   function meter(label, value, min, max, side) {
@@ -775,7 +828,17 @@
       };
       timing.textContent = tradeTimeline(currentCall, !!(currentCall.exit != null || currentCall.exitPrice != null));
     }
-    $("regime-row").textContent = "regime: " + (sig.regime || "—") + " · session: " + (sig.session || state.session || "—") + " · engine: 1m · mtf bias: " + ((sig.metrics && sig.metrics.mtfBias) || 0) + "/" + ((sig.metrics && sig.metrics.mtfChecked) || 0);
+    // The live hero states the strategy that produced THIS signal. Under
+    // auto_adaptive that is the concrete strategy the router picked, so the
+    // trader can see which one is speaking without opening the cockpit card.
+    const heroStrategy = signalStrategyLabel(sig, state);
+    const routed = state.strategy === "auto_adaptive" ? " (auto)" : "";
+    const noiseTxt = sig.noise && sig.noise.ready
+      ? " · noise: " + Number(sig.noise.score).toFixed(2)
+      : "";
+    $("regime-row").textContent = "strategy: " + heroStrategy + routed +
+      " · regime: " + (sig.regime || "—") + " · session: " + (sig.session || state.session || "—") + noiseTxt +
+      " · engine: 1m · mtf bias: " + ((sig.metrics && sig.metrics.mtfBias) || 0) + "/" + ((sig.metrics && sig.metrics.mtfChecked) || 0);
 
     // Auto-Adaptive Cockpit UI Update
     const adaptiveCard = $("adaptive-card");
@@ -887,7 +950,8 @@
         const outcome = tradeOutcome(h);
         li.innerHTML =
           '<span class="' + outcome.cls + '">' + outcome.label + '</span>' +
-          '<span class="meta">' + esc(h.dir || "") + " · " + esc(h.asset || "—") + " · conf " + esc(finite(h.confidence, 0)) + "%<br>" + esc(tradeTimeline(h, true)) + '</span>' +
+          '<span class="meta">' + esc(h.dir || "") + " · " + esc(h.asset || "—") + " · conf " + esc(finite(h.confidence, 0)) + "%" +
+            " · " + esc(strategyLabel(h.strategy, h.strategyLabel) || "—") + "<br>" + esc(tradeTimeline(h, true)) + '</span>' +
           '<span class="' + outcome.cls + '">' + esc(fmtMoney(h.pnl)) + '</span>';
         ul.appendChild(li);
       });
@@ -993,6 +1057,11 @@
         at: finite(rawLastTrade.at, 0),
         entryTime: finite(rawLastTrade.entryTime, 0),
         expiryTime: finite(rawLastTrade.expiryTime, 0),
+        // This whitelist used to drop the strategy, so the Auto tab could
+        // never name the strategy that placed the trade even once the
+        // controller reported it.
+        strategy: typeof rawLastTrade.strategy === "string" ? rawLastTrade.strategy.slice(0, 64) : "",
+        strategyLabel: typeof rawLastTrade.strategyLabel === "string" ? rawLastTrade.strategyLabel.slice(0, 96) : "",
       } : null,
     };
 
@@ -1016,10 +1085,16 @@
     const pnl = finite(autoState.dailyPnl, 0);
     $("daily-pnl").textContent = (pnl > 0 ? "+" : "") + pnl.toFixed(2);
     $("daily-pnl").className = pnl > 0 ? "win" : pnl < 0 ? "loss" : "";
-    $("last-trade").textContent = autoState.lastTrade
-      ? (autoState.lastTrade.dir + " " + (autoState.lastTrade.asset || "") + " · " +
-        fmtTime(autoState.lastTrade.entryTime || autoState.lastTrade.at) + " → " + fmtTime(autoState.lastTrade.expiryTime))
-      : "—";
+    if (autoState.lastTrade) {
+      const lastStrat = strategyLabel(autoState.lastTrade.strategy, autoState.lastTrade.strategyLabel);
+      $("last-trade").textContent =
+        autoState.lastTrade.dir + " " + (autoState.lastTrade.asset || "") +
+        (lastStrat ? " · " + lastStrat : "") + " · " +
+        fmtClock(autoState.lastTrade.entryTime || autoState.lastTrade.at) + " → " +
+        fmtClock(autoState.lastTrade.expiryTime) + " UTC";
+    } else {
+      $("last-trade").textContent = "—";
+    }
 
     const armBtn = $("arm-btn");
     if (armBtn) {
@@ -1610,7 +1685,8 @@
         const outcome = tradeOutcome(h);
         li.innerHTML =
           '<span class="' + outcome.cls + '">' + outcome.label + '</span>' +
-          '<span class="meta">' + esc(h.dir || "") + " · " + esc(h.asset || "—") + " · conf " + esc(finite(h.confidence, 0)) + "% · " + esc(h.regime || "—") + "<br>" + esc(tradeTimeline(h, true)) + '</span>' +
+          '<span class="meta">' + esc(h.dir || "") + " · " + esc(h.asset || "—") + " · conf " + esc(finite(h.confidence, 0)) + "% · " + esc(h.regime || "—") +
+            " · " + esc(strategyLabel(h.strategy, h.strategyLabel) || "—") + "<br>" + esc(tradeTimeline(h, true)) + '</span>' +
           '<span class="' + outcome.cls + '">' + esc(fmtMoney(h.pnl)) + '</span>';
         ul.appendChild(li);
       }

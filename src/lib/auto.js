@@ -30,8 +30,48 @@
   "use strict";
 
   const STORE = root.CYBER_STORE;
+  const STRAT = root.CYBER_STRATEGIES || null;
 
   function safeStorage() { return STORE; }
+
+  /**
+   * v2.6.17: the strategy behind an automated action.
+   *
+   * The controller never used to look at the strategy at all, so every auto
+   * log line, the "Last trade" tile and the persisted lastTrade were silent
+   * about which strategy fired — and under auto_adaptive the user's setting
+   * ("auto_adaptive") is a router, not the answer. The engine names its pick
+   * in `signal.selectedStrategy`; prefer that, fall back to the plain
+   * `signal.strategy`, and never report the router as if it were a strategy.
+   */
+  function signalStrategyId(signal) {
+    const candidates = [signal && signal.selectedStrategy, signal && signal.strategy];
+    for (const id of candidates) {
+      if (typeof id === "string" && id && id !== "auto_adaptive") return id.slice(0, 64);
+    }
+    return "";
+  }
+
+  function signalStrategyLabel(signal) {
+    const id = signalStrategyId(signal);
+    if (signal && typeof signal.selectedStrategyLabel === "string" && signal.selectedStrategyLabel) {
+      return signal.selectedStrategyLabel.slice(0, 96);
+    }
+    if (!id) return "";
+    try {
+      const preset = STRAT && typeof STRAT.get === "function" ? STRAT.get(id) : null;
+      if (preset && typeof preset.label === "string" && preset.label) return preset.label.slice(0, 96);
+    } catch (_) {}
+    return id;
+  }
+
+  /** " · strategy Sniper 90+ Confluence" — empty when nothing named it. */
+  function strategySuffix(signal) {
+    const label = signalStrategyLabel(signal);
+    if (!label) return "";
+    const routed = signal && signal.strategy === "auto_adaptive" ? " (auto)" : "";
+    return " · strategy " + label + routed;
+  }
 
   function makeId() {
     return "tx_" + Date.now().toString(36) + "_" + Math.floor(Math.random() * 1e6).toString(36);
@@ -112,6 +152,10 @@
           ctx.lastTrade.at = toMs(saved.lastTrade.at || saved.lastTrade.entryTime, 0);
           ctx.lastTrade.entryTime = toMs(saved.lastTrade.entryTime || saved.lastTrade.at, ctx.lastTrade.at);
           ctx.lastTrade.expiryTime = toMs(saved.lastTrade.expiryTime, 0);
+          ctx.lastTrade.strategy = typeof saved.lastTrade.strategy === "string"
+            ? saved.lastTrade.strategy.slice(0, 64) : "";
+          ctx.lastTrade.strategyLabel = typeof saved.lastTrade.strategyLabel === "string"
+            ? saved.lastTrade.strategyLabel.slice(0, 96) : "";
         }
         ctx.lastAttemptAt = toMs(saved.lastAttemptAt, 0);
         const recent = Array.isArray(saved.recentSignalKeys) ? saved.recentSignalKeys.slice(-100) : [];
@@ -312,7 +356,10 @@
       const asset = safeMapKey(signal.asset, 96);
       if (asset && ctx.frozenAssets[asset]) {
         if (ctx.frozenAssets[asset] > now) {
-          return { ok: false, reason: `Asset frozen until ${new Date(ctx.frozenAssets[asset]).toLocaleTimeString()}` };
+          // UTC, like everything else the user sees: the platform clock is
+          // UTC, so a local-time freeze deadline could not be compared with
+          // the Quotex chart the trader is looking at.
+          return { ok: false, reason: `Asset frozen until ${new Date(ctx.frozenAssets[asset]).toISOString().slice(11, 19)} UTC` };
         }
         delete ctx.frozenAssets[asset];
         persistSafety();
@@ -419,13 +466,18 @@
           score: signal.score,
           regime: signal.regime,
           reason: signal.reason,
+          // The strategy that produced this signal, not the router the user
+          // selected — so an auto-mode log line names e.g. "sniper".
+          strategy: signalStrategyId(signal),
+          strategyLabel: signalStrategyLabel(signal),
+          routedBy: typeof signal.strategy === "string" ? signal.strategy.slice(0, 64) : "",
           ok: decision.ok,
           blockedReason: decision.reason,
           action: null,
         };
 
         if (!decision.ok) {
-          pushLog("skip", `Skip ${signal.direction} ${assetLabel}: ${decision.reason}`);
+          pushLog("skip", `Skip ${signal.direction} ${assetLabel}: ${decision.reason}${strategySuffix(signal)}`);
           safeCallback("onTrade", log);
           return;
         }
@@ -487,6 +539,8 @@
             entryPrice: resultPrice != null && resultPrice > 0 && resultPrice <= 1e15 ? resultPrice : log.entryPrice,
             asset: safeMapKey(signal.asset, 96) || "UNKNOWN",
             dir: signal.direction,
+            strategy: signalStrategyId(signal),
+            strategyLabel: signalStrategyLabel(signal),
             id: safeMapKey(result.id, 128) || null,
             confirmed: true,
           };
@@ -497,7 +551,7 @@
           if (!confirmedPersisted) confirmedPersisted = await persistSafety();
           log.safetyPersisted = confirmedPersisted;
           pushLog(confirmedPersisted ? "trade" : "error",
-            `Trade confirmed: ${signal.direction} ${assetLabel} · expiry ${expiryMin}m · conf=${signal.confidence}` +
+            `Trade confirmed: ${signal.direction} ${assetLabel} · expiry ${expiryMin}m · conf=${signal.confidence}${strategySuffix(signal)}` +
             (confirmedPersisted ? "" : " · local safety ledger unavailable"));
         } else {
           pushLog("error", `Trade not confirmed: ${(result && result.error) || "broker did not acknowledge the order"}`);
@@ -530,12 +584,14 @@
           ctx.lastTrade = {
             at: log.entryTime, entryTime: log.entryTime, expiryTime: log.expiryTime,
             entryPrice: log.entryPrice, asset: assetLabel, dir: signal.direction,
+            strategy: signalStrategyId(signal),
+            strategyLabel: signalStrategyLabel(signal),
           };
           let alertPersisted = await persistSafety();
           if (!alertPersisted) alertPersisted = await persistSafety();
           log.safetyPersisted = alertPersisted;
           pushLog(alertPersisted ? "alert" : "error",
-            `ALERT ${signal.direction} ${assetLabel} · expiry ${expiryMin}m · conf=${signal.confidence}` +
+            `ALERT ${signal.direction} ${assetLabel} · expiry ${expiryMin}m · conf=${signal.confidence}${strategySuffix(signal)}` +
             (alertPersisted ? "" : " · local safety ledger unavailable"));
         }
       }

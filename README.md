@@ -4,6 +4,46 @@ Chrome extension (Manifest V3) that attaches to a Quotex / QX Broker chart, buil
 
 > Live signal analysis and explicitly armed automated execution for Quotex. This third-party tool can place real trades. Binary options are high risk, losses can quickly outweigh returns, and no result or profit is guaranteed.
 
+## What's new in v2.6.17 — Strategy Names on Every Signal, Real Noise Detection, UTC Clock
+
+**The bugs (user-reported)**: signals did not show which strategy produced them (worst in auto mode), asset noise detection was too weak to protect accuracy, and the dashboard's candle times did not line up with Quotex's 24-hour clock.
+
+### 1. Every signal names the strategy that produced it
+
+**Root cause — only one code path ever set the name, and the surfaces that needed it dropped it anyway.** `selectedStrategy` was written *solely* by the adaptive router, on its final result. Direct preset runs and all four of `analyze()`'s early returns (too few candles, invalid data, warm-up, ATR floor) came back anonymous. Worse, under `auto_adaptive` — the shipped default — the only strategy value anything downstream could see was the user's setting, which is the literal string `"auto_adaptive"`: a router, not a strategy. So in auto mode the honest answer to "which strategy fired this?" existed for a moment inside the engine and was then thrown away.
+
+Three separate whitelists then discarded it even when it was present: `auto.js`'s decision log (no strategy field at all), its `lastTrade` record, and the dashboard's `updateAutoUI()` sanitizer.
+
+**The fixes**:
+- **`analyze()` tags at a single exit point.** Every return — including all four early ones — carries `selectedStrategy` + `selectedStrategyLabel`. An unknown id resolves to the default preset rather than echoing garbage back. The adaptive router still names its concrete pick and never itself.
+- **`content.js` resolves once and propagates.** `resolveSignalStrategyId()` prefers the engine's pick, falls back to the user's preset, and never reports `auto_adaptive` as a strategy. It now reaches the on-page HUD, the pushed state (`selectedStrategy`/`selectedStrategyLabel`, alongside the unchanged `strategy` that still drives the dropdown), and the pending trade (which also records `routedBy` so the router is auditable without being mistaken for the strategy).
+- **`auto.js` reports what it acted on.** The decision log, both `lastTrade` records (click and alert), the persisted/rehydrated copy, and the log lines themselves — `Trade confirmed: CALL EUR/USD · expiry 1m · conf=88 · strategy Sniper 90+ Confluence (auto)`. A plain preset run names itself with no `(auto)` tag.
+- **The dashboard shows it** on the live hero, both history renderers, and the Auto tab's "Last trade" tile. An unnamed signal degrades to `—`, never `undefined`.
+
+### 2. Noise detection that can see the chop that actually costs money
+
+**Root cause — the score only looked at the *sign* of each close-to-close move.** A flip ratio is blind to the two patterns that most often put a binary expiry on the wrong side of entry: a series that walks one way and retraces nearly all of it (few flips, no net travel), and candles whose bodies are dwarfed by their wicks (price rejected in both directions *inside* the bar — invisible to any close-to-close measure). In a 28.7k-trade backtest the old gate fired on **3.5%** of trades and moved win rate by **0.7 points**.
+
+**The fix**: `CYBER_TA.noiseProfile()` blends four bounded views of the same window — flip ratio (0.30), Kaufman inefficiency (0.30), wick dominance (0.15) and a normalised choppiness index (0.25) — and returns every component so a block can be explained rather than asserted. The gate reads the composite, and the reason string now names the dominant component.
+
+Thresholds were measured, not guessed (`confluence`, 25 mixed-regime series, 3-bar expiry):
+
+| gate | trades kept | win rate |
+|---|---|---|
+| none | 28,719 | 66.7% |
+| old flip ratio ≥ 0.78 | 27,716 | 67.4% |
+| **composite ≥ 0.62** | **15,248** | **81.7%** |
+
+The trades it removes win **49.9%** — coin flips. Confirmed on 25 unseen seeds and again with the `sniper` preset (63.2% → 76.4%), so it is not fitted to one series or one strategy. The `overlap` session is no longer exempt from the gate, only more tolerant (0.74): a deep book absorbs chop, but at some point the market is churning regardless of who is at the desk. The profile fails **open** — an unscorable window scores 0 — because this gate may only ever suppress a signal, so an unknown score must never suppress one.
+
+### 3. The dashboard clock is the platform clock
+
+**Root cause — three renderers still used the machine's zone and locale.** v2.6.15 fixed the chart *axis* to UTC but left `fmtTime()`, `fmtDate()` and one automation message on `toLocaleTimeString()`/`toLocaleString()`. Quotex is a UTC platform: its charts, expiries and price updates are all UTC and it does not adapt to local time. So on a UTC+5:30 machine a 09:47 UTC entry read `3:17:00 PM` — offset *and* in 12-hour form — across the hero timing line, both history tabs, the Auto tab, the broker-order list and the automation log. The axis said 09:47 while every timestamp beside it said 15:17.
+
+**The fix**: all three render fixed-width 24-hour UTC with an explicit `UTC` suffix, matching the chart axis and the platform. `tradeTimeline()` states the basis once per line instead of three times.
+
+**Locked by `tools/signal-clarity.js`** (new, 57 checks): it drives the real render paths under `TZ=Asia/Kolkata`, runs the *real* adaptive router rather than a stub, and asserts the accuracy claim above by backtesting rather than restating it. Against v2.6.16 it fails 36 and passes 20. Full suite green (16 tools).
+
 ## What's new in v2.6.16 — Auto-Adaptive Router Now Uses Recorded Accuracy
 
 **The bug (user-reported)**: the auto-adaptive strategy system "uses realtime data only and does not choose the best strategy based on historical and live data".
@@ -310,6 +350,7 @@ node tools/search.js                # bounded parameter grid search
 node tools/trade-confirm.js         # broker ACK confirmation + chart alignment
 node tools/hook-confirm.js          # MAIN-world bundle: place_ws → ACK → order event
 node tools/dashboard-chart.js       # dashboard chart renders the broker's UTC candles
+node tools/signal-clarity.js        # strategy naming + noise detection + UTC time basis
 ```
 
 ## Project layout
@@ -336,6 +377,7 @@ tools/adaptive-test.js   # v2.6: test suite for adaptive strategies & assets
 tools/trade-confirm.js   # v2.6.15: orders/open ACK correlation + chart series
 tools/hook-confirm.js    # v2.6.15: generated page-hook round trip (socket → ACK)
 tools/dashboard-chart.js # v2.6.15: chart axis/basis under a non-UTC machine zone
+tools/signal-clarity.js  # v2.6.17: strategy naming, noise gate accuracy, UTC clock
 ```
 
 **Live-trading notice.** This is a third-party Quotex signal and automation client. Explicitly armed click mode can place real orders. Binary options have a built-in payout edge against the trader (most brokers require more than 50% wins to break even), so no signal, backtest, or automation result is a profit guarantee. Automation remains off and disarmed by default.
