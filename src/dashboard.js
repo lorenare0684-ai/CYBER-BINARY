@@ -765,6 +765,7 @@
     const ranked = AS.rankAssets({
       stats: stats,
       candlesByAsset: liveCandlesByAsset,
+      history: stats && stats.history,
       openOnly: false,
     });
     const top = ranked.slice(0, 5);
@@ -775,13 +776,22 @@
       const tr = document.createElement("tr");
       const evCls = item.expectedValue > 0 ? "win" : "loss";
       const evTxt = (item.expectedValuePct > 0 ? "+" : "") + item.expectedValuePct + "%";
+      // v2.7.4: quality metrics tooltip
+      const volQ = item.volatilityQuality != null ? item.volatilityQuality : "—";
+      const trendQ = item.trendStrength != null ? item.trendStrength : "—";
+      const noiseQ = item.noiseQuality != null ? item.noiseQuality : "—";
+      const sessQ = item.sessionQuality != null ? item.sessionQuality : "—";
+      const qualityTip = "Volatility: " + volQ + "/100 · Trend: " + trendQ +
+        "/100 · Noise: " + noiseQ + "/100 · Session: " + sessQ + "x";
+      const accBadge = item.accuracyScore >= 75 ? "green"
+        : item.accuracyScore >= 60 ? "blue" : "";
       tr.innerHTML =
-        "<td>#" + item.rank + "</td>" +
+        "<td># " + item.rank + "</td>" +
         "<td><strong>" + esc(item.name) + "</strong></td>" +
         "<td>" + item.payout + "%</td>" +
         "<td>" + item.winrate + "%</td>" +
         "<td class='" + evCls + "'>" + evTxt + "</td>" +
-        "<td><span class='badge " + (item.accuracyScore >= 70 ? 'green' : 'blue') + "'>" + item.accuracyScore + " / 100</span></td>" +
+        "<td title='" + esc(qualityTip) + "'><span class='badge " + accBadge + "'>" + item.accuracyScore + " / 100</span></td>" +
         "<td>" + esc(item.recommendedStrategyLabel) + "</td>" +
         "<td><button type='button' class='arm-btn tiny' data-asset='" + item.id + "'>Select</button></td>";
       const btn = tr.querySelector("button");
@@ -1799,6 +1809,7 @@
       const ranked = AS ? AS.rankAssets({
         stats: stats,
         candlesByAsset: liveCandlesByAsset,
+        history: stats && stats.history,
         minAccuracy: highAccOnly ? 60 : 0,
       }) : ASSETS.list().map((a) => ({
         id: a.id, name: a.name, kind: a.kind, payout: 85, winrate: 60, expectedValue: 0.11, expectedValuePct: 11, accuracyScore: 65, recommendedStrategyLabel: "Confluence", trades: 0, wins: 0, losses: 0,

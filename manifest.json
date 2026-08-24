@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "CYBER BINARY \u2014 Quotex Trading Automation",
-  "version": "2.7.3",
-  "description": "v2.7.3: Improved auto asset detection — MutationObserver, URL patterns, chart widget extraction, cached element tracking. Switch assets from dashboard.",
+  "version": "2.7.4",
+  "description": "v2.7.4: Improved high-accuracy asset detection — multi-strategy sweep, volatility/trend/noise quality scoring, session awareness, recent performance weighting.",
   "permissions": [
     "storage",
     "windows",
