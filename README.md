@@ -4,6 +4,19 @@ Chrome extension (Manifest V3) that attaches to a Quotex / QX Broker chart, buil
 
 > Live signal analysis and explicitly armed automated execution for Quotex. This third-party tool can place real trades. Binary options are high risk, losses can quickly outweigh returns, and no result or profit is guaranteed.
 
+## What's new in v2.6.14 — Critical Fix: Floating Arrows on the Platform Chart
+
+**The bug (user-reported)**: on the Quotex site, signal arrows were not attached to candles — they stayed frozen in place while the chart was panned/zoomed, "floating on screen".
+
+**Root cause**: when the platform's chart API could not be discovered (bundled lightweight-charts builds expose no global), the overlay fallback drew arrows using an *approximate* mapping (all cached bars spread evenly across the viewport) — and with no chart API there is also no pan/zoom event to re-project, so the arrows froze at stale pixels. Discovery also gave up after 24 seconds, before lazy-mounted SPA charts even existed.
+
+**The fix**:
+- **No lying arrows**: without the chart's time scale, arrows are never drawn — a floating arrow is a false visual. Arrows render only when they can be glued to their bar (native v4 `setMarkers`, v5 `createSeriesMarkers`, or exact-overlay projection through the chart API).
+- **Chart discovery hardened**: 2s burst then a permanent 10s background lane (late/re-mounted charts are always found); React-fiber scan now also climbs from the chart canvases themselves and walks child/sibling fiber links (charts live in leaf components); a second library global spelling (`lightweightCharts`) is trapped.
+- **Overlay tracking hardened**: the visible-range watcher re-binds immediately when the platform swaps the chart (asset switch), and a 500ms repaint heartbeat covers price-axis autoscale, which moves arrows vertically without firing range-change events.
+
+Locked by 10 new regressions in `tools/markers.js` (floating-arrow suite). Full suite green (15 tools); baselines unchanged.
+
 ## What's new in v2.6.13 — Bug Hunt: Money-Path Audit
 
 Audited the remaining unaudited paths end to end: virtual settlement (`settlePending`), broker close processing (`processClosedOrder`/`confirmationLifecycle`), candle persistence and the export handler, the marker store and the chart-glue that pins arrows to visible-timeframe candles, and the Node worker pool.

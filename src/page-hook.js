@@ -6,7 +6,7 @@
  *   - tools/page-hook.shell.js (MAIN-world WebSocket hook shell)
  *
  * Rebuild after any change to either source file.
- * Generated: 2026-08-24T02:26:36.165Z
+ * Generated: 2026-08-24T03:11:36.619Z
  */
 /* ====================================================================
  * Inlined CYBER_QUOTEX adapter (src/lib/quotex.js).
@@ -2669,6 +2669,10 @@
       if (chart && currentArea > 0 && (nextArea === 0 || nextArea < currentArea)) return true;
       chart = c;
       chartContainer = container || chartContainer;
+      // The old chart's redraw subscription died with it; re-bind to the new
+      // chart's timeScale immediately (a markers message may not follow).
+      rangeBoundChart = null;
+      if (mode === "overlay") bindOverlayRangeWatcher();
       series = findExistingSeries(c);
       if (series) hookSeries(series);
       // Wrap series adders so a re-created main series (asset / timeframe
@@ -2812,6 +2816,7 @@
       }
       mode = "overlay";
       bindOverlayRangeWatcher();
+      ensureOverlayHeartbeat();
       drawOverlay();
       return false;
     }
@@ -2828,6 +2833,19 @@
           ts.subscribeVisibleLogicalRangeChange(function () { scheduleOverlayRedraw(); });
           rangeBoundChart = chart;
         }
+      } catch (_) {}
+    }
+
+    // The price axis autoscales on new ticks WITHOUT moving the logical
+    // range, so an exact-overlay's y can drift while x stays glued. A slow
+    // repaint heartbeat keeps both honest; it no-ops outside overlay mode.
+    var overlayHeartbeat = null;
+    function ensureOverlayHeartbeat() {
+      if (overlayHeartbeat || typeof setInterval !== "function") return;
+      try {
+        overlayHeartbeat = setInterval(function () {
+          if (mode === "overlay") scheduleOverlayRedraw();
+        }, 500);
       } catch (_) {}
     }
 
@@ -2921,6 +2939,14 @@
       try { timeScale = chart && typeof chart.timeScale === "function" ? chart.timeScale() : null; } catch (_) {}
       var exactTime = !!timeScale && typeof timeScale.timeToCoordinate === "function";
       var exactPrice = !!series && typeof series.priceToCoordinate === "function";
+      if (!exactTime) {
+        // No chart API → every x would be an approximation spread across the
+        // viewport, freezing in place when the chart pans/zooms: the
+        // "floating arrows" defect. Arrows are only ever drawn when they can
+        // be glued to their bar; discovery keeps retrying in the background.
+        try { scheduleScan(); } catch (_) {}
+        return;
+      }
       var periodMs = markerPeriod() * 1000;
       for (var k = 0; k < markers.length; k++) {
         var m = markers[k];
@@ -2999,9 +3025,14 @@
       scanTimer = setInterval(function () {
         tries++;
         try { scanOnce(); } catch (_) {}
-        // Keep scanning briefly after the first capture: multi-chart layouts
-        // often mount mini charts first and the large main chart later.
-        if (tries > 12) { clearInterval(scanTimer); scanTimer = null; }
+        // Lazy SPAs mount the trade chart long after first paint, and asset
+        // switches can re-mount it — a fixed burst gave up too early. After
+        // the initial burst, keep a slow background lane forever so a
+        // late-mounted chart is always eventually captured.
+        if (tries === 15) {
+          clearInterval(scanTimer);
+          scanTimer = setInterval(function () { try { scanOnce(); } catch (_) {} }, 10000);
+        }
       }, 2000);
     }
 
@@ -3022,6 +3053,19 @@
         for (var c = 0; c < containers.length && c < 80; c++) {
           var inst = fiberScan(containers[c]);
           if (inst && captureChart(inst, containers[c])) found = true;
+        }
+      } catch (_) {}
+      // b2) climb from the big canvases themselves — the definitive chart
+      // leaf — up the ancestor chain looking for React fiber state.
+      try {
+        var canvases = document.querySelectorAll("canvas");
+        for (var v = 0; v < canvases.length && v < 12; v++) {
+          var cnode = canvases[v];
+          for (var up = 0; cnode && up < 8; up++) {
+            var viaCanvas = fiberScan(cnode);
+            if (viaCanvas && captureChart(viaCanvas, cnode)) found = true;
+            cnode = cnode.parentElement;
+          }
         }
       } catch (_) {}
       // c) common window handles
@@ -3047,17 +3091,22 @@
     }
 
     function walkFiber(fiber, depth) {
-      if (!fiber || depth > 60) return null;
+      if (!fiber || depth > 60 || inspectBudget <= 0) return null;
       var found = inspectObj(fiber.memoizedProps, 0);
       if (found) return found;
       found = inspectObj(fiber.memoizedState, 0);
       if (found) return found;
       found = inspectObj(fiber.stateNode, 0);
       if (found) return found;
-      // Only walk the `return` chain (parent components) — bounded and
-      // linear, avoids exponential blowup from child/sibling traversal.
-      if (fiber.return) return walkFiber(fiber.return, depth + 1);
-      return null;
+      // Walk parent, first-child, and sibling links. The chart instance is
+      // usually created inside a leaf component, so child/sibling links
+      // matter as much as the parent chain; inspectBudget bounds the total
+      // work so this can not blow up.
+      found = fiber.return ? walkFiber(fiber.return, depth + 1) : null;
+      if (found) return found;
+      found = fiber.child ? walkFiber(fiber.child, depth + 1) : null;
+      if (found) return found;
+      return fiber.sibling ? walkFiber(fiber.sibling, depth + 1) : null;
     }
 
     function inspectObj(obj, depth) {
@@ -3090,43 +3139,47 @@
       return null;
     }
 
-    // Trap window.LightweightCharts (set by the page's bundle) so any chart
+    // Trap chart-library globals (set by the page's bundle) so any chart
     // created later is captured. Installed synchronously at document_start.
     // The module ref is kept even for builds whose charts never touch our
     // wrappers: v5 marker rendering needs createSeriesMarkers() from it.
-    try {
-      var _lwc = window.LightweightCharts;
-      Object.defineProperty(window, "LightweightCharts", {
-        configurable: true,
-        enumerable: true,
-        get: function () { return _lwc; },
-        set: function (v) {
-          _lwc = v;
-          lwcModule = v;
-          if (v && typeof v.createChart === "function" && !v.__cyberWrapped) {
-            var origCreate = v.createChart;
-            v.createChart = function () {
-              var container = arguments[0];
-              var c = origCreate.apply(this, arguments);
-              try { captureChart(c, container); } catch (_) {}
-              return c;
-            };
-            try { v.__cyberWrapped = true; } catch (_) {}
-          }
-        },
-      });
-      if (_lwc && typeof _lwc.createChart === "function" && !_lwc.__cyberWrapped) {
-        lwcModule = _lwc;
-        var origCreate2 = _lwc.createChart;
-        _lwc.createChart = function () {
-          var container = arguments[0];
-          var c = origCreate2.apply(this, arguments);
-          try { captureChart(c, container); } catch (_) {}
-          return c;
-        };
-        try { _lwc.__cyberWrapped = true; } catch (_) {}
-      }
-    } catch (_) {}
+    function trapChartGlobal(name) {
+      try {
+        var _lwc = window[name];
+        Object.defineProperty(window, name, {
+          configurable: true,
+          enumerable: true,
+          get: function () { return _lwc; },
+          set: function (v) {
+            _lwc = v;
+            if (name === "LightweightCharts") lwcModule = v;
+            if (v && typeof v.createChart === "function" && !v.__cyberWrapped) {
+              var origCreate = v.createChart;
+              v.createChart = function () {
+                var container = arguments[0];
+                var c = origCreate.apply(this, arguments);
+                try { captureChart(c, container); } catch (_) {}
+                return c;
+              };
+              try { v.__cyberWrapped = true; } catch (_) {}
+            }
+          },
+        });
+        if (_lwc && typeof _lwc.createChart === "function" && !_lwc.__cyberWrapped) {
+          if (name === "LightweightCharts") lwcModule = _lwc;
+          var origCreate2 = _lwc.createChart;
+          _lwc.createChart = function () {
+            var container = arguments[0];
+            var c = origCreate2.apply(this, arguments);
+            try { captureChart(c, container); } catch (_) {}
+            return c;
+          };
+          try { _lwc.__cyberWrapped = true; } catch (_) {}
+        }
+      } catch (_) {}
+    }
+    trapChartGlobal("LightweightCharts");
+    trapChartGlobal("lightweightCharts");
 
     try {
       window.addEventListener("resize", scheduleOverlayRedraw);
@@ -3155,6 +3208,8 @@
       candlesVerified: live.candlesVerified,
       assetIdMap: live.assetIdMap,
       lastWsSymbol: live.lastWsSymbol,
+      markersMode: MARKERS.mode(),
+      markersChart: MARKERS.hasChart(),
       lastWsPeriod: live.lastWsPeriod,
       activeChart: live.activeChart,
       socket: !!handle.lastWs,
