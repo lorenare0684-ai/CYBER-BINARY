@@ -40,5 +40,21 @@ const banner = `/* =============================================================
 
 const out = header + banner + adapter + "\n\n" + banner.replace("Inlined CYBER_QUOTEX adapter (src/lib/quotex.js).", "MAIN-world WebSocket hook shell (tools/page-hook.shell.js).") + shell;
 
-fs.writeFileSync(path.join(root, "src/page-hook.js"), out);
-console.log("wrote src/page-hook.js (" + out.length + " bytes)");
+/** Build the page-hook source WITHOUT touching the committed file. Used by
+ *  tools/validate.js to guarantee the generated file can never drift from
+ *  its sources (editing the generated file directly once silently reverted
+ *  five shipped fixes on the next rebuild — v2.6.12). */
+function build() {
+  return {
+    adapter: adapter,
+    shell: shell,
+    source: out.replace(/ \* Generated: .*\n/, " * Generated: <normalized>\n"),
+  };
+}
+
+if (require.main === module) {
+  fs.writeFileSync(path.join(root, "src/page-hook.js"), out);
+  console.log("wrote src/page-hook.js (" + out.length + " bytes)");
+}
+
+module.exports = { build };

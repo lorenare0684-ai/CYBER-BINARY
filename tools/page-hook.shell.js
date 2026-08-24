@@ -40,6 +40,7 @@
 
   var live = {
     candles: Object.create(null), // asset@period -> latest candles array
+    candlesVerified: Object.create(null), // asset@period -> batch was symbol-verified
     ticks: Object.create(null),   // asset -> last tick { price, time }
     instruments: [],  // broker-discovered instruments
     balance: null,
@@ -53,6 +54,7 @@
 
   var internalSubscriptionSend = false;
   var candleKeyOrder = [];
+  var candlesVerified = Object.create(null); // asset@period -> batch was symbol-verified
   var tickKeyOrder = [];
   var backgroundTickAt = Object.create(null);
   var lastBackgroundEmitAt = 0;
@@ -99,13 +101,18 @@
       var period = msg.period || live.lastWsPeriod || 60;
       var key = asset + "@" + period;
       live.candles[key] = Array.isArray(msg.candles) ? msg.candles.slice(-5000) : [];
+      if (msg.verified != null) live.candlesVerified[key] = !!msg.verified;
       var oldKeyAt = candleKeyOrder.indexOf(key);
       if (oldKeyAt >= 0) candleKeyOrder.splice(oldKeyAt, 1);
       candleKeyOrder.push(key);
-      while (candleKeyOrder.length > 24) delete live.candles[candleKeyOrder.shift()];
+      while (candleKeyOrder.length > 24) {
+        var droppedKey = candleKeyOrder.shift();
+        delete live.candles[droppedKey];
+        delete live.candlesVerified[droppedKey];
+      }
       // History is low-frequency and remains available per asset/timeframe;
       // it never changes activeChart.
-      emit("candle", { asset: asset, period: period, candles: live.candles[key] });
+      emit("candle", { asset: asset, period: period, candles: live.candles[key], verified: live.candlesVerified[key] === true });
     },
     onTick: function (q) {
       if (!q || !q.symbol) return;
@@ -261,7 +268,7 @@
               var norm = Q.normalizeCandles(parsed || { raw: data });
               if (norm.length) {
                 var p = (parsed && parsed.period) || live.lastWsPeriod || 60;
-                routerHandlers.onCandle({ asset: sym, period: p, candles: norm });
+                routerHandlers.onCandle({ asset: sym, period: p, candles: norm, verified: true });
               }
             }
           } catch (_) {}
@@ -276,7 +283,7 @@
               var sym2 = (live.activeChart && live.activeChart.symbol) || live.lastWsSymbol || "EURUSD";
               var norm2 = Q.normalizeCandles({ raw: [bar] });
               if (norm2.length) {
-                routerHandlers.onCandle({ asset: sym2, period: live.lastWsPeriod || 60, candles: norm2 });
+                routerHandlers.onCandle({ asset: sym2, period: live.lastWsPeriod || 60, candles: norm2, verified: true });
               }
             }
           } catch (_) {}
@@ -822,6 +829,7 @@
       orders: live.orders.slice(0, 20),
       ticks: live.ticks,
       candles: live.candles,
+      candlesVerified: live.candlesVerified,
       assetIdMap: live.assetIdMap,
       lastWsSymbol: live.lastWsSymbol,
       lastWsPeriod: live.lastWsPeriod,

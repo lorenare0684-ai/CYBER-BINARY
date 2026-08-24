@@ -6,7 +6,7 @@
  *   - tools/page-hook.shell.js (MAIN-world WebSocket hook shell)
  *
  * Rebuild after any change to either source file.
- * Generated: 2026-08-23T16:07:32.499Z
+ * Generated: 2026-08-24T02:26:36.165Z
  */
 /* ====================================================================
  * Inlined CYBER_QUOTEX adapter (src/lib/quotex.js).
@@ -627,9 +627,9 @@
     if (!asset && typeof payload === "object" && !Array.isArray(payload)) {
       asset = payload.asset || payload.symbol || payload.pair || payload.code || null;
     }
-    // v2.6.6: an asset named by the payload itself is symbol-verified; an
-    // asset taken from the fallback (the chart the user is looking at) is a
-    // guess that downstream code must treat as untrusted for the engine feed.
+    // An asset named by the payload itself is symbol-verified; an asset taken
+    // from the fallback (the chart the user is looking at) is a guess that
+    // downstream code must treat as untrusted for the engine feed.
     var verified = asset != null;
     if (!asset && fallbackAsset) asset = fallbackAsset;
 
@@ -663,6 +663,7 @@
     }
 
     if (!Array.isArray(rows) || !rows.length) return null;
+
     if (typeof period === "object" && period != null) {
       period = period.time != null ? period.time : (period.value != null ? period.value : 60);
     }
@@ -692,11 +693,11 @@
     if (!raw.length) return [];
     var byTime = Object.create(null);
     var start = Math.max(0, raw.length - 5000);
-    // v2.6.5: vote on the array-row layout across the whole batch instead
-    // of guessing per row. Layout A is Quotex's [ts, open, close, high,
-    // low]; layout B is [ts, open, high, low, close]. A row only votes when
-    // its unique max/min positions are unambiguous, so flat bars and
-    // close-at-extreme bars abstain instead of corrupting the tally.
+    // Vote on the array-row layout across the whole batch instead of guessing
+    // per row. Layout A is Quotex's [ts, open, close, high, low]; layout B is
+    // [ts, open, high, low, close]. A row only votes when its unique max/min
+    // positions are unambiguous, so flat bars and close-at-extreme bars
+    // abstain instead of corrupting the tally.
     var votesA = 0, votesB = 0;
     for (var vi = start; vi < raw.length; vi++) {
       var vrow = raw[vi];
@@ -748,8 +749,8 @@
         var p4 = numberValue(row[4]);
         if (o != null && p2 != null && p3 != null && p4 != null &&
             o > 0 && p2 > 0 && p3 > 0 && p4 > 0) {
-          // v2.6.5: honour the batch-level layout vote; clamp into a valid
-          // OHLC range afterwards so one glitched row can never poison it.
+          // Honour the batch-level layout vote; clamp into a valid OHLC range
+          // afterwards so one glitched row can never poison it.
           if (layoutB) { c = p4; hi = p2; lo = p3; }
           else { c = p2; hi = p3; lo = p4; }
           hi = Math.max(o, c, hi, lo);
@@ -761,10 +762,9 @@
           o <= 0 || c <= 0 || hi <= 0 || lo <= 0 ||
           o > 1e100 || c > 1e100 || hi > 1e100 || lo > 1e100) continue;
       var tMs = toMs(ts);
-      // v2.6.5: tolerate up to 24h of broker-server-vs-local clock skew. The
-      // old +5min bound silently dropped EVERY candle whenever the user's PC
-      // clock ran behind Quotex's server, which kept the dashboard on its
-      // synthetic seed forever ("candles don't match the platform").
+      // Tolerate up to 24h of broker-server-vs-local clock skew. The old
+      // +5min bound silently dropped EVERY candle whenever the user's PC
+      // clock ran behind Quotex's server, keeping feeds on synthetic seeds.
       if (tMs == null || tMs < 946684800000 || tMs > Date.now() + 86400000) continue;
       byTime[tMs] = {
         time: tMs,
@@ -2377,6 +2377,7 @@
 
   var internalSubscriptionSend = false;
   var candleKeyOrder = [];
+  var candlesVerified = Object.create(null); // asset@period -> batch was symbol-verified
   var tickKeyOrder = [];
   var backgroundTickAt = Object.create(null);
   var lastBackgroundEmitAt = 0;
@@ -2590,8 +2591,6 @@
               var norm = Q.normalizeCandles(parsed || { raw: data });
               if (norm.length) {
                 var p = (parsed && parsed.period) || live.lastWsPeriod || 60;
-                // Chart-library series data is the platform's own render for
-                // the visible chart's symbol — symbol-verified by provenance.
                 routerHandlers.onCandle({ asset: sym, period: p, candles: norm, verified: true });
               }
             }

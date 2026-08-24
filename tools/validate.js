@@ -718,5 +718,16 @@ async function poolTest() {
     console.error("FAILED", failed);
     process.exit(1);
   }
-  console.log("OK — structure + engine + backtest checks passed");
+  {
+  const builder = require("./build-hook.js");
+  const generated = fs.readFileSync(path.join(root, "src/page-hook.js"), "utf8")
+    .replace(/ \* Generated: .*\n/, " * Generated: <normalized>\n");
+  if (generated !== builder.build().source) {
+    console.error("FAIL src/page-hook.js matches its sources (no generated-file drift) — run: node tools/build-hook.js (edit src/lib/quotex.js or tools/page-hook.shell.js, never the generated file)");
+    process.exitCode = 1;
+  } else {
+    console.log("ok   src/page-hook.js matches its sources (no generated-file drift)");
+  }
+}
+console.log("OK — structure + engine + backtest checks passed");
 })();

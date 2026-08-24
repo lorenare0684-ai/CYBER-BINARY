@@ -4,6 +4,17 @@ Chrome extension (Manifest V3) that attaches to a Quotex / QX Broker chart, buil
 
 > Live signal analysis and explicitly armed automated execution for Quotex. This third-party tool can place real trades. Binary options are high risk, losses can quickly outweigh returns, and no result or profit is guaranteed.
 
+## What's new in v2.6.12 — Critical Fix: Generated-File Drift
+
+**The bug**: `src/page-hook.js` is GENERATED from `src/lib/quotex.js` + `tools/page-hook.shell.js`. The v2.6.5-v2.6.7 fixes (clock-skew tolerance, layout voting, symbol-verification trust chain) were applied to the generated file directly — so the next `node tools/build-hook.js` run would have silently reverted all of them. Verified for real: a rebuild wiped 59 lines of shipped fixes.
+
+**The fix**:
+- All fixes ported into the true sources (`quotex.js`: parseCandles verified flag, normalizeCandles layout voting + 24h skew, emitCandles verified; `page-hook.shell.js`: candlesVerified cache + eviction + snapshot field, chart-series verified provenance). The rebuilt file is functionally identical to the hand-edited one (diff = timestamps/comments only).
+- `tools/build-hook.js` now exports `build()` without touching the committed file.
+- `tools/validate.js` guards against drift: regeneration must match the committed file (timestamp-normalized) or validation fails with instructions. Verified the guard catches a tampered generated file.
+
+Full suite green (15 tools); baselines unchanged.
+
 ## What's new in v2.6.11 — Bug Sweep: New Surfaces Under Adversarial Load
 
 - Audited the previously unreviewed files (background.js ownership/patch plumbing, workers.js pool, historic-worker lifecycle — all sound; the worker's one-shot message guard matches its create-per-chunk consumer).
