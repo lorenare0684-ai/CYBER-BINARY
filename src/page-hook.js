@@ -6,7 +6,7 @@
  *   - tools/page-hook.shell.js (MAIN-world WebSocket hook shell)
  *
  * Rebuild after any change to either source file.
- * Generated: 2026-08-24T18:02:06.583Z
+ * Generated: 2026-08-24T19:02:12.394Z
  */
 /* ====================================================================
  * Inlined CYBER_QUOTEX adapter (src/lib/quotex.js).
@@ -2604,6 +2604,9 @@
       event: hit.event || null,
       main: true,
     });
+    // v2.7.5: chart asset changed — try to apply any markers that were
+    // deferred during the previous chart mismatch.
+    try { MARKERS.reapplyPendingMarkers(); } catch (_) {}
     return true;
   }
 
@@ -2757,6 +2760,7 @@
     var lwcModule = null;     // window.LightweightCharts module ref (v5 createSeriesMarkers)
     var markersPlugin = null; // v5 ISeriesMarkersPluginApi bound to `series`
     var pluginSeries = null;  // series the markers plugin was created for
+    var pendingMarkersPayload = null; // v2.7.5: deferred markers during chart mismatch
     var rangeBoundChart = null; // chart whose timeScale redraw subscription is installed
     var CALL_COLOR = "#3dff9a";
     var PUT_COLOR = "#ff5d7a";
@@ -2901,6 +2905,9 @@
       if (mode === "overlay") bindOverlayRangeWatcher();
       series = findExistingSeries(c);
       if (series) hookSeries(series);
+      // v2.7.5: a new chart was captured — try to apply any deferred markers
+      // that were waiting for a chart mismatch to resolve.
+      try { reapplyPendingMarkers(); } catch (_) {}
       // Wrap series adders so a re-created main series (asset / timeframe
       // switch) is captured too. Candlestick/bar adders REPLACE the marker
       // target (they are the price chart); overlays (line/area/…) only fill
@@ -2988,11 +2995,37 @@
         markers: Array.isArray(payload.markers) ? payload.markers.slice(-MAX) : [],
         bars: Array.isArray(payload.bars) ? payload.bars.slice(-400) : [],
       } : null;
+      // v2.7.5: defer markers on chart mismatch instead of silently clearing.
+      // When the user switches assets from the dashboard, the content script
+      // sends markers before Quotex confirms the chart switch. Storing them
+      // and applying when the chart catches up ensures arrows always appear.
       var chartMismatch = !!(lastPayload && lastPayload.asset && live.activeChart && live.activeChart.symbol &&
         Q.normalizeSymbol(lastPayload.asset) !== Q.normalizeSymbol(live.activeChart.symbol));
-      nativeList = chartMismatch ? [] : normalize(lastPayload && lastPayload.markers);
+      if (chartMismatch) {
+        // Store for later — applyNative will get them when the chart switches
+        pendingMarkersPayload = lastPayload;
+        nativeList = [];
+      } else {
+        pendingMarkersPayload = null;
+        nativeList = normalize(lastPayload && lastPayload.markers);
+      }
       // The platform may have recreated the main series (asset/timeframe
       // switch) since the last markers message — re-resolve it if needed.
+      if (!series && chart) series = findExistingSeries(chart);
+      applyNative();
+    }
+
+    /** v2.7.5: re-apply deferred markers when the chart switches to the
+     *  matching asset. Called from the asset-change detection path. */
+    function reapplyPendingMarkers() {
+      if (!pendingMarkersPayload) return;
+      var pending = pendingMarkersPayload;
+      var matchesNow = !!(pending.asset && live.activeChart && live.activeChart.symbol &&
+        Q.normalizeSymbol(pending.asset) === Q.normalizeSymbol(live.activeChart.symbol));
+      if (!matchesNow) return;
+      pendingMarkersPayload = null;
+      lastPayload = pending;
+      nativeList = normalize(pending.markers);
       if (!series && chart) series = findExistingSeries(chart);
       applyNative();
     }
@@ -3301,6 +3334,61 @@
           if (captureChart(cands[j])) found = true;
         }
       } catch (_) {}
+      // d) v2.7.5: scan element properties for chart instances (non-React).
+      // Some Quotex builds store the chart on the container element directly
+      // as a property (e.g. el._chart, el.chart, el._chartInstance).
+      try {
+        var containers = document.querySelectorAll("[class*='chart'], [class*='trading'], [id*='chart']");
+        for (var ci = 0; ci < containers.length && ci < 40; ci++) {
+          var cel = containers[ci];
+          var ckeys = [];
+          try { ckeys = Object.keys(cel); } catch (_) {}
+          for (var ck = 0; ck < ckeys.length && ck < 30; ck++) {
+            var cv = null;
+            try { cv = cel[ckeys[ck]]; } catch (_) {}
+            if (cv && isChartLike(cv) && captureChart(cv, cel)) found = true;
+          }
+          // Also check underscore-prefixed properties
+          var propNames = ["_chart", "chart", "_chartInstance", "chartInstance", "_lwc", "lwc", "_tvChart"];
+          for (var pi = 0; pi < propNames.length; pi++) {
+            var pv = null;
+            try { pv = cel[propNames[pi]]; } catch (_) {}
+            if (pv && isChartLike(pv) && captureChart(pv, cel)) found = true;
+          }
+        }
+      } catch (_) {}
+      // e) v2.7.5: deep property scan on the largest canvas's ancestors.
+      // Some bundled chart libraries store the API on a parent element's
+      // internal property that React fiber doesn't expose.
+      if (!found) {
+        try {
+          var bigCanvas = null, bigArea = 0;
+          var allC = document.querySelectorAll("canvas");
+          for (var bc = 0; bc < allC.length; bc++) {
+            try {
+              var br = allC[bc].getBoundingClientRect();
+              var ba = br.width > 200 && br.height > 100 ? br.width * br.height : 0;
+              if (ba > bigArea) { bigCanvas = allC[bc]; bigArea = ba; }
+            } catch (_) {}
+          }
+          if (bigCanvas) {
+            var walk = bigCanvas;
+            for (var wd = 0; walk && wd < 12; wd++) {
+              var wkeys = [];
+              try { wkeys = Object.getOwnPropertyNames(walk); } catch (_) {}
+              for (var wk = 0; wk < wkeys.length && wk < 50; wk++) {
+                var wv = null;
+                try { wv = walk[wkeys[wk]]; } catch (_) {}
+                if (wv && typeof wv === "object" && !Array.isArray(wv) && isChartLike(wv)) {
+                  if (captureChart(wv, walk)) { found = true; break; }
+                }
+              }
+              if (found) break;
+              walk = walk.parentElement;
+            }
+          }
+        } catch (_) {}
+      }
       return found;
     }
 
@@ -3415,6 +3503,7 @@
     return {
       captureChart: captureChart,
       applyMarkers: applyMarkers,
+      reapplyPendingMarkers: reapplyPendingMarkers,
       hasChart: hasChart,
       isChartLike: isChartLike,
       mode: function () { return mode; },
