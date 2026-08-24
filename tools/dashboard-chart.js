@@ -270,5 +270,42 @@ try {
 check("a missing OPTIONAL lib (workers.js) does not abort startup",
   optError === "", optError || "(no error thrown)");
 
+/* ---------- account line: the documented fallback must actually fire ---------- */
+// content.js nests the broker account under `quotex`; the dashboard used to read
+// only a top-level `state.balance` that nothing ever wrote, so lastLiveBalance
+// stayed null and the line was stuck on "waiting for a balance event" even
+// though the broker had reported the balance.
+// Seed the placeholder exactly as dashboard.html ships it, so the "no longer
+// stuck" assertion compares against the real initial text rather than "".
+byIdGet("auto-account").textContent = "Account: unknown — waiting for a balance event";
+for (const fn of listeners.runtime || []) {
+  fn({
+    type: "CYBER_STATE_PUSH",
+    payload: {
+      attached: true, primary: true, source: "websocket",
+      asset: "EUR/USD OTC", assetId: "EURUSD_otc", price,
+      candles, chartCandles: candles, chartPeriod: 60, chartTimeBasis: "broker-utc",
+      signal: { ready: false, direction: "WAIT", reason: "test", confidence: 0 },
+      wins: 0, losses: 0, winrate: 0, accuracy: 0, history: [], markers: [],
+      quotex: {
+        status: { state: "authenticated", url: "wss://ws2.qxbroker.com/socket.io/" },
+        balance: { uid: 4242, balance: 1337.42, currency: "USD", isDemo: false },
+        instrumentsCount: 12, activeSymbol: "EURUSD_otc", activePeriod: 60, lastOrders: [],
+      },
+      ts: Date.now(),
+    },
+  }, {}, () => {});
+}
+for (let pass = 0; pass < 4; pass++) {
+  const due = timeouts.splice(0, timeouts.length);
+  for (const fn of due) { try { fn(); } catch (_) {} }
+}
+const acctText = byIdGet("auto-account").textContent;
+check("account line shows the broker account from state.quotex.balance",
+  /LIVE/.test(acctText) && /1337\.42/.test(acctText) && /USD/.test(acctText),
+  JSON.stringify(acctText));
+check("account line is no longer stuck on 'waiting for a balance event'",
+  !/waiting for a balance event/i.test(acctText), JSON.stringify(acctText));
+
 if (failed) { console.error("FAILED " + failed); process.exitCode = 1; }
 else console.log("OK — dashboard chart alignment checks passed");

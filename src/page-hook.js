@@ -6,7 +6,7 @@
  *   - tools/page-hook.shell.js (MAIN-world WebSocket hook shell)
  *
  * Rebuild after any change to either source file.
- * Generated: 2026-08-24T04:49:13.315Z
+ * Generated: 2026-08-24T05:58:54.842Z
  */
 /* ====================================================================
  * Inlined CYBER_QUOTEX adapter (src/lib/quotex.js).
@@ -2168,8 +2168,18 @@
         var ev3 = mapEventName(frame.event);
         if (ev3 === "authenticated") {
           try { listeners.status({ state: "authenticated" }); } catch (_) {}
-        } else if (ev3 === "s_authorization") {
-          try { listeners.status({ state: "authenticated" }); } catch (_) {}
+          // The authorization frame doubles as the account snapshot: Quotex
+          // sends {uid, balance, isDemo, currency} here, and for many sessions
+          // it is the ONLY balance frame that ever arrives. Treating it as a
+          // status ping discarded that balance and left the account line stuck
+          // on "waiting for a balance event" even though the broker had already
+          // reported the balance.
+          // (mapEventName maps "s_authorization" -> "authenticated", so this is
+          // the only branch that frame can reach.)
+          if (frame.payload && typeof frame.payload === "object" &&
+              inferEventFromPayload(frame.payload) === "balance") {
+            emitBalance(frame.payload);
+          }
         } else if (ev3 === "balance") {
           emitBalance(frame.payload);
         } else if (ev3 === "instruments") {

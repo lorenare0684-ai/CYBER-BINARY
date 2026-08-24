@@ -741,8 +741,18 @@
       liveCandlesByAsset[activeAsset] = state.candles.slice(-500);
     }
 
-    if (state.balance && typeof state.balance === "object") {
-      const b = state.balance;
+    // content.js nests the broker account under `quotex`; nothing has ever
+    // written a top-level `balance`. Reading only the top level left
+    // lastLiveBalance permanently null, so renderAccountLine()'s documented
+    // fallback ("falls back to the extension state's last balance event")
+    // could never fire and the line stayed on "waiting for a balance event".
+    const balanceSource = (state.balance && typeof state.balance === "object")
+      ? state.balance
+      : (state.quotex && typeof state.quotex === "object" &&
+         state.quotex.balance && typeof state.quotex.balance === "object"
+        ? state.quotex.balance : null);
+    if (balanceSource) {
+      const b = balanceSource;
       lastLiveBalance = {
         isDemo: typeof b.isDemo === "boolean" ? b.isDemo : null,
         balance: Number(b.balance),

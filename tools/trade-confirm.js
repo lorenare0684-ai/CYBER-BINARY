@@ -120,6 +120,38 @@ function adapterTests() {
   check("unrelated ACK is not attributed to a pending placement",
     opened.length === 1 && (opened[0].data.requestId == null || opened[0].data.requestId === ""),
     JSON.stringify(opened[0] && opened[0].data));
+
+  // --- the authorization frame is also the account snapshot ------------
+  // Quotex reports {uid, balance, isDemo, currency} inside s_authorization,
+  // and for many sessions that is the only balance frame that ever arrives.
+  // mapEventName maps it to "authenticated", so the status branch used to
+  // swallow the balance and the dashboard sat on "waiting for a balance event".
+  const balances = [];
+  const statuses = [];
+  const acctRouter = Q.createRouter({
+    onBalance: (b) => balances.push(b),
+    onStatus: (s) => statuses.push(s),
+  });
+  acctRouter.feedRaw('42["s_authorization",{"uid":4242,"balance":1337.42,"currency":"USD","isDemo":1}]');
+  check("s_authorization still reports the authenticated status",
+    statuses.some((s) => s && s.state === "authenticated"), JSON.stringify(statuses));
+  check("s_authorization also yields the account balance",
+    balances.length === 1 && balances[0].balance === 1337.42 &&
+    balances[0].currency === "USD" && balances[0].isDemo === true,
+    JSON.stringify(balances));
+
+  // A dedicated balance frame must keep working unchanged.
+  balances.length = 0;
+  acctRouter.feedRaw('42["s_balance",{"uid":4242,"balance":900.5,"currency":"USD","isDemo":0}]');
+  check("a dedicated s_balance frame still yields the balance",
+    balances.length === 1 && balances[0].balance === 900.5 && balances[0].isDemo === false,
+    JSON.stringify(balances));
+
+  // An authorization frame that carries no account fields must not invent one.
+  balances.length = 0;
+  acctRouter.feedRaw('42["s_authorization",{"status":"ok"}]');
+  check("an authorization frame with no account fields invents no balance",
+    balances.length === 0, JSON.stringify(balances));
 }
 
 /* ===================================================================
