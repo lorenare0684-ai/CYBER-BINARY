@@ -490,8 +490,12 @@
     // machine's local zone shifted every candle by the UTC offset, so the
     // dashboard never lined up with the broker chart side by side.
     const useUtc = o.timeBasis !== "local";
+    // The time axis owns the dedicated strip at the very bottom of the canvas.
+    // Drawing it at priceH + 12 put it inside the top of the MACD pane, where
+    // it collided with the "MACD 12/26/9" legend and left timeAxisH blank.
+    const axisBaseline = priceH + macdH + Math.round(timeAxisH * 0.72);
     for (let i = 0; i < view.length; i += labelEvery) {
-      ctx.fillText(axisTimeLabel(view[i].time, useUtc), xFor(i), priceH + 12);
+      ctx.fillText(axisTimeLabel(view[i].time, useUtc), xFor(i), axisBaseline);
     }
 
     if (useMacd && self.CYBER_TA) {

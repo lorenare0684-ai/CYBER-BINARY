@@ -200,6 +200,23 @@ const priceTag = texts.find((t) => t === lastClose.toFixed(5));
 check("newest broker close is drawn on the price axis", !!priceTag,
   "expected " + lastClose.toFixed(5) + " in " + JSON.stringify(texts.slice(-6)));
 
+// The time axis and the MACD legend previously shared the same band: axis ticks
+// were stamped at priceH + 12 and "MACD 12/26/9" at priceH + 14, so the legend
+// sat on top of the axis text while the dedicated bottom strip stayed empty.
+const axisTicks = drawn.filter((d) => /^\d\d:\d\d$/.test(d.text));
+const macdLegend = drawn.find((d) => d.text.indexOf("MACD") === 0);
+check("time axis is drawn below the MACD pane, not across it",
+  axisTicks.length > 0 && !!macdLegend &&
+  axisTicks.every((t) => t.y > macdLegend.y + 8),
+  "axis y=" + JSON.stringify(axisTicks.map((t) => t.y)) +
+  " macd y=" + (macdLegend && macdLegend.y));
+// canvas.height is in device pixels; drawChart scales the context by dpr, so
+// compare the CSS-pixel baselines against height/dpr.
+const cssHeight = byIdGet("chart").height / Math.max(1, Math.min(2, 1));
+check("time axis stays inside the canvas",
+  axisTicks.length > 0 && axisTicks.every((t) => t.y <= cssHeight),
+  "axis y=" + JSON.stringify(axisTicks.map((t) => t.y)) + " h=" + cssHeight);
+
 /* ---------- build stamp: a stale load must be visible ---------- */
 check("header shows the loaded extension build from the manifest",
   byIdGet("app-kicker").textContent.indexOf("v9.9.9-test") !== -1,

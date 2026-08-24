@@ -4,6 +4,15 @@ Chrome extension (Manifest V3) that attaches to a Quotex / QX Broker chart, buil
 
 > Live signal analysis and explicitly armed automated execution for Quotex. This third-party tool can place real trades. Binary options are high risk, losses can quickly outweigh returns, and no result or profit is guaranteed.
 
+## What's new in v2.6.18 — Chart Time Axis No Longer Collides With the MACD Legend
+
+The time axis was stamped at `priceH + 12`, which is *inside* the top of the MACD
+pane, while the canvas's dedicated 18px axis strip at the bottom was left empty.
+The result: the `MACD 12/26/9` legend was drawn two pixels below the axis ticks
+and sat right on top of them. The axis now renders on its own baseline beneath
+the MACD pane, and `tools/dashboard-chart.js` asserts the separation so the two
+bands can't merge again.
+
 ## What's new in v2.6.17 — Strategy Names on Every Signal, Real Noise Detection, UTC Clock
 
 **The bugs (user-reported)**: signals did not show which strategy produced them (worst in auto mode), asset noise detection was too weak to protect accuracy, and the dashboard's candle times did not line up with Quotex's 24-hour clock.
@@ -378,6 +387,7 @@ tools/trade-confirm.js   # v2.6.15: orders/open ACK correlation + chart series
 tools/hook-confirm.js    # v2.6.15: generated page-hook round trip (socket → ACK)
 tools/dashboard-chart.js # v2.6.15: chart axis/basis under a non-UTC machine zone
 tools/signal-clarity.js  # v2.6.17: strategy naming, noise gate accuracy, UTC clock
+tools/dashboard-chart.js # v2.6.18: chart alignment + time-axis / MACD legend separation
 ```
 
 **Live-trading notice.** This is a third-party Quotex signal and automation client. Explicitly armed click mode can place real orders. Binary options have a built-in payout edge against the trader (most brokers require more than 50% wins to break even), so no signal, backtest, or automation result is a profit guarantee. Automation remains off and disarmed by default.
