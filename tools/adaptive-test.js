@@ -268,11 +268,60 @@ async function testAutoHighAccuracyGate() {
   check("Auto controller high-accuracy gate integration complete", true);
 }
 
+/** The router has TWO paths: evaluateAdaptive (live, via analyze) and
+ *  evaluateAdaptiveLeanAt (backtest, via ENG.backtest). Both carry the
+ *  winrateBonus, and the lean one had no coverage at all — a regression there
+ *  would be invisible. Drive it through backtest and confirm a penalised
+ *  record actually removes that strategy from the picks. */
+function testLeanAdaptiveUsesRecordedAccuracy() {
+  const asset = ASSETS.get("EURUSD_otc") || ASSETS.get("EURUSD");
+  const ids = ENG.CONCRETE_STRATEGIES;
+
+  const tally = (winrates) => {
+    const out = {};
+    for (let seed = 1; seed <= 4; seed++) {
+      const candles = FEED.syntheticSeries(asset, 400, { seed, drift: 0.001 });
+      const res = ENG.backtest(candles, {
+        strategy: "auto_adaptive", horizon: 3, minConf: 0, minBars: 60,
+        strategyWinrates: winrates,
+      });
+      for (const t of (res && res.trades) || []) {
+        const id = t.selectedStrategy || "?";
+        out[id] = (out[id] || 0) + 1;
+      }
+    }
+    return out;
+  };
+
+  const base = tally(null);
+  const picks = Object.keys(base).filter((id) => id !== "?");
+  check("lean adaptive backtest attributes trades to concrete strategies",
+    picks.length > 0, JSON.stringify(base));
+
+  const top = picks.sort((a, b) => base[b] - base[a])[0];
+  const penalised = {};
+  for (const id of ids) penalised[id] = 95;
+  penalised[top] = 5;
+  const after = tally(penalised);
+  check("a poor record removes a strategy from the lean router's picks",
+    (after[top] || 0) < base[top],
+    top + ": " + base[top] + " -> " + (after[top] || 0));
+
+  // A uniform record carries no information, so it must change nothing.
+  const uniform = {};
+  for (const id of ids) uniform[id] = 70;
+  const same = tally(uniform);
+  check("a uniform record does not perturb the lean router",
+    JSON.stringify(same) === JSON.stringify(base),
+    JSON.stringify(same));
+}
+
 async function main() {
   console.log("=== Testing Auto-Adaptive Strategy & High-Accuracy Assets System ===");
   testStrategiesList();
   testAutoAdaptiveEngine();
   testAdaptiveUsesRecordedAccuracy();
+  testLeanAdaptiveUsesRecordedAccuracy();
   testAssetSelector();
   await testAutoHighAccuracyGate();
 
