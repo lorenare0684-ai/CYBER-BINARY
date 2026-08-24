@@ -824,7 +824,12 @@
     const currentDate = new Date(now);
     const dayStart = Date.UTC(currentDate.getUTCFullYear(), currentDate.getUTCMonth(), currentDate.getUTCDate());
     if (fromSnapshot && !Number.isSafeInteger(closeTime)) return false;
-    if (Number.isSafeInteger(closeTime) && (closeTime < dayStart || closeTime > now + 300000)) return false;
+    // v2.6.13: the close-time upper bound must tolerate broker-server clock
+    // skew, like every other broker-timestamp check. The old +5-minute bound
+    // silently rejected real closes whenever the server clock ran ahead, so
+    // losses never reached the daily-loss cap — the safety ledger disarmed
+    // itself on a skewed clock. 24h still rejects unit-mixup garbage.
+    if (Number.isSafeInteger(closeTime) && (closeTime < dayStart || closeTime > now + 86400000)) return false;
     const hasFallbackIdentity = data.asset && (data.openTime != null || data.closeTime != null);
     const closeKey = data.id != null && data.id !== "" ? data.id
       : (data.requestId != null && data.requestId !== "" ? data.requestId

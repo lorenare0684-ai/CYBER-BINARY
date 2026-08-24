@@ -4,6 +4,15 @@ Chrome extension (Manifest V3) that attaches to a Quotex / QX Broker chart, buil
 
 > Live signal analysis and explicitly armed automated execution for Quotex. This third-party tool can place real trades. Binary options are high risk, losses can quickly outweigh returns, and no result or profit is guaranteed.
 
+## What's new in v2.6.13 — Bug Hunt: Money-Path Audit
+
+Audited the remaining unaudited paths end to end: virtual settlement (`settlePending`), broker close processing (`processClosedOrder`/`confirmationLifecycle`), candle persistence and the export handler, the marker store and the chart-glue that pins arrows to visible-timeframe candles, and the Node worker pool.
+
+- **Fixed (critical)**: closed-order timestamps were only accepted within +5 minutes of the local clock — the same skew bug class fixed for candles (v2.6.5) and settlements (v2.6.10), but this one sat in the path that feeds the daily loss cap. On a broker clock running ahead, real losses were silently dropped and the safety ledger stayed blind while auto-trade kept running. Bound aligned to the 24h tolerance.
+- Verified clean: settlePending (time-gated, draw-aware, bounded, prototype-safe), storage candle/trade mutations, the live-candle export shape, markers.js (anchor dedupe, epoch sanity, bounded), the shell's marker period-bucketing and asset-mismatch clearing, and the worker pool's completion accounting (no hang path).
+
+Full suite green (15 tools); baselines unchanged.
+
 ## What's new in v2.6.12 — Critical Fix: Generated-File Drift
 
 **The bug**: `src/page-hook.js` is GENERATED from `src/lib/quotex.js` + `tools/page-hook.shell.js`. The v2.6.5-v2.6.7 fixes (clock-skew tolerance, layout voting, symbol-verification trust chain) were applied to the generated file directly — so the next `node tools/build-hook.js` run would have silently reverted all of them. Verified for real: a rebuild wiped 59 lines of shipped fixes.
