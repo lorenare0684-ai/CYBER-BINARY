@@ -2351,9 +2351,15 @@
       return { ok: false, confirmed: false, error: "expiry must be between 0.5 and 1,440 minutes" };
     }
     const expirySec = Math.max(30, Math.round(expiry * 60));
-    if (!lastWsSymbol) return { ok: false, confirmed: false, error: "authoritative main chart is not known" };
+    if (!lastWsSymbol && !manualAsset) return { ok: false, confirmed: false, error: "authoritative main chart is not known" };
     const asset = args.asset || lastWsSymbol;
-    if (QUOTEX.normalizeSymbol(asset) !== QUOTEX.normalizeSymbol(lastWsSymbol)) {
+    // v2.7.6: relaxed the asset match check. When manualAsset is set
+    // (dashboard switch), lastWsSymbol may lag behind the active asset.
+    // Accept the trade if the asset matches EITHER lastWsSymbol OR the
+    // manually selected activeAsset.
+    const wsMatch = lastWsSymbol && QUOTEX.normalizeSymbol(asset) === QUOTEX.normalizeSymbol(lastWsSymbol);
+    const manualMatch = manualAsset && QUOTEX.normalizeSymbol(asset) === QUOTEX.normalizeSymbol(activeAsset);
+    if (!wsMatch && !manualMatch) {
       return { ok: false, confirmed: false, error: "trade asset is not the authoritative main chart" };
     }
 
