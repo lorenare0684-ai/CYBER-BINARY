@@ -469,15 +469,38 @@
     });
   }
 
+  /**
+   * v2.6.17: every analysis names the strategy that produced it.
+   *
+   * `selectedStrategy` used to be set only by the adaptive router, and only on
+   * its final result — so a direct preset run (and every early return: too few
+   * candles, invalid data, warm-up, ATR floor) came back anonymous. Anything
+   * downstream that wanted to display "which strategy said this" had to guess
+   * from the user's dropdown, which under auto-adaptive is the literal
+   * "auto_adaptive" rather than the concrete strategy that actually fired.
+   * Tagging at the single exit point means no path can go unnamed again.
+   */
+  function tagStrategy(result, strategyId) {
+    if (!result || typeof result !== "object") return result;
+    const id = typeof strategyId === "string" && strategyId ? strategyId : "confluence";
+    if (result.selectedStrategy) return result;
+    const preset = STRAT && hasOwn(STRAT, id) ? STRAT[id] : null;
+    result.selectedStrategy = id;
+    result.selectedStrategyLabel = (preset && preset.label) || id;
+    return result;
+  }
+
   function analyze(candles, opts) {
     const requestedStrategy = opts && typeof opts.strategy === "string" ? opts.strategy : "";
     if (requestedStrategy === "auto_adaptive") {
       return evaluateAdaptive(candles, opts, (c, o) => analyze(c, o));
     }
+    const namedStrategy = STRAT && hasOwn(STRAT, requestedStrategy) ? requestedStrategy : "confluence";
+    const tag = (result) => tagStrategy(result, namedStrategy);
 
     const { params: cfg, weights } = resolveStrategy(opts);
     if (!Array.isArray(candles) || candles.length < 40) {
-      return { ready: false, reason: "Need at least 40 candles", votes: [], regime: "unknown" };
+      return tag({ ready: false, reason: "Need at least 40 candles", votes: [], regime: "unknown" });
     }
 
     const liveMinBars = (opts && opts.lean === false) ? 200 : 0;
@@ -500,7 +523,7 @@
           (hasInputTimes && bar.time == null) ||
           (bar.time != null && (suppliedTime == null || suppliedTime < 0 ||
             (priorInputTime != null && suppliedTime <= priorInputTime)))) {
-        return { ready: false, reason: "Invalid candle data", votes: [], regime: "unknown" };
+        return tag({ ready: false, reason: "Invalid candle data", votes: [], regime: "unknown" });
       }
       if (suppliedTime != null) priorInputTime = suppliedTime;
     }
@@ -535,12 +558,12 @@
     ];
     if (!lean) need.push(donch && donch.upper[i], williams && williams[i], cci && cci[i]);
     if (need.some((v) => v == null || numberValue(v) == null)) {
-      return { ready: false, reason: "Warming indicators", votes: [], regime: "unknown" };
+      return tag({ ready: false, reason: "Warming indicators", votes: [], regime: "unknown" });
     }
 
     const atrPct = atr[i] / c[i];
     if (atrPct < cfg.minAtrPct) {
-      return {
+      return tag({
         ready: true, direction: "WAIT", score: 0, confidence: 0,
         reason: "Volatility too low (ATR filter)",
         votes: [], regime: detectRegime(i, rsi, emaF, emaS, adxR.adx, atr, c, hurst, bb, keltner),
@@ -552,7 +575,7 @@
           superTrend: superR.trend[i], psar: psar[i], mtfBias: 0, mtfChecked: 0,
           callScore: 0, putScore: 0, requiredScore: numberValue(cfg.minScore) || DEFAULTS.minScore,
         },
-      };
+      });
     }
 
     // Multi-timeframe alignment
@@ -732,7 +755,7 @@
       }
     }
 
-    return {
+    return tag({
       ready: true,
       direction,
       score,
@@ -777,7 +800,7 @@
         requiredScore,
         requiredLead,
       },
-    };
+    });
   }
 
   function createEmaTracker(period) {

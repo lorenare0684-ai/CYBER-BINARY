@@ -743,6 +743,108 @@
     return out;
   }
 
+  /**
+   * Composite market-noise profile (v2.6.17).
+   *
+   * The live noise gate used to be a single close-to-close flip ratio, which
+   * only sees the SIGN of each move. That misses the two chop patterns that
+   * cost the most accuracy on binary expiries:
+   *
+   *   - a series that walks steadily one way but retraces almost all of it
+   *     (few flips, no net travel) — flip ratio calls it clean;
+   *   - candles whose bodies are dwarfed by their wicks (price rejected in
+   *     both directions inside the bar) — flip ratio cannot see them at all.
+   *
+   * So the score blends four bounded [0,1] views of the same window, each
+   * measuring "how much of this movement is not going anywhere":
+   *
+   *   flip      direction reversals / direction changes possible
+   *   1 - ER    Kaufman efficiency ratio: |net travel| / total travel
+   *   wick      1 - mean(|body| / range): rejection inside the bar
+   *   chop      normalised choppiness index: sum(TR) vs the window's range
+   *
+   * Weights favour the two travel-based measures (they are the ones that
+   * correlate with a binary expiry landing on the wrong side of the entry),
+   * with the intrabar measures as confirmation. Every component is returned
+   * so a caller — or a regression test — can see WHY a bar was called noisy.
+   *
+   * Fails open (score 0, ready false) on short or malformed input: the gate
+   * this feeds may only ever suppress a signal, so an unknown score must
+   * never suppress one.
+   */
+  const NOISE_WEIGHTS = { flip: 0.3, efficiency: 0.3, wick: 0.15, chop: 0.25 };
+
+  function noiseProfile(candles, period) {
+    const empty = {
+      ready: false, score: 0, flip: 0, efficiency: 1, inefficiency: 0,
+      wick: 0, chop: 0, bars: 0,
+    };
+    if (!Array.isArray(candles)) return empty;
+    let window = Math.floor(numeric(period));
+    if (!Number.isFinite(window) || window <= 0) window = 20;
+    window = Math.max(4, Math.min(500, window));
+    const tail = [];
+    for (const raw of candles.slice(-window)) {
+      if (!raw || typeof raw !== "object") return empty;
+      const open = numeric(raw.open), high = numeric(raw.high);
+      const low = numeric(raw.low), close = numeric(raw.close);
+      if (![open, high, low, close].every((n) => Number.isFinite(n) && n > 0)) return empty;
+      const clamped = clampHighLow(high, low, open, close);
+      tail.push({ open, close, high: clamped.high, low: clamped.low });
+    }
+    if (tail.length < 8) return empty;
+
+    let flips = 0, moves = 0, prev = 0;
+    let travel = 0, wickSum = 0, trSum = 0;
+    let hh = -Infinity, ll = Infinity;
+    for (let i = 0; i < tail.length; i++) {
+      const bar = tail[i];
+      if (bar.high > hh) hh = bar.high;
+      if (bar.low < ll) ll = bar.low;
+      const range = bar.high - bar.low;
+      wickSum += range > 0 ? 1 - Math.abs(bar.close - bar.open) / range : 1;
+      if (i === 0) { trSum += range; continue; }
+      const priorClose = tail[i - 1].close;
+      const delta = bar.close - priorClose;
+      travel += Math.abs(delta);
+      const dir = delta > 0 ? 1 : delta < 0 ? -1 : 0;
+      if (dir && prev && dir !== prev) flips++;
+      if (dir) { moves++; prev = dir; }
+      trSum += Math.max(range, Math.abs(bar.high - priorClose), Math.abs(bar.low - priorClose));
+    }
+
+    const flip = moves > 1 ? flips / (moves - 1) : (moves === 1 ? 0 : 1);
+    const net = Math.abs(tail[tail.length - 1].close - tail[0].close);
+    const efficiency = travel > 0 ? Math.max(0, Math.min(1, net / travel)) : 0;
+    const wick = Math.max(0, Math.min(1, wickSum / tail.length));
+    // Choppiness index, normalised to [0,1]. 100*log10(sum TR / range) /
+    // log10(n) is ~1 when price covers the same ground repeatedly and ~0 on a
+    // clean directional leg.
+    const span = hh - ll;
+    const denom = Math.log10(tail.length);
+    let chop = 1;
+    if (span > 0 && trSum > 0 && denom > 0) {
+      chop = Math.max(0, Math.min(1, Math.log10(trSum / span) / denom));
+    }
+
+    const score = Math.max(0, Math.min(1,
+      NOISE_WEIGHTS.flip * flip +
+      NOISE_WEIGHTS.efficiency * (1 - efficiency) +
+      NOISE_WEIGHTS.wick * wick +
+      NOISE_WEIGHTS.chop * chop
+    ));
+    return {
+      ready: true,
+      score,
+      flip,
+      efficiency,
+      inefficiency: 1 - efficiency,
+      wick,
+      chop,
+      bars: tail.length,
+    };
+  }
+
   function lastValid(arr) {
     if (!Array.isArray(arr)) return { value: null, index: -1 };
     for (let i = arr.length - 1; i >= 0; i--) {
@@ -790,6 +892,7 @@
     obv,
     donchian,
     resample,
+    noiseProfile,
     lastValid,
     softmaxProbs,
   };
