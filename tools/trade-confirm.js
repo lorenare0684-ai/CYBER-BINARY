@@ -339,6 +339,11 @@ function contentTests() {
       return {
         ready: true, direction: "CALL", confidence: 88, score: 9, regime: "trending",
         reason: "test", votes: [], metrics: {},
+        // Mimic the real router: under auto_adaptive the analysis names the
+        // concrete strategy it picked, and that is what the settled outcome
+        // must be booked against.
+        adaptive: o && o.strategy === "auto_adaptive",
+        selectedStrategy: o && o.strategy === "auto_adaptive" ? "sniper" : undefined,
       };
     };
 
@@ -507,6 +512,23 @@ function contentTests() {
     check("small samples are shrunk toward 50%, not reported raw",
       Number(wr.sniper) > 50 && Number(wr.sniper) < 100,
       "sniper=" + wr.sniper + " (raw would be 85.7)");
+
+    // --- M. a settled adaptive trade must be booked against the strategy the
+    // router PICKED, not the literal "auto_adaptive". Before the fix every
+    // adaptive outcome landed under that one key, so no concrete strategy ever
+    // accumulated the record the router is supposed to route on. ---
+    const booked = (storageMap.cyberBinaryV2 && storageMap.cyberBinaryV2.stats &&
+      storageMap.cyberBinaryV2.stats.byStrategy) || {};
+    // Compare against the seeded baseline (sniper 30w/5l = 35 settled), not
+    // against zero — otherwise the check passes on the unfixed tree too, where
+    // sniper only exists because the test seeded it.
+    const sniperSettled = booked.sniper ? (booked.sniper.w + booked.sniper.l) : 0;
+    check("a settled adaptive trade is booked against the selected strategy",
+      sniperSettled > 35,
+      "sniper settled=" + sniperSettled + " (seeded 35) byStrategy=" + JSON.stringify(booked));
+    check("no adaptive outcome is stranded under the literal 'auto_adaptive'",
+      !booked.auto_adaptive,
+      "byStrategy=" + JSON.stringify(booked));
 
     if (failed) { console.error("FAILED " + failed); process.exitCode = 1; return; }
     console.log("OK — broker confirmation + chart-alignment regressions passed");
