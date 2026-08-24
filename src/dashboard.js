@@ -70,6 +70,7 @@
   let btDataByAsset = null; // asset id -> "live" | "live+sim" | "sim" for the last run
   let lastChartCandles = null;
   let lastChartMeta = {};
+  let currentAssetId = null; // asset on screen, for per-asset price precision
   let lastBtEquity = null;
   let qxStatus = { state: "idle" };
   let qxInstruments = [];
@@ -138,9 +139,26 @@
     const x = finite(n, null);
     return x == null ? "—" : x.toFixed(1) + "%";
   }
-  function fmtPx(n) {
+  // Decimal places for the asset currently on screen. The old rule keyed off
+  // magnitude alone (>= 20 → 2 decimals), which truncated every JPY pair to
+  // 115.01 while Quotex quotes 115.012 — dropping the digit that actually
+  // decides a binary option. Prefer the catalog's per-asset `decimals`.
+  function assetDecimals(assetId) {
+    const id = assetId == null ? currentAssetId : assetId;
+    if (id && self.CYBER_ASSETS && typeof self.CYBER_ASSETS.get === "function") {
+      try {
+        const a = self.CYBER_ASSETS.get(id);
+        const d = a && Number(a.decimals);
+        if (Number.isFinite(d) && d >= 0 && d <= 10) return Math.floor(d);
+      } catch (_) {}
+    }
+    return null;
+  }
+  function fmtPx(n, assetId) {
     const x = finite(n, null);
     if (x == null) return "—";
+    const d = assetDecimals(assetId);
+    if (d != null) return x.toFixed(d);
     return Math.abs(x) >= 20 ? x.toFixed(2) : x.toFixed(5);
   }
   function fmtReading(n) {
@@ -776,6 +794,11 @@
       ? (state.primary === false ? "Secondary chart" : "Main · " + (state.source || "chart"))
       : "Demo feed";
     $("link-state").className = "pill " + (state.attached ? "ok" : "dim");
+
+    // Track the on-screen asset before formatting any price, so fmtPx can use
+    // that asset's real decimal precision (JPY pairs quote 3, not 2).
+    if (typeof state.assetId === "string" && state.assetId) currentAssetId = state.assetId.slice(0, 96);
+    else if (typeof state.asset === "string" && state.asset) currentAssetId = state.asset.slice(0, 96);
 
     if (state.asset) $("asset").textContent = state.asset;
     if (state.price != null) $("price").textContent = fmtPx(state.price);

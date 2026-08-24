@@ -384,6 +384,18 @@
         const computed = Math.min(ctx.account.balance, raw, 1000000);
         s = Object.assign({}, s, { stake: Math.round(computed * 100) / 100 });
       }
+      // Percent staking clamps itself to the balance, but a FIXED stake was
+      // never checked against available funds: a stake of 500 on a balance of
+      // 10 was submitted to the broker and rejected there (or, on a live
+      // account, silently ate the whole balance). Refuse it here instead.
+      const fixedStake = numberValue(s.stake);
+      if (ctx.account.balance != null && ctx.account.balance > 0 &&
+          fixedStake != null && fixedStake > ctx.account.balance) {
+        return {
+          ok: false,
+          reason: `Stake exceeds balance (${fixedStake.toFixed(2)} > ${ctx.account.balance.toFixed(2)})`,
+        };
+      }
       return { ok: true, settings: s };
     }
 

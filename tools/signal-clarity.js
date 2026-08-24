@@ -813,6 +813,54 @@ function dashboardTests(contentState) {
     /strategy: —/.test(emptyRow) && !/undefined/.test(emptyRow), JSON.stringify(emptyRow));
 }
 
+/* ===================================================================
+ * Part E — per-asset price precision (v2.6.19)
+ *
+ * JPY-quoted pairs are priced to 3 decimals with a 0.01 pip. The catalog
+ * hardcoded 5/0.0001 for every FX pair, and the dashboard's fmtPx picked
+ * decimals from magnitude alone (>= 20 -> 2), rendering CADJPY as 115.01
+ * while Quotex shows 115.012.
+ * =================================================================== */
+function precisionTests() {
+  const sandbox = { self: {}, console, Date, Math, JSON, RegExp };
+  sandbox.globalThis = sandbox.self;
+  vm.createContext(sandbox);
+  loadLibs(sandbox, ["indicators.js", "assets.js"]);
+  const ASSETS = sandbox.self.CYBER_ASSETS;
+
+  const jpy = ["USDJPY", "EURJPY", "GBPJPY", "CADJPY", "CHFJPY", "NZDJPY", "AUDJPY", "USDJPY_otc"];
+  for (const id of jpy) {
+    const a = ASSETS.get(id);
+    check("JPY pair " + id + " quotes 3 decimals with a 0.01 pip",
+      !!a && a.decimals === 3 && Math.abs(a.pipSize - 0.01) < 1e-12,
+      a ? "decimals=" + a.decimals + " pipSize=" + a.pipSize : "asset missing");
+  }
+  for (const id of ["EURUSD", "GBPUSD", "AUDUSD", "EURGBP"]) {
+    const a = ASSETS.get(id);
+    check("non-JPY pair " + id + " keeps 5 decimals / 0.0001 pip",
+      !!a && a.decimals === 5 && Math.abs(a.pipSize - 0.0001) < 1e-12,
+      a ? "decimals=" + a.decimals + " pipSize=" + a.pipSize : "asset missing");
+  }
+
+  // The dashboard formatter must honour those decimals, not the magnitude
+  // heuristic. Mirrors src/dashboard.js fmtPx/assetDecimals.
+  function fmtPx(n, assetId) {
+    const a = assetId ? ASSETS.get(assetId) : null;
+    const d = a && Number.isFinite(Number(a.decimals)) ? Math.floor(Number(a.decimals)) : null;
+    if (d != null) return n.toFixed(d);
+    return Math.abs(n) >= 20 ? n.toFixed(2) : n.toFixed(5);
+  }
+  check("CADJPY 115.012 keeps its third decimal (was 115.01)",
+    fmtPx(115.012, "CADJPY") === "115.012", fmtPx(115.012, "CADJPY"));
+  check("USDJPY 156.423 keeps its third decimal",
+    fmtPx(156.423, "USDJPY") === "156.423", fmtPx(156.423, "USDJPY"));
+  check("EURUSD still renders 5 decimals",
+    fmtPx(1.08542, "EURUSD") === "1.08542", fmtPx(1.08542, "EURUSD"));
+  check("unknown asset falls back to the magnitude heuristic",
+    fmtPx(1.08542, null) === "1.08542" && fmtPx(2412.35, null) === "2412.35",
+    fmtPx(1.08542, null) + " / " + fmtPx(2412.35, null));
+}
+
 /* =================================================================== */
 engineTests();
 noiseTests();
@@ -820,6 +868,7 @@ contentTests()
   .then((state) => autoTests().then(() => state))
   .then(() => {
     dashboardTests();
+    precisionTests();
     if (failed) { console.error("FAILED " + failed); process.exitCode = 1; return; }
     console.log("OK — strategy naming, noise detection and UTC time-basis regressions passed");
   })

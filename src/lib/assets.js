@@ -246,6 +246,13 @@
       return { basePrice: 100, pipSize: 0.001, decimals: 3, vol: annToMin(25), jumpRate: 0.012, session: "OTC 24/7" };
     }
     var fp = FX_PRICES[S] || FX_PRICES[S2] || 1.08;
+    // JPY-quoted pairs are conventionally priced to 3 decimals with a pip of
+    // 0.01 — not the 5/0.0001 used for every other FX pair. Returning the
+    // generic profile made a USDJPY "pip" 100x too small and rendered prices
+    // with two digits of false precision.
+    if (/JPY$/.test(S.replace(/_OTC$/i, ""))) {
+      return { basePrice: fp, pipSize: 0.01, decimals: 3, vol: annToMin(8), jumpRate: 0.003, session: "London/NY" };
+    }
     return { basePrice: fp, pipSize: 0.0001, decimals: 5, vol: annToMin(8), jumpRate: 0.003, session: "London/NY" };
   }
 
@@ -274,10 +281,13 @@
     for (i = 0; i < FX_PAIRS.length; i++) {
       row = FX_PAIRS[i];
       var sym = row[0], name = row[1], id = row[2];
+      // Use the profile's pip/decimals instead of hardcoding 0.0001/5: JPY
+      // pairs quote to 3 decimals with a 0.01 pip.
+      var pFx = profileFor(sym, "fx");
       out.push({
         id: sym, name: name, kind: "fx",
-        basePrice: profileFor(sym, "fx").basePrice,
-        pipSize: 0.0001, decimals: 5,
+        basePrice: pFx.basePrice,
+        pipSize: pFx.pipSize, decimals: pFx.decimals,
         vol: annToMin(8), drift: 0, jumpRate: 0.003,
         session: "London/NY",
         brokerId: id,
@@ -286,8 +296,8 @@
       var otcId = FX_OTC_IDS[sym] != null ? FX_OTC_IDS[sym] : null;
       out.push({
         id: sym + "_otc", name: name + " OTC", kind: "fx",
-        basePrice: profileFor(sym, "fx").basePrice,
-        pipSize: 0.0001, decimals: 5,
+        basePrice: pFx.basePrice,
+        pipSize: pFx.pipSize, decimals: pFx.decimals,
         vol: annToMin(11), drift: 0, jumpRate: 0.008,
         session: "OTC 24/7",
         brokerId: otcId,
@@ -301,7 +311,8 @@
       out.push({
         id: row[0], name: row[1] + " OTC", kind: "fx",
         basePrice: profileFor(row[0], "fx").basePrice,
-        pipSize: 0.0001, decimals: 5,
+        pipSize: profileFor(row[0], "fx").pipSize,
+        decimals: profileFor(row[0], "fx").decimals,
         vol: annToMin(14), drift: 0, jumpRate: 0.01,
         session: "OTC 24/7",
         brokerId: row[2],

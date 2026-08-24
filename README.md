@@ -4,6 +4,26 @@ Chrome extension (Manifest V3) that attaches to a Quotex / QX Broker chart, buil
 
 > Live signal analysis and explicitly armed automated execution for Quotex. This third-party tool can place real trades. Binary options are high risk, losses can quickly outweigh returns, and no result or profit is guaranteed.
 
+## What's new in v2.6.19 — Stake Safety and Correct JPY Price Precision
+
+Three bugs found by probing the money and price paths:
+
+1. **A fixed stake was never checked against the balance.** Percent staking
+   clamps itself to available funds, but `stakeMode: "fixed"` did not: a stake
+   of 500 on a balance of 10 was sent straight to the broker. It is now
+   refused with `Stake exceeds balance (500.00 > 10.00)`. The guard stays
+   silent when no balance event has arrived yet, so it cannot block trading on
+   an unknown account.
+2. **Every JPY pair had a pip 100x too small.** The catalog hardcoded
+   `pipSize: 0.0001, decimals: 5` for all FX pairs, but JPY-quoted pairs trade
+   to 3 decimals with a 0.01 pip. `profileFor()` now returns the JPY profile
+   and the catalog builder uses it instead of the hardcoded literals.
+3. **The dashboard truncated JPY prices.** `fmtPx` chose decimals from price
+   magnitude alone (`>= 20` → 2 decimals), so CADJPY rendered as `115.01`
+   while Quotex displayed `115.012` — hiding the digit that decides a binary
+   option. Prices now use the asset's real precision, falling back to the old
+   heuristic only for unknown assets.
+
 ## What's new in v2.6.18 — Chart Time Axis No Longer Collides With the MACD Legend
 
 The time axis was stamped at `priceH + 12`, which is *inside* the top of the MACD
@@ -388,6 +408,8 @@ tools/hook-confirm.js    # v2.6.15: generated page-hook round trip (socket → A
 tools/dashboard-chart.js # v2.6.15: chart axis/basis under a non-UTC machine zone
 tools/signal-clarity.js  # v2.6.17: strategy naming, noise gate accuracy, UTC clock
 tools/dashboard-chart.js # v2.6.18: chart alignment + time-axis / MACD legend separation
+tools/auto-trade.js      # v2.6.19: fixed-stake vs balance guard
+# tools/signal-clarity.js also covers v2.6.19 JPY pip/decimal precision
 ```
 
 **Live-trading notice.** This is a third-party Quotex signal and automation client. Explicitly armed click mode can place real orders. Binary options have a built-in payout edge against the trader (most brokers require more than 50% wins to break even), so no signal, backtest, or automation result is a profit guarantee. Automation remains off and disarmed by default.

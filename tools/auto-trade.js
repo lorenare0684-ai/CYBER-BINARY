@@ -435,6 +435,51 @@ async function main() {
     await STORE.setSettings({ accountMode: "demo", stakeMode: "fixed", minBalance: 0 });
   }
 
+  // ---- v2.6.19: a FIXED stake must never exceed the account balance ----
+  {
+    const decisions = [];
+    const stakes = [];
+    const funds = AUTO.startAuto({
+      onTrade: (d) => decisions.push(d),
+      executeTrade: async (args) => { stakes.push(args.stake); return { ok: true, confirmed: true, id: "funds" }; },
+    });
+    funds.setMode("click");
+    funds.setArmed(true);
+    await STORE.setSettings({
+      accountMode: "any", stakeMode: "fixed", stake: 500, minBalance: 0,
+      cooldownBars: 0, minConfidence: 0, minIntervalMs: 1000,
+      maxTradesPerHour: 100, maxTradesPerDay: 1000,
+    });
+    funds.setAccountInfo({ isDemo: true, balance: 10, currency: "USD" });
+    advance(60000);
+    await funds.handleSignal(makeSignal("CALL", recentBar(), 85, "EURUSD_otc"));
+    check("fixed stake larger than the balance is refused",
+      stakes.length === 0 && /exceeds balance/i.test(decisions[decisions.length - 1] && decisions[decisions.length - 1].blockedReason || ""),
+      "stakes=" + JSON.stringify(stakes) + " reason=" + (decisions[decisions.length - 1] && decisions[decisions.length - 1].blockedReason));
+
+    // An affordable fixed stake on the same balance still goes through.
+    await STORE.setSettings({ stake: 5 });
+    advance(60000);
+    await funds.handleSignal(makeSignal("PUT", recentBar(), 85, "EURUSD_otc"));
+    check("affordable fixed stake is still placed",
+      stakes.length === 1 && Math.abs(stakes[0] - 5) < 0.01, "stakes=" + JSON.stringify(stakes));
+
+    // With no balance event yet the guard must not fire (nothing to compare).
+    const noBal = AUTO.startAuto({
+      onTrade: (d) => decisions.push(d),
+      executeTrade: async () => ({ ok: true, confirmed: true, id: "nobal" }),
+    });
+    noBal.setMode("click");
+    noBal.setArmed(true);
+    await STORE.setSettings({ stake: 500 });
+    advance(60000);
+    await noBal.handleSignal(makeSignal("CALL", recentBar(), 85, "GBPUSD_otc"));
+    check("stake guard stays quiet when the balance is unknown",
+      !/exceeds balance/i.test(decisions[decisions.length - 1] && decisions[decisions.length - 1].blockedReason || ""),
+      String(decisions[decisions.length - 1] && decisions[decisions.length - 1].blockedReason));
+    await STORE.setSettings({ accountMode: "demo", stakeMode: "fixed", stake: 1 });
+  }
+
   if (failed) { console.error("FAILED " + failed); process.exitCode = 1; return; }
   console.log("OK — auto/placement regressions passed");
 }

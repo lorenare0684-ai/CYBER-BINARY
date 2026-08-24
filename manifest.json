@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "CYBER BINARY \u2014 Quotex Trading Automation",
-  "version": "2.6.18",
+  "version": "2.6.19",
   "description": "v2.6.15: live Quotex signals with Auto-Adaptive Strategy engine, Auto-Adapting High-Accuracy Assets system, multi-strategy suite, and ACK-confirmed broker execution.",
   "permissions": [
     "storage",
