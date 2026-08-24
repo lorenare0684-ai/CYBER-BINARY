@@ -389,6 +389,11 @@
       // 10 was submitted to the broker and rejected there (or, on a live
       // account, silently ate the whole balance). Refuse it here instead.
       const fixedStake = numberValue(s.stake);
+      // v2.7.1: Quotex minimum stake is $1. A stake below that is silently
+      // rejected by the broker, wasting the signal. Refuse it here instead.
+      if (fixedStake != null && fixedStake < 1) {
+        return { ok: false, reason: `Stake below broker minimum ($1.00): ${fixedStake.toFixed(2)}` };
+      }
       if (ctx.account.balance != null && ctx.account.balance > 0 &&
           fixedStake != null && fixedStake > ctx.account.balance) {
         return {

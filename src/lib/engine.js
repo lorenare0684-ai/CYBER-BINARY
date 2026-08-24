@@ -320,7 +320,10 @@
       // selected the most trigger-happy strategy in quiet markets — the
       // opposite of accuracy-first. Fitness now decides; firing adds a mild
       // preference (stacked with signalBonus inside rawFitness: 50 total).
-      const effectiveFitness = rawFitness + (hasSignal ? 25 : 0);
+      // v2.7.1: removed the second +25 bonus. signalBonus (25) is already
+      // inside rawFitness, so effectiveFitness was adding 50 total (25+25) for
+      // a signal vs 0 for abstaining — still too much weight on firing.
+      const effectiveFitness = rawFitness;
       if (effectiveFitness > bestScore) {
         bestScore = effectiveFitness;
         bestStrategy = stratId;
@@ -433,8 +436,11 @@
       // beat EVERY correctly-abstaining strategy, so auto-adaptive actively
       // selected the most trigger-happy strategy in quiet markets — the
       // opposite of accuracy-first. Fitness now decides; firing adds a mild
-      // preference (stacked with signalBonus inside rawFitness: 50 total).
-      const effectiveFitness = rawFitness + (hasSignal ? 25 : 0);
+      // preference.
+      // v2.7.1: removed the second +25 bonus. signalBonus (25) is already
+      // inside rawFitness, so effectiveFitness was adding 50 total (25+25) for
+      // a signal vs 0 for abstaining — still too much weight on firing.
+      const effectiveFitness = rawFitness;
       if (effectiveFitness > bestScore) {
         bestScore = effectiveFitness;
         bestStrategy = stratId;

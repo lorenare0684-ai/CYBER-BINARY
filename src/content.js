@@ -452,8 +452,12 @@
     const p = pendingByAsset[key];
     close = Number(close);
     time = Number(time);
+    // v2.7.1: upper bound prevents a stale tick from settling a trade hours
+    // after expiry. Allow 2x the expiry duration or 10 minutes, whichever is
+    // larger, to tolerate broker delays but reject ancient ticks.
+    const maxSettlementWindow = Math.max(p && p.expiryMinutes ? p.expiryMinutes * 120000 : 600000, 600000);
     if (!p || !Number.isFinite(close) || close <= 0 || close > 1e12 ||
-        !Number.isSafeInteger(time) || time < p.expireAt ||
+        !Number.isSafeInteger(time) || time < p.expireAt || time > p.expireAt + maxSettlementWindow ||
         (p.dir !== "CALL" && p.dir !== "PUT") ||
         !Number.isFinite(Number(p.entry)) || Number(p.entry) <= 0) return;
     const draw = close === p.entry;
