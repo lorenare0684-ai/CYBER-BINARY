@@ -133,14 +133,39 @@ function testAdaptiveUsesRecordedAccuracy() {
     rankedRes.strategyScores[a].fitness > rankedRes.strategyScores[b].fitness,
     a + "=" + rankedRes.strategyScores[a].fitness + " vs " + b + "=" + rankedRes.strategyScores[b].fitness);
 
-  // --- bounded: the +/-25 clamp keeps accuracy from overriding the bar ---
+  // --- bounded: the +/-50 clamp is a real bound. At gain 1.5 an unclamped
+  // bonus reaches |73.5| at wr=99%, so unlike the old +/-25-at-gain-0.5 pair
+  // (max |24.5|, i.e. a clamp that never bound) this one actually bites. ---
   const extreme = {};
   for (const id of Object.keys(base.strategyScores)) extreme[id] = 50;
   extreme[target] = 100;
   const capped = ENG.analyze(candles, { strategy: "auto_adaptive", lean: false, strategyWinrates: extreme });
   const cappedGain = capped.strategyScores[target].fitness - base.strategyScores[target].fitness;
-  check("accuracy bonus is bounded (cannot swamp confluence)", cappedGain <= 26,
+  check("accuracy bonus is bounded (cannot swamp confluence)", cappedGain <= 51,
     "gain=" + cappedGain);
+  check("the clamp actually binds (it is not dead code)", cappedGain > 26,
+    "gain=" + cappedGain + " (unclamped would be ~73)");
+
+  // --- the invariant that makes the clamp safe: a strategy that ABSTAINS on
+  // the current bar must never be picked on the strength of its history.
+  // Give every abstainer a near-perfect record and every firing strategy a
+  // near-hopeless one; the pick must still be a strategy that fired. ---
+  const fired = Object.keys(base.strategyScores)
+    .filter((id) => base.strategyScores[id].direction !== "WAIT");
+  const abstainers = Object.keys(base.strategyScores)
+    .filter((id) => base.strategyScores[id].direction === "WAIT");
+  check("this bar has both firing and abstaining candidates",
+    fired.length > 0 && abstainers.length > 0,
+    "fired=" + fired.length + " abstaining=" + abstainers.length);
+  const inverted = {};
+  for (const id of Object.keys(base.strategyScores)) {
+    inverted[id] = base.strategyScores[id].direction === "WAIT" ? 99 : 1;
+  }
+  const inv = ENG.analyze(candles, { strategy: "auto_adaptive", lean: false, strategyWinrates: inverted });
+  check("history alone cannot make an abstaining strategy win",
+    inv.strategyScores[inv.selectedStrategy].direction !== "WAIT",
+    "picked=" + inv.selectedStrategy +
+    " dir=" + inv.strategyScores[inv.selectedStrategy].direction);
 
   // --- omitting the map must leave fitness exactly as before ---
   const omitted = ENG.analyze(candles, { strategy: "auto_adaptive", lean: false, strategyWinrates: null });
