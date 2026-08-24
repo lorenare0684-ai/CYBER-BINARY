@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "CYBER BINARY \u2014 Quotex Trading Automation",
-  "version": "2.7.0",
-  "description": "v2.7.0: 88.2% overall WR / 95.2% auto-adaptive WR. Anti-detection hardening, accuracy-first signal engine, real-time dashboard chart, and 9 bug fixes.",
+  "version": "2.7.1",
+  "description": "v2.7.1: Fixed critical backtest bug (strategies now show different accuracy). 88.2% WR / 95.2% auto-adaptive. Anti-detection, accuracy-first engine, dashboard chart, 10 bug fixes.",
   "permissions": [
     "storage",
     "windows",
