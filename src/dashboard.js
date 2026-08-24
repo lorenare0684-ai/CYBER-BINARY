@@ -594,19 +594,37 @@
   /* ---------- asset/strategy selectors ---------- */
   function selectAsset(assetId) {
     if (hasChrome) {
+      const pill = $("link-state");
+      if (pill) {
+        pill.textContent = "Switching asset…";
+        pill.className = "pill dim";
+      }
       chrome.runtime.sendMessage({ type: "CYBER_SET_ASSET", asset: assetId }).then((response) => {
         if (response && response.ok) {
           activeAsset = response.asset || assetId;
           const sel = $("asset-select");
           if (sel) sel.value = activeAsset;
-        } else {
-          const pill = $("link-state");
           if (pill) {
-            pill.textContent = response && response.error || "Select asset on Quotex first";
+            if (response.wsConnected) {
+              pill.textContent = response.message || ("Switched to " + (response.name || activeAsset));
+              pill.className = "pill ok";
+            } else {
+              pill.textContent = response.message || "Open Quotex to receive live data";
+              pill.className = "pill warn";
+            }
+          }
+        } else {
+          if (pill) {
+            pill.textContent = response && response.error || "Asset switch failed";
             pill.className = "pill warn";
           }
         }
-      }).catch(() => {});
+      }).catch(() => {
+        if (pill) {
+          pill.textContent = "Extension not responding";
+          pill.className = "pill warn";
+        }
+      });
     } else {
       activeAsset = assetId;
       const sel = $("asset-select");

@@ -176,6 +176,7 @@
   let dashOpened = false;
   let pollTimer = null;
   let manualAsset = null; // set by dashboard selection; null = auto-detect
+  let manualAssetSetAt = 0; // timestamp when manualAsset was last set (for grace period)
   let isPrimaryContext = false;  // only the selected Quotex browser tab may auto-trade
   let primaryEpoch = 0;          // invalidates placement work across leadership changes
   let cachedSignal = null;
@@ -1657,7 +1658,10 @@
           const period = Number(p.period);
           if (Number.isFinite(period) && period >= 1 && period <= 86400) lastWsPeriod = Math.floor(period);
           const det = ASSETS.ensureRegistered(p.symbol);
-          if (manualAsset && det && det.id !== manualAsset) manualAsset = null;
+          // v2.7.2: respect a 5-second grace period after manual asset selection
+          // to prevent old "asset" events from resetting the selection before
+          // Quotex confirms the chart switch.
+          if (manualAsset && det && det.id !== manualAsset && Date.now() - manualAssetSetAt > 5000) manualAsset = null;
           if (det && det.id !== activeAsset) {
             activateAsset(det.id);
             lastWsPrice = null;
@@ -2226,20 +2230,25 @@
         sendResponse({ ok: false, error: "unknown or invalid asset", asset: activeAsset });
         return;
       }
-      // The dashboard cannot safely switch the broker's chart. Pinning a
-      // different local feed made the UI display synthetic candles for one
-      // asset while Quotex was trading another. Only acknowledge the symbol
-      // already selected on the authoritative main chart.
-      const matchesMain = !!lastWsSymbol && !!QUOTEX &&
-        QUOTEX.normalizeSymbol(det.id) === QUOTEX.normalizeSymbol(lastWsSymbol);
-      if (!matchesMain) {
-        sendResponse({ ok: false, asset: activeAsset,
-          error: "Select " + det.name + " on the Quotex chart first" });
-        return;
-      }
-      manualAsset = null;
+      // v2.7.2: allow switching assets from the dashboard. The subscription
+      // sends instruments/update to Quotex which switches the broker chart,
+      // then history/list/v2 requests candle data for the new asset.
+      manualAsset = det.id;
+      manualAssetSetAt = Date.now();
       activateAsset(det.id);
-      sendResponse({ ok: true, asset: det.id, manual: false });
+      // Check if the WebSocket is connected - if not, the subscription will
+      // fail silently and the user will need to open Quotex first.
+      const wsConnected = !!lastWsSymbol && !!QUOTEX;
+      sendResponse({
+        ok: true,
+        asset: det.id,
+        name: det.name,
+        manual: true,
+        wsConnected,
+        message: wsConnected
+          ? "Switching to " + det.name + " — requesting candle data..."
+          : "Open Quotex first to receive live candle data for " + det.name
+      });
       return;
     }
     if (msg && msg.type === "CYBER_DETECT_ASSET") {
