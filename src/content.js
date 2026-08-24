@@ -215,6 +215,7 @@
   // arrow can never move or duplicate as new candles form.
   const markerStore = MARKERS ? MARKERS.createStore({ max: 600 }) : null;
   let lastMarkersAsset = null; // re-send to the page hook when the chart's asset changes
+  let lastMarkerPushAt = 0;    // v2.7.5: periodic re-push timer
 
   const pendingByAsset = Object.create(null);
   const stats = {
@@ -1852,6 +1853,13 @@
     // the arrows shown always belong to the visible chart.
     if (markerStore && lastMarkersAsset !== activeAsset) {
       lastMarkersAsset = activeAsset;
+      sendMarkers();
+    }
+    // v2.7.5: periodic marker re-push every 5 seconds. The page-hook may
+    // miss the initial markers message (chart not yet captured, asset
+    // mismatch, or timing race). Re-sending ensures arrows eventually appear.
+    if (markerStore && currentTime - (lastMarkerPushAt || 0) >= 5000) {
+      lastMarkerPushAt = currentTime;
       sendMarkers();
     }
     ensureHistorySubscription(det || ASSETS.get(activeAsset));

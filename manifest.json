@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "CYBER BINARY \u2014 Quotex Trading Automation",
-  "version": "2.7.4",
-  "description": "v2.7.4: Improved high-accuracy asset detection — multi-strategy sweep, volatility/trend/noise quality scoring, session awareness, recent performance weighting.",
+  "version": "2.7.5",
+  "description": "v2.7.5: Fixed arrows not appearing on Quotex chart — deferred marker replay, periodic re-push, expanded chart detection.",
   "permissions": [
     "storage",
     "windows",
