@@ -217,6 +217,9 @@
   const markerStore = MARKERS ? MARKERS.createStore({ max: 600 }) : null;
   let lastMarkersAsset = null; // re-send to the page hook when the chart's asset changes
   let lastMarkerPushAt = 0;    // v2.7.5: periodic re-push timer
+  // v2.7.6: live candle cache by asset — populated from broker history
+  // responses. Used by the autoHighAccuracy gate to evaluate asset quality.
+  const liveCandlesByAsset = Object.create(null);
 
   const pendingByAsset = Object.create(null);
   const stats = {
@@ -290,7 +293,6 @@
   let lastDomAssetScan = 0;
   let lastDomAssetResult = null;
 
-  /**
   /**
    * v2.7.2: Improved asset detection with caching, MutationObserver,
    * URL patterns, and TradingView chart widget extraction.
@@ -1175,6 +1177,12 @@
     // other open/mini charts are retained per asset+period but NEVER select
     // the active chart.
     mergeChartCandles(id, safePeriod, real);
+    // v2.7.6: populate the live candle cache for the autoHighAccuracy gate.
+    // Only store 1m bars (the engine's timeframe) — higher timeframes are
+    // chart-only and would confuse the asset evaluator.
+    if (safePeriod === 60 && useForEngine) {
+      liveCandlesByAsset[id] = feed.series().slice(-500);
+    }
     if (id === activeAsset || id === lastWsSymbol || !historySeeded[activeAsset]) {
       if (activeAsset !== id && !manualAsset) {
         activateAsset(id);
