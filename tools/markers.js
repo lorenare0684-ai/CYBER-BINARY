@@ -246,14 +246,14 @@ function hookTests() {
   // load the REAL built hook (adapter + shell)
   vm.runInContext(fs.readFileSync(path.join(root, "src/page-hook.js"), "utf8"), sandbox);
   const M = sandbox.self.CYBER_MARKERS; // lib loaded inside the hook bundle? no — bundle only has CYBER_QUOTEX
-  const HK = sandbox.window.__cyber && sandbox.window.__cyber.markers;
+  const HK = sandbox.window._xkh && sandbox.window._xkh.markers;
   check("hook exposes markers API", !!HK && typeof HK.applyMarkers === "function", String(HK));
 
   // History requests are correlated and report the actual socket-send result.
   // Previously content received an uncorrelated event while the dashboard was
   // told success merely because postMessage itself succeeded.
   msgListener({ source: sandbox.window, data: {
-    source: "CYBER_BINARY_CONTENT", kind: "subscribe",
+    source: "_q1c", kind: "subscribe",
     payload: { requestId: "history-test-1", asset: "EURUSD_otc", period: 60, limit: 5000 },
   } });
   const historyAck = posted.filter((m) => m && m.kind === "subscribe_result").pop();
@@ -274,7 +274,7 @@ function hookTests() {
   check("chart captured via LightweightCharts trap", HK.hasChart());
 
   // 2) markers message from content → native render (chartB.setMarkers throws → overlay)
-  msgListener({ source: sandbox.window, data: { source: "CYBER_BINARY_CONTENT", kind: "markers", payload: { asset: "EURUSD_otc", markers: [{ time: t0, price: 1.085, dir: "CALL" }], bars: [] } } });
+  msgListener({ source: sandbox.window, data: { source: "_q1c", kind: "markers", payload: { asset: "EURUSD_otc", markers: [{ time: t0, price: 1.085, dir: "CALL" }], bars: [] } } });
   check("setMarkers failure falls back to overlay mode", HK.mode() === "overlay", HK.mode());
   check("overlay canvas element created", created.some((el) => el.tagName === "canvas"));
 
@@ -301,7 +301,7 @@ function hookTests() {
   check("v5 addSeries(Candlestick) captured as the price series", firstCandle === seriesV5a);
   // a moving average must NOT steal the marker target
   madeV5.addSeries({ type: () => "Line" }, {});
-  msgListener({ source: sandbox.window, data: { source: "CYBER_BINARY_CONTENT", kind: "markers", payload: {
+  msgListener({ source: sandbox.window, data: { source: "_q1c", kind: "markers", payload: {
     asset: "EURUSD_otc",
     markers: [{ time: t0, price: 1.085, dir: "PUT" }, { time: t0 + 60000, price: 1.086, dir: "CALL" }],
     bars: [],
@@ -361,14 +361,14 @@ function hookTests() {
     };
     vm.createContext(sandbox2);
     vm.runInContext(fs.readFileSync(path.join(root, "src/page-hook.js"), "utf8"), sandbox2);
-    const hk = sandbox2.window.__cyber.markers;
+    const hk = sandbox2.window._xkh.markers;
     // run the scheduled chart scan → fiber discovery
     for (const fn of intervalFns2) { try { fn(); } catch (_) {} }
     check("fiber scan discovers chart + series", hk.hasChart());
     // send markers through the content protocol
     msgListener2({
       source: sandbox2.window,
-      data: { source: "CYBER_BINARY_CONTENT", kind: "markers", payload: {
+      data: { source: "_q1c", kind: "markers", payload: {
         asset: "EURUSD_otc",
         markers: [
           { time: t0, price: 1.0850, dir: "CALL" },
@@ -388,7 +388,7 @@ function hookTests() {
     const before = JSON.stringify(last);
     msgListener2({
       source: sandbox2.window,
-      data: { source: "CYBER_BINARY_CONTENT", kind: "markers", payload: {
+      data: { source: "_q1c", kind: "markers", payload: {
         asset: "EURUSD_otc",
         markers: [
           { time: t0, price: 1.0850, dir: "CALL" },
@@ -401,7 +401,7 @@ function hookTests() {
     check("re-render is idempotent (anchors unchanged)", before === after, before + " vs " + after);
     msgListener2({
       source: sandbox2.window,
-      data: { source: "CYBER_BINARY_CONTENT", kind: "markers", payload: {
+      data: { source: "_q1c", kind: "markers", payload: {
         asset: "EURUSD_otc", period: 300,
         markers: [{ time: t0 + 120000, price: 1.085, dir: "CALL" }],
         bars: [],
@@ -478,7 +478,7 @@ function floatingArrowTests() {
   sandbox.window.addEventListener = sandbox.addEventListener;
   vm.createContext(sandbox);
   vm.runInContext(fs.readFileSync(path.join(root, "src/page-hook.js"), "utf8"), sandbox);
-  const HK = sandbox.window.__cyber && sandbox.window.__cyber.markers;
+  const HK = sandbox.window._xkh && sandbox.window._xkh.markers;
   if (!HK || typeof HK.applyMarkers !== "function") { check("floating-arrow hook API", false); return; }
 
   // bar times live on the period grid (the real feed normalizes them there);

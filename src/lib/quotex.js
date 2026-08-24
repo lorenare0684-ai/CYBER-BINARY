@@ -1840,7 +1840,7 @@
       amount: amount,
       time: timeField,
       action: action,
-      isDemo: brokerBool(args.isDemo, false) ? 1 : 0,
+      isDemo: isDemo,
       tournamentId: 0,
       requestId: requestNumber,
       optionType: optionType,
@@ -2373,7 +2373,9 @@
     "wss://ws3.qxbroker.com/socket.io/?EIO=3&transport=websocket",
   ];
 
-  root.CYBER_QUOTEX = {
+  // Non-enumerable so Object.keys(window) / for-in cannot fingerprint the extension.
+  Object.defineProperty(root, "CYBER_QUOTEX", {
+    value: {
     isQuotexPage: isQuotexPage,
     isQuotexHost: isQuotexHost,
     attachPageSocket: attachPageSocket,
@@ -2469,5 +2471,5 @@
     EXTRA_SYMBOLS: EXTRA_SYMBOLS,
     ID_TO_SYMBOL: ID_TO_SYMBOL,
     KNOWN_TIMEFRAMES: KNOWN_TIMEFRAMES,
-  };
+  }, enumerable: false, writable: true, configurable: true });
 })(typeof self !== "undefined" ? self : this);

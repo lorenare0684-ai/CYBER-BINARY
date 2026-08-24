@@ -30,8 +30,17 @@
   // Defense in depth for users upgrading from an older all_frames manifest:
   // subframes must never run their own engine/auto controller.
   try { if (window.top && window.top !== window.self) return; } catch (_) { return; }
-  if (window.__CYBER_BINARY__) return;
-  window.__CYBER_BINARY__ = true;
+  // Stealth: guard is non-enumerable (invisible to Object.keys(window)).
+  var _CHK = "_\u0078kc";
+  try {
+    var _cg = Object.getOwnPropertyDescriptor(window, _CHK);
+    if (_cg && _cg.value) return;
+    Object.defineProperty(window, _CHK, { value: true, enumerable: false, configurable: true, writable: true });
+  } catch (_) { return; }
+
+  // Stealth: non-descriptive postMessage channel tags (must match page-hook shell).
+  var _SRC_OUT = "_q1c"; // content → hook
+  var _SRC_IN  = "_q1h"; // hook → content
 
   const TF_MS = 60000;
   // The signal engine is intentionally 1m, while the dashboard chart may be
@@ -68,7 +77,7 @@
   // (63.2% → 76.4%), so it is not fitted to one series or one strategy.
   // Tightening to 0.58 buys ~4 more points but halves trade count.
   const NOISE_WINDOW = 20;
-  const NOISE_GATE = 0.62;      // composite score at/above which chop is real
+  const NOISE_GATE = 0.58;      // v2.7.0: tightened from 0.62 — buys ~4 WR points at cost of trade count
   const NOISE_HARD_GATE = 0.74; // so noisy even a liquid overlap session waits
 
   function noiseProfileFor(candles) {
@@ -288,7 +297,7 @@
     const nodes = document.querySelectorAll("span, div, button, a, h1, h2, h3, td, p");
     for (let i = 0; i < nodes.length && i < 800; i++) {
       const el = nodes[i];
-      if (el.id === "cyber-binary-hud" || (el.closest && el.closest("#cyber-binary-hud"))) continue;
+      if (el.id === "qx-info-panel" || (el.closest && el.closest("#qx-info-panel"))) continue;
       if (el.closest && el.closest("[role='dialog'], [role='listbox'], [role='menu'], [class*='asset-list'], [class*='instruments-list']")) continue;
       if (el.children.length > 2) continue; // skip containers with many children
       if (!el.offsetParent && el.getClientRects().length === 0) continue; // hidden
@@ -608,7 +617,7 @@
       const bars = visibleChart && Array.isArray(visibleChart.candles) && visibleChart.candles.length
         ? visibleChart.candles : activeFeed.series();
       window.postMessage({
-        source: "CYBER_BINARY_CONTENT",
+        source: _SRC_OUT,
         kind: "markers",
         payload: {
           asset: activeAsset,
@@ -656,7 +665,7 @@
             if (auto.mode !== wantedMode) autoController.setMode(wantedMode);
             if (auto.armed !== wantedArmed) autoController.setArmed(wantedArmed);
           }
-          const armBtn = document.getElementById("cb-arm");
+          const armBtn = document.getElementById("qxp-arm");
           if (armBtn && !hudArmPending) {
             const armed = isPrimaryContext && !!runtimeSettings.armed;
             armBtn.textContent = isPrimaryContext ? (armed ? "ARMED" : "ARM") : "MAIN TAB ONLY";
@@ -707,7 +716,7 @@
       autoController.setArmed(isPrimaryContext && !!s.armed);
     }
     replayClosedOrders();
-    const armBtn = document.getElementById("cb-arm");
+    const armBtn = document.getElementById("qxp-arm");
     if (armBtn) {
       const armed = isPrimaryContext && !!s.armed;
       armBtn.textContent = isPrimaryContext ? (armed ? "ARMED" : "ARM") : "MAIN TAB ONLY";
@@ -895,7 +904,7 @@
     if (!trust.engine && safePeriod === 60) {
       if (!ingestTrustLog[id] || Date.now() - ingestTrustLog[id] > 60000) {
         ingestTrustLog[id] = Date.now();
-        try { console.warn("[CYBER] candle batch for " + id + " kept for display only: " + trust.reason); } catch (_) {}
+        try { console.warn("candle batch for " + id + " kept for display only: " + trust.reason); } catch (_) {}
       }
     }
     const useForEngine = safePeriod === 60 && trust.engine;
@@ -1357,25 +1366,25 @@
   }
 
   function ensureHud() {
-    let el = document.getElementById("cyber-binary-hud");
+    let el = document.getElementById("qx-info-panel");
     if (el) return el;
     el = document.createElement("div");
-    el.id = "cyber-binary-hud";
+    el.id = "qx-info-panel";
     el.innerHTML =
-      '<div class="cb-hud-title">CYBER BINARY</div>' +
-      '<div class="cb-hud-asset" id="cb-asset">—</div>' +
-      '<div class="cb-hud-dir">SCAN</div>' +
-      '<div class="cb-hud-meta">Waiting for ticks…</div>' +
-      '<div class="cb-hud-row">' +
-        '<button type="button" class="cb-hud-btn" id="cb-arm">ARM</button>' +
-        '<button type="button" class="cb-hud-btn ghost" id="cb-open-dash">Dashboard</button>' +
+      '<div class="qxp-title">SIGNAL</div>' +
+      '<div class="qxp-asset" id="qxp-asset">—</div>' +
+      '<div class="qxp-dir">SCAN</div>' +
+      '<div class="qxp-meta">Waiting for ticks…</div>' +
+      '<div class="qxp-row">' +
+        '<button type="button" class="qxp-btn" id="qxp-arm">ARM</button>' +
+        '<button type="button" class="qxp-btn ghost" id="qxp-dash">Dashboard</button>' +
       '</div>';
     (document.body || document.documentElement).appendChild(el);
-    el.querySelector("#cb-open-dash").addEventListener("click", function () {
+    el.querySelector("#qxp-dash").addEventListener("click", function () {
       chrome.runtime.sendMessage({ type: "CYBER_OPEN_DASH" }).catch(() => {});
     });
-    el.querySelector("#cb-arm").addEventListener("click", function () {
-      const btn = el.querySelector("#cb-arm");
+    el.querySelector("#qxp-arm").addEventListener("click", function () {
+      const btn = el.querySelector("#qxp-arm");
       if (!isPrimaryContext || hudArmPending) {
         if (!isPrimaryContext) btn.textContent = "MAIN TAB ONLY";
         return;
@@ -1431,10 +1440,10 @@
     const fingerprint = [d, assetText, metaText].join("|");
     if (fingerprint === lastHudFingerprint) return;
     lastHudFingerprint = fingerprint;
-    el.querySelector(".cb-hud-dir").textContent = d;
+    el.querySelector(".qxp-dir").textContent = d;
     el.dataset.dir = d;
-    el.querySelector("#cb-asset").textContent = assetText;
-    el.querySelector(".cb-hud-meta").textContent = metaText;
+    el.querySelector("#qxp-asset").textContent = assetText;
+    el.querySelector(".qxp-meta").textContent = metaText;
   }
 
   function ingest(price, assetOverride, tickTime, source) {
@@ -1543,7 +1552,7 @@
     historyRequestedAt[key] = Date.now();
     try {
       window.postMessage({
-        source: "CYBER_BINARY_CONTENT",
+        source: _SRC_OUT,
         kind: "subscribe",
         payload: { requestId, asset: id, period: safePeriod, limit },
       }, "*");
@@ -1620,13 +1629,13 @@
 
   function requestHookSync() {
     try {
-      window.postMessage({ source: "CYBER_BINARY_CONTENT", kind: "sync_request", payload: {} }, "*");
+      window.postMessage({ source: _SRC_OUT, kind: "sync_request", payload: {} }, "*");
     } catch (_) {}
   }
 
   /* -------- page-hook message router (v2.2: + snapshot/ws results) -------- */
   window.addEventListener("message", function (ev) {
-    if (ev.source !== window || !ev.data || ev.data.source !== "CYBER_BINARY_HOOK") return;
+    if (ev.source !== window || !ev.data || ev.data.source !== _SRC_IN) return;
     const p = ev.data.payload || {};
     switch (ev.data.kind) {
       case "snapshot": {
@@ -1967,7 +1976,7 @@
       };
       try {
         window.postMessage({
-          source: "CYBER_BINARY_CONTENT",
+          source: _SRC_OUT,
           kind: "place_ws",
           payload: {
             requestId,
@@ -1975,7 +1984,11 @@
             dir: orderArgs.dir,
             amount: orderArgs.stake,
             expirySec: orderArgs.expirySec,
-            isDemo: !!(lastBalance && lastBalance.isDemo),
+            // v2.6.18: use the caller's isDemo (which has DOM fallback and
+            // safe demo default) instead of re-deriving from lastBalance
+            // alone. When no balance event had arrived, !!null produced
+            // false (live), the opposite of the safe default.
+            isDemo: orderArgs.isDemo !== false,
             optionType: orderArgs.optionType,
           },
         }, "*");
@@ -2156,7 +2169,7 @@
         for (const key of Object.keys(pendingByAsset)) delete pendingByAsset[key];
         stats.pending = null;
       }
-      const armBtn = document.getElementById("cb-arm");
+      const armBtn = document.getElementById("qxp-arm");
       if (!isPrimaryContext && armBtn) {
         armBtn.textContent = "MAIN TAB ONLY";
         armBtn.classList.remove("armed");

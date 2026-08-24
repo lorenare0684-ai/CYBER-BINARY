@@ -36,7 +36,11 @@
         atrPeriod: 10, minAtrPct: 0.00015,
         minScore: 3, lookback: 2,
         minConfidence: 90,
-        regimeFilter: ["trending"],
+        // v2.6.18: "strong-trend" was mislabeled "trending" before the regime
+        // classifier fix, so the old filter only matched the strongest trends.
+        // Include both now so the gate still passes for the trend conditions
+        // this strategy was tuned for (ADX ≥ 22, any directionality).
+        regimeFilter: ["trending", "strong-trend"],
       },
       weights: {
         emaTrend: 2, emaCross: 2, rsiPull: 1, macd: 2, stoch: 1, bb: 1,

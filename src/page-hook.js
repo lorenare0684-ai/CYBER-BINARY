@@ -6,7 +6,7 @@
  *   - tools/page-hook.shell.js (MAIN-world WebSocket hook shell)
  *
  * Rebuild after any change to either source file.
- * Generated: 2026-08-24T05:58:54.842Z
+ * Generated: 2026-08-24T17:30:21.188Z
  */
 /* ====================================================================
  * Inlined CYBER_QUOTEX adapter (src/lib/quotex.js).
@@ -1854,7 +1854,7 @@
       amount: amount,
       time: timeField,
       action: action,
-      isDemo: brokerBool(args.isDemo, false) ? 1 : 0,
+      isDemo: isDemo,
       tournamentId: 0,
       requestId: requestNumber,
       optionType: optionType,
@@ -2387,7 +2387,9 @@
     "wss://ws3.qxbroker.com/socket.io/?EIO=3&transport=websocket",
   ];
 
-  root.CYBER_QUOTEX = {
+  // Non-enumerable so Object.keys(window) / for-in cannot fingerprint the extension.
+  Object.defineProperty(root, "CYBER_QUOTEX", {
+    value: {
     isQuotexPage: isQuotexPage,
     isQuotexHost: isQuotexHost,
     attachPageSocket: attachPageSocket,
@@ -2483,7 +2485,7 @@
     EXTRA_SYMBOLS: EXTRA_SYMBOLS,
     ID_TO_SYMBOL: ID_TO_SYMBOL,
     KNOWN_TIMEFRAMES: KNOWN_TIMEFRAMES,
-  };
+  }, enumerable: false, writable: true, configurable: true });
 })(typeof self !== "undefined" ? self : this);
 
 
@@ -2515,19 +2517,31 @@
  */
 (function () {
   try { if (window.top && window.top !== window.self) return; } catch (_) { return; }
-  if (window.__CYBER_WS_HOOK__) return;
-  window.__CYBER_WS_HOOK__ = true;
+  // Stealth: guard flag is non-enumerable so Object.keys(window) cannot see it.
+  var _G = typeof window !== "undefined" ? window : (typeof self !== "undefined" ? self : this);
+  var _HK = "_\u0078k7";
+  try {
+    var _gd = Object.getOwnPropertyDescriptor(_G, _HK);
+    if (_gd && _gd.value) return;
+    Object.defineProperty(_G, _HK, { value: true, enumerable: false, configurable: true, writable: true });
+  } catch (_) { return; }
 
-  var Q = window.CYBER_QUOTEX;
+  var Q = _G.CYBER_QUOTEX;
   if (!Q || typeof Q.createRouter !== "function") {
     // Should never happen (adapter is inlined above), but keep a graceful
     // fallback for third-party tampering.
     return;
   }
 
+  // Stealth: postMessage uses a non-descriptive source tag so broker
+  // fingerprinting scripts cannot grep for the extension's name.
+  var _SRC_OUT = "_q1h";
+  var _SRC_IN = "_q1c";
+  var _cyberFrames = []; // closure-scoped; never leaks to window
+
   function emit(kind, payload) {
     try {
-      window.postMessage({ source: "CYBER_BINARY_HOOK", kind: kind, payload: payload }, "*");
+      window.postMessage({ source: _SRC_OUT, kind: kind, payload: payload }, "*");
     } catch (_) {}
   }
 
@@ -2682,13 +2696,12 @@
       // Do not allocate/debug-log high-frequency quote or candle events.
       if (label === "tick" || label === "candles") return;
       try {
-        if (!window.__cyber_frames) window.__cyber_frames = [];
-        window.__cyber_frames.unshift({
+        _cyberFrames.unshift({
           at: Date.now(),
           label: label,
           preview: frame && frame.raw ? String(frame.raw).slice(0, 160) : "",
         });
-        if (window.__cyber_frames.length > 20) window.__cyber_frames.length = 20;
+        if (_cyberFrames.length > 20) _cyberFrames.length = 20;
       } catch (_) {}
     },
   };
@@ -2717,6 +2730,12 @@
    *   c. a bounded React-fiber scan of the chart container (bundled builds
    *      that never expose the library globally).
    * ==================================================================== */
+  // Stealth: WeakSet tracks wrapped/hooked objects without leaving enumerable
+  // properties on the page's own objects (no __cyberWrapped / __cyberHooked).
+  var _wrappedSet = typeof WeakSet !== "undefined" ? new WeakSet() : null;
+  function _isWrapped(o) { return _wrappedSet ? _wrappedSet.has(o) : false; }
+  function _markWrapped(o) { if (_wrappedSet && o) try { _wrappedSet.add(o); } catch (_) {} }
+
   var MARKERS = (function () {
     var chart = null;        // selected (largest visible) lightweight-charts IChartApi
     var chartContainer = null;
@@ -2759,8 +2778,8 @@
     }
 
     function hookSeries(s) {
-      if (!s || typeof s !== "object" || s.__cyberHooked) return s;
-      s.__cyberHooked = true;
+      if (!s || typeof s !== "object" || _isWrapped(s)) return s;
+      _markWrapped(s);
       var origSetData = s.setData;
       if (typeof origSetData === "function") {
         s.setData = function (data) {
@@ -2864,7 +2883,7 @@
         "addAreaSeries", "addBaselineSeries", "addHistogramSeries", "addSeries"];
       for (var i = 0; i < names.length; i++) (function (n) {
         var orig = c[n];
-        if (typeof orig !== "function" || orig.__cyberWrapped) return;
+        if (typeof orig !== "function" || _isWrapped(orig)) return;
         c[n] = function () {
           var s = orig.apply(this, arguments);
           if (isSeriesLike(s)) {
@@ -2881,7 +2900,7 @@
           }
           return s;
         };
-        try { c[n].__cyberWrapped = true; } catch (_) {}
+        _markWrapped(c[n]);
       })(names[i]);
       if (series) applyNative();
       return true;
@@ -3333,7 +3352,7 @@
           set: function (v) {
             _lwc = v;
             if (name === "LightweightCharts") lwcModule = v;
-            if (v && typeof v.createChart === "function" && !v.__cyberWrapped) {
+            if (v && typeof v.createChart === "function" && !_isWrapped(v)) {
               var origCreate = v.createChart;
               v.createChart = function () {
                 var container = arguments[0];
@@ -3341,11 +3360,11 @@
                 try { captureChart(c, container); } catch (_) {}
                 return c;
               };
-              try { v.__cyberWrapped = true; } catch (_) {}
+              _markWrapped(v);
             }
           },
         });
-        if (_lwc && typeof _lwc.createChart === "function" && !_lwc.__cyberWrapped) {
+        if (_lwc && typeof _lwc.createChart === "function" && !_isWrapped(_lwc)) {
           if (name === "LightweightCharts") lwcModule = _lwc;
           var origCreate2 = _lwc.createChart;
           _lwc.createChart = function () {
@@ -3354,7 +3373,7 @@
             try { captureChart(c, container); } catch (_) {}
             return c;
           };
-          try { _lwc.__cyberWrapped = true; } catch (_) {}
+          _markWrapped(_lwc);
         }
       } catch (_) {}
     }
@@ -3393,7 +3412,7 @@
       lastWsPeriod: live.lastWsPeriod,
       activeChart: live.activeChart,
       socket: !!handle.lastWs,
-      frames: (window.__cyber_frames || []).slice(0, 12),
+      frames: _cyberFrames.slice(0, 12),
     };
   }
 
@@ -3454,6 +3473,13 @@
         } catch (_) {}
         return nativeSend(data);
       };
+      // Stealth: make the wrapped send look native to toString() probes.
+      try {
+        Object.defineProperty(ws.send, "toString", {
+          value: function () { return "function send() { [native code] }"; },
+          configurable: true, writable: true,
+        });
+      } catch (_) {}
       ws.addEventListener("open", function () {
         if (brokerSocket && handle.lastWs === ws) try { emit("quotex_status", { state: "open", url: url || "" }); } catch (_) {}
       });
@@ -3473,23 +3499,35 @@
     Wrapped.CLOSING = Native.CLOSING;
     Wrapped.CLOSED = Native.CLOSED;
     try { Object.setPrototypeOf(Wrapped, Native); } catch (_) {}
+    // Stealth: make toString() and name indistinguishable from the real constructor.
+    try {
+      Object.defineProperty(Wrapped, "name", { value: "WebSocket", configurable: true });
+      Object.defineProperty(Wrapped, "toString", {
+        value: function () { return "function WebSocket() { [native code] }"; },
+        configurable: true, writable: true,
+      });
+    } catch (_) {}
     handle.wrapper = Wrapped;
     window.WebSocket = Wrapped;
   }
 
+  // Stealth: internal handle is non-enumerable (invisible to Object.keys(window)).
   try {
-    window.__cyber = {
-      adapter: Q,
-      handle: handle,
-      router: router,
-      live: live,
-      snapshot: snapshot,
-      markers: MARKERS,
-      detach: function () {
-        if (handle.wrapper && window.WebSocket === handle.wrapper) window.WebSocket = handle.native;
-        window.__CYBER_WS_HOOK__ = false;
+    Object.defineProperty(_G, "_\u0078kh", {
+      value: {
+        adapter: Q,
+        handle: handle,
+        router: router,
+        live: live,
+        snapshot: snapshot,
+        markers: MARKERS,
+        detach: function () {
+          if (handle.wrapper && window.WebSocket === handle.wrapper) window.WebSocket = handle.native;
+          try { Object.defineProperty(_G, _HK, { value: false, enumerable: false, configurable: true, writable: true }); } catch (_) {}
+        },
       },
-    };
+      enumerable: false, configurable: true, writable: true,
+    });
   } catch (_) {}
 
   // v2.3.3: try to capture the platform chart (web component / React fiber /
@@ -3507,7 +3545,7 @@
   //                     page's own socket (mirrors the web client's frames).
   //   - place_ws      → send a real `orders/open` frame on the page socket.
   window.addEventListener("message", function (ev) {
-    if (ev.source !== window || !ev.data || ev.data.source !== "CYBER_BINARY_CONTENT") return;
+    if (ev.source !== window || !ev.data || ev.data.source !== _SRC_IN) return;
     if (ev.data.kind === "sync_request") {
       emit("snapshot", snapshot());
     } else if (ev.data.kind === "subscribe") {

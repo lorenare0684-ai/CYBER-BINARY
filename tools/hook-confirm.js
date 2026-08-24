@@ -100,7 +100,7 @@ const vmWindow = vm.runInContext("window", sandbox);
 check("hook bundle installed its WebSocket wrapper",
   sandbox.window.WebSocket !== FakeWS && typeof sandbox.window.WebSocket === "function");
 check("hook exposes the adapter + message bridge",
-  !!sandbox.window.__cyber && typeof contentListener === "function");
+  !!sandbox.window._xkh && typeof contentListener === "function");
 
 /* ---------- the page opens its broker socket ---------- */
 const ws = new sandbox.window.WebSocket("wss://ws2.qxbroker.com/socket.io/?EIO=3&transport=websocket");
@@ -110,16 +110,16 @@ ws.receive('42["s_authorization",{"isDemo":1}]');
 // hook learns the selected asset/period from that outgoing frame.
 ws.send('42["instruments/update",{"asset":"EURUSD_otc","period":60}]');
 check("the page's own outgoing frames reveal the main chart",
-  !!sandbox.window.__cyber.live.activeChart &&
-  sandbox.window.__cyber.live.activeChart.symbol === "EURUSD_otc" &&
-  sandbox.window.__cyber.live.activeChart.period === 60,
-  JSON.stringify(sandbox.window.__cyber.live.activeChart));
+  !!sandbox.window._xkh.live.activeChart &&
+  sandbox.window._xkh.live.activeChart.symbol === "EURUSD_otc" &&
+  sandbox.window._xkh.live.activeChart.period === 60,
+  JSON.stringify(sandbox.window._xkh.live.activeChart));
 
 function hookMessages(kind) {
-  return posted.filter((m) => m && m.source === "CYBER_BINARY_HOOK" && m.kind === kind);
+  return posted.filter((m) => m && m.source === "_q1h" && m.kind === kind);
 }
 function contentSend(payload) {
-  contentListener({ source: vmWindow, data: Object.assign({ source: "CYBER_BINARY_CONTENT" }, payload) });
+  contentListener({ source: vmWindow, data: Object.assign({ source: "_q1c" }, payload) });
 }
 
 /* ---------- 1. placement: content.js asks the page to place an order ---------- */

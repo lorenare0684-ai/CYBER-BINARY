@@ -54,7 +54,7 @@ function makeEl(text, cls) {
 const domNodes = [
   makeEl("EUR/USD OTC", "sc-hashed123"),
   makeEl("1.0854", "sc-hashed456"),
-  makeEl("CYBER BINARY", "cyber-binary-hud"),
+  makeEl("CYBER BINARY", "qx-info-panel"),
 ];
 const documentStub = {
   readyState: "complete",
@@ -62,8 +62,8 @@ const documentStub = {
   location: { href: "https://qxbroker.com/en/trade?type=demo" },
   querySelector: () => null,
   querySelectorAll: (sel) => {
-    if (sel.includes("#cyber-binary-hud")) return [];
-    return domNodes.filter((n) => !/cyber-binary-hud/.test(n.className));
+    if (sel.includes("#qx-info-panel")) return [];
+    return domNodes.filter((n) => !/qx-info-panel/.test(n.className));
   },
   getElementById: () => null,
   createElement: () => makeEl(""),
@@ -109,7 +109,7 @@ function check(name, cond, extra) {
 }
 
 function hookMsg(kind, payload) {
-  const ev = { source: sandbox.window, data: { source: "CYBER_BINARY_HOOK", kind: kind, payload: payload } };
+  const ev = { source: sandbox.window, data: { source: "_q1h", kind: kind, payload: payload } };
   const fns = sandbox.__contentMsgListeners || [];
   for (const fn of fns) fn(ev);
 }

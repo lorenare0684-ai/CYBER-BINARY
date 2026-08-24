@@ -360,7 +360,7 @@
     const assets = uniqueById(Array.isArray(opts.assets) ? opts.assets : ASSETS.list(),
       resolveAsset, 256)
       .filter((a) => matchesKinds(a, opts.kinds));
-    const strategies = uniqueById(Array.isArray(opts.strategies) ? opts.strategies : STRAT.list(),
+    const strategies = uniqueById(Array.isArray(opts.strategies) ? opts.strategies : STRATEGIES.list(),
       resolveStrategy, 128);
     if (!assets.length || !strategies.length) {
       return Promise.resolve({ results: [], count: 0 });

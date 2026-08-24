@@ -204,7 +204,7 @@ function contentTests() {
     readyState: "complete", title: "Quotex - Trade EUR/USD OTC",
     location: { href: "https://qxbroker.com/en/trade?type=demo" },
     querySelector: () => null,
-    querySelectorAll: (sel) => (String(sel).indexOf("#cyber-binary-hud") !== -1 ? [] : [makeEl("EUR/USD OTC", "sc-h")]),
+    querySelectorAll: (sel) => (String(sel).indexOf("#qx-info-panel") !== -1 ? [] : [makeEl("EUR/USD OTC", "sc-h")]),
     getElementById: () => null, createElement: () => makeEl(""), addEventListener: () => {},
     body: makeEl(""), documentElement: makeEl(""),
   };
@@ -273,7 +273,7 @@ function contentTests() {
   vm.runInContext(fs.readFileSync(path.join(root, "src/content.js"), "utf8"), sandbox);
 
   function hookMsg(kind, payload) {
-    const ev = { source: sandbox.window, data: { source: "CYBER_BINARY_HOOK", kind, payload } };
+    const ev = { source: sandbox.window, data: { source: "_q1h", kind, payload } };
     for (const fn of sandbox.__contentMsgListeners || []) fn(ev);
   }
   function runDue() {
