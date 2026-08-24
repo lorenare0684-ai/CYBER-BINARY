@@ -490,6 +490,40 @@
     catch (_) {}
   }
 
+  /** Per-strategy win rate (percent) from settled outcomes — historical
+   * (restored from storage) and live (this session) combined, because
+   * applyStoredStats() merges stored rows into stats.byStrategy and every
+   * settled trade bumps the same map.
+   *
+   * The adaptive router's fitness function has always had a `strategyWinrates`
+   * term, but nothing ever supplied it, so that term was permanently zero and
+   * the router picked purely on the current bar's regime + confidence —
+   * realtime data only. This is the missing input.
+   *
+   * Small samples are shrunk toward 50% (a Beta(5,5) prior) so one lucky trade
+   * cannot make a strategy look unbeatable, and strategies with fewer than
+   * `minSettled` decided trades are omitted rather than guessed at. Draws are
+   * excluded: a refunded trade is not an outcome. */
+  function strategyWinrates(minSettled) {
+    const out = Object.create(null);
+    const src = stats.byStrategy;
+    if (!src || typeof src !== "object") return out;
+    const rawFloor = Number(minSettled);
+    const floor = Number.isFinite(rawFloor) && rawFloor > 0 ? Math.floor(rawFloor) : 10;
+    const PRIOR = 10; // pseudo-observations at 50%
+    for (const id of Object.keys(src)) {
+      const row = src[id];
+      if (!row || typeof row !== "object") continue;
+      const w = Math.max(0, Math.floor(Number(row.w) || 0));
+      const l = Math.max(0, Math.floor(Number(row.l) || 0));
+      const settled = w + l;
+      if (settled < floor) continue;
+      const wr = ((w + PRIOR * 0.5) / (settled + PRIOR)) * 100;
+      if (Number.isFinite(wr)) out[String(id).slice(0, 64)] = Math.round(wr * 10) / 10;
+    }
+    return out;
+  }
+
   /** Push the active asset's markers plus bars from the SAME timeframe shown
    *  by Quotex. Sending 1m bars while the platform displayed 5m/15m made the
    *  overlay project arrows into the wrong horizontal slots. */
@@ -1008,6 +1042,10 @@
         params: strat.params,
         weights: strat.weights,
         lean: false,
+        // The adaptive router's fitness function reads this, but nothing ever
+        // supplied it — so historical/live accuracy never influenced which
+        // strategy got picked. Only the router consumes it.
+        strategyWinrates: currentStrategy === "auto_adaptive" ? strategyWinrates() : null,
       });
       sig.asset = asset ? asset.id : activeAsset;
       sig.assetName = asset ? asset.name : activeAsset;
@@ -1104,7 +1142,13 @@
           score: sig.score,
           confidence: sig.confidence,
           regime: sig.regime,
-          strategy: currentStrategy,
+          // Under auto_adaptive, currentStrategy is the literal "auto_adaptive",
+          // so every adaptive outcome was bucketed under that one key and the
+          // strategy the router actually chose never accumulated a record.
+          // Attribute the outcome to the selected strategy so its win rate can
+          // feed the next routing decision.
+          strategy: (sig.selectedStrategy && STRAT.get(sig.selectedStrategy))
+            ? sig.selectedStrategy : currentStrategy,
           payout,
         };
       }

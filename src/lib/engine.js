@@ -278,9 +278,14 @@
       const rawScore = res.score || 0;
 
       let winrateBonus = 0;
-      if (opts && opts.strategyWinrates && opts.strategyWinrates[stratId]) {
+      if (opts && opts.strategyWinrates && opts.strategyWinrates[stratId] != null) {
         const wr = Number(opts.strategyWinrates[stratId]);
-        if (Number.isFinite(wr) && wr > 50) winrateBonus = (wr - 50) * 0.5;
+        // Symmetric and bounded. It used to reward only wr > 50, so a strategy
+        // that had been losing steadily scored exactly the same as one with no
+        // record at all — accuracy could lift a strategy but never demote one.
+        // Bounded to +/-25 so a track record informs the choice without
+        // overriding what the current bar's confluence actually says.
+        if (Number.isFinite(wr)) winrateBonus = Math.max(-25, Math.min(25, (wr - 50) * 0.5));
       }
 
       const rawFitness = Math.round(
@@ -376,9 +381,14 @@
       const rawScore = res.score || 0;
 
       let winrateBonus = 0;
-      if (opts && opts.strategyWinrates && opts.strategyWinrates[stratId]) {
+      if (opts && opts.strategyWinrates && opts.strategyWinrates[stratId] != null) {
         const wr = Number(opts.strategyWinrates[stratId]);
-        if (Number.isFinite(wr) && wr > 50) winrateBonus = (wr - 50) * 0.5;
+        // Symmetric and bounded. It used to reward only wr > 50, so a strategy
+        // that had been losing steadily scored exactly the same as one with no
+        // record at all — accuracy could lift a strategy but never demote one.
+        // Bounded to +/-25 so a track record informs the choice without
+        // overriding what the current bar's confluence actually says.
+        if (Number.isFinite(wr)) winrateBonus = Math.max(-25, Math.min(25, (wr - 50) * 0.5));
       }
 
       const rawFitness = Math.round(

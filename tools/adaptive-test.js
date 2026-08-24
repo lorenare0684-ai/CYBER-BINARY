@@ -87,6 +87,68 @@ function testStrategiesList() {
   }
 }
 
+function testAdaptiveUsesRecordedAccuracy() {
+  const asset = ASSETS.get("EURUSD_otc") || ASSETS.get("EURUSD");
+  const candles = FEED.syntheticSeries(asset, 200, { seed: 42, drift: 0.001 });
+
+  const base = ENG.analyze(candles, { strategy: "auto_adaptive", lean: false });
+  check("baseline adaptive run has a fitness table",
+    !!base && !!base.strategyScores && Object.keys(base.strategyScores).length > 0);
+
+  // --- a strong record must LIFT that strategy's fitness ---
+  const boosted = {};
+  for (const id of Object.keys(base.strategyScores)) boosted[id] = 50; // neutral
+  const target = Object.keys(base.strategyScores).find((id) => id !== base.selectedStrategy);
+  boosted[target] = 95;
+  const up = ENG.analyze(candles, { strategy: "auto_adaptive", lean: false, strategyWinrates: boosted });
+  const gain = up.strategyScores[target].fitness - base.strategyScores[target].fitness;
+  check("a high recorded win rate raises that strategy's fitness", gain > 0,
+    "target=" + target + " gain=" + gain);
+
+  // --- a poor record must DEMOTE it, not merely fail to reward it ---
+  const penalised = {};
+  for (const id of Object.keys(base.strategyScores)) penalised[id] = 50;
+  penalised[target] = 10;
+  const down = ENG.analyze(candles, { strategy: "auto_adaptive", lean: false, strategyWinrates: penalised });
+  const loss = base.strategyScores[target].fitness - down.strategyScores[target].fitness;
+  check("a poor recorded win rate lowers that strategy's fitness", loss > 0,
+    "target=" + target + " loss=" + loss);
+
+  // --- accuracy must reorder candidates of comparable confluence ---
+  // Candidates that abstain on this bar contribute no score/confidence, so the
+  // only thing separating them is regime + accuracy. Note the +/-25 bound means
+  // accuracy informs the choice without overriding a large confluence lead
+  // (asserted separately below).
+  const abstaining = Object.keys(base.strategyScores)
+    .filter((id) => base.strategyScores[id].direction === "WAIT");
+  check("several candidates abstain on this bar (comparable confluence)",
+    abstaining.length >= 2, "count=" + abstaining.length);
+  const [a, b] = abstaining;
+  const ranked = {};
+  for (const id of Object.keys(base.strategyScores)) ranked[id] = 50;
+  ranked[a] = 99;
+  ranked[b] = 5;
+  const rankedRes = ENG.analyze(candles, { strategy: "auto_adaptive", lean: false, strategyWinrates: ranked });
+  check("better recorded accuracy outranks worse among comparable candidates",
+    rankedRes.strategyScores[a].fitness > rankedRes.strategyScores[b].fitness,
+    a + "=" + rankedRes.strategyScores[a].fitness + " vs " + b + "=" + rankedRes.strategyScores[b].fitness);
+
+  // --- bounded: the +/-25 clamp keeps accuracy from overriding the bar ---
+  const extreme = {};
+  for (const id of Object.keys(base.strategyScores)) extreme[id] = 50;
+  extreme[target] = 100;
+  const capped = ENG.analyze(candles, { strategy: "auto_adaptive", lean: false, strategyWinrates: extreme });
+  const cappedGain = capped.strategyScores[target].fitness - base.strategyScores[target].fitness;
+  check("accuracy bonus is bounded (cannot swamp confluence)", cappedGain <= 26,
+    "gain=" + cappedGain);
+
+  // --- omitting the map must leave fitness exactly as before ---
+  const omitted = ENG.analyze(candles, { strategy: "auto_adaptive", lean: false, strategyWinrates: null });
+  const same = Object.keys(base.strategyScores).every(
+    (id) => omitted.strategyScores[id].fitness === base.strategyScores[id].fitness);
+  check("no win-rate data leaves fitness unchanged", same);
+}
+
 function testAutoAdaptiveEngine() {
   const asset = ASSETS.get("EURUSD_otc") || ASSETS.get("EURUSD");
   const trendingCandles = FEED.syntheticSeries(asset, 200, { seed: 42, drift: 0.001 });
@@ -185,6 +247,7 @@ async function main() {
   console.log("=== Testing Auto-Adaptive Strategy & High-Accuracy Assets System ===");
   testStrategiesList();
   testAutoAdaptiveEngine();
+  testAdaptiveUsesRecordedAccuracy();
   testAssetSelector();
   await testAutoHighAccuracyGate();
 

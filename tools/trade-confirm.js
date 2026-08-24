@@ -211,6 +211,14 @@ function contentTests() {
 
   // chrome.storage with the patch protocol storage.js uses.
   const storageMap = {};
+  // Seed recorded per-strategy outcomes so the adaptive router has a real
+  // track record to route on (sniper strong, scalp weak).
+  storageMap.cyberBinaryV2 = {
+    stats: {
+      wins: 35, losses: 35,
+      byStrategy: { sniper: { w: 30, l: 5 }, scalp: { w: 5, l: 30 } },
+    },
+  };
   function applyStoragePatch(patch) {
     const key = "cyberBinaryV2";
     const state = storageMap[key] && typeof storageMap[key] === "object" ? JSON.parse(JSON.stringify(storageMap[key])) : {};
@@ -314,7 +322,7 @@ function contentTests() {
     applyStoragePatch([{ path: ["settings"], value: {
       autoMode: "click", armed: true, stake: 5, expiry: 1, cooldownBars: 0, minConfidence: 0,
       minIntervalMs: 0, maxTradesPerHour: 100, maxTradesPerDay: 1000, accountMode: "any",
-      stakeMode: "fixed", minBalance: 0, strategy: "confluence", calibration: false,
+      stakeMode: "fixed", minBalance: 0, strategy: "auto_adaptive", calibration: false,
     } }]);
     await settle();
     onMsg({ type: "CYBER_SET_AUTO", mode: "click", armed: true }, {}, () => {});
@@ -325,10 +333,14 @@ function contentTests() {
     const ENG = sandbox.self.CYBER_ENGINE;
     const realGate = ENG.liveSignalGate;
     ENG.liveSignalGate = () => ({ allowed: true, reason: "test" });
-    ENG.analyze = () => ({
-      ready: true, direction: "CALL", confidence: 88, score: 9, regime: "trending",
-      reason: "test", votes: [], metrics: {},
-    });
+    const analyzeOpts = [];
+    ENG.analyze = (candles, o) => {
+      analyzeOpts.push(o);
+      return {
+        ready: true, direction: "CALL", confidence: 88, score: 9, regime: "trending",
+        reason: "test", votes: [], metrics: {},
+      };
+    };
 
     // --- A. account order-open push without a requestId confirms the WS trade
     fakeNow = minute + 60000;              // a new bar closes
@@ -472,6 +484,29 @@ function contentTests() {
       chart5b.chartCandles[chart5b.chartCandles.length - 1].time === broker5m[broker5m.length - 1].time,
       "chart=" + chart5b.chartCandles[chart5b.chartCandles.length - 1].time +
       " broker=" + broker5m[broker5m.length - 1].time);
+
+    // --- L. the adaptive router must route on recorded accuracy ---
+    // Tick across two minute boundaries so a genuinely new bar closes and the
+    // engine is re-run (maybeSignal caches on the closed bar's key).
+    const baseMin = Math.floor(fakeNow / 60000) * 60000;
+    for (let k = 1; k <= 2; k++) {
+      fakeNow = baseMin + k * 60000;
+      hookMsg("tick", { symbol: "EURUSD_otc", price: 1.086 + k * 0.0001, time: fakeNow, main: true });
+      forceTick();
+      await settle();
+    }
+    const adaptiveOpts = analyzeOpts.filter((o) => o && o.strategy === "auto_adaptive").pop();
+    check("auto_adaptive analysis receives recorded per-strategy win rates",
+      !!adaptiveOpts && !!adaptiveOpts.strategyWinrates &&
+      typeof adaptiveOpts.strategyWinrates === "object",
+      adaptiveOpts ? JSON.stringify(adaptiveOpts.strategyWinrates) : "(no auto_adaptive analysis)");
+    const wr = (adaptiveOpts && adaptiveOpts.strategyWinrates) || {};
+    check("a strong recorded strategy outranks a weak one",
+      Number(wr.sniper) > 50 && Number(wr.scalp) < 50 && Number(wr.sniper) > Number(wr.scalp),
+      JSON.stringify(wr));
+    check("small samples are shrunk toward 50%, not reported raw",
+      Number(wr.sniper) > 50 && Number(wr.sniper) < 100,
+      "sniper=" + wr.sniper + " (raw would be 85.7)");
 
     if (failed) { console.error("FAILED " + failed); process.exitCode = 1; return; }
     console.log("OK — broker confirmation + chart-alignment regressions passed");
