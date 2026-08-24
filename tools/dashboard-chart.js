@@ -92,6 +92,7 @@ const timeouts = [];
 const chromeStub = {
   runtime: {
     id: "test-dash", getURL: (p) => "chrome-extension://test/" + p,
+    getManifest: () => ({ version: "9.9.9-test" }),
     sendMessage: (m, cb) => { if (cb) cb({ ok: true }); return Promise.resolve({ ok: true }); },
     onMessage: { addListener: (fn) => { (listeners.runtime = listeners.runtime || []).push(fn); } },
     lastError: null,
@@ -198,6 +199,76 @@ const lastClose = candles[candles.length - 1].close;
 const priceTag = texts.find((t) => t === lastClose.toFixed(5));
 check("newest broker close is drawn on the price axis", !!priceTag,
   "expected " + lastClose.toFixed(5) + " in " + JSON.stringify(texts.slice(-6)));
+
+/* ---------- build stamp: a stale load must be visible ---------- */
+check("header shows the loaded extension build from the manifest",
+  byIdGet("app-kicker").textContent.indexOf("v9.9.9-test") !== -1,
+  JSON.stringify(byIdGet("app-kicker").textContent));
+
+/* ---------- startup guard: a missing lib must be named, not guessed ---------- */
+// Reload dashboard.js in a fresh sandbox with strategy.js deliberately absent.
+// Before the guard this died later as a cryptic "STRAT is not defined" from
+// inside an event handler, with nothing pointing at the script that never ran.
+const guardSandbox = {
+  self: {}, console: { log: () => {}, error: () => {}, warn: () => {} },
+  Date, Math, JSON, navigator: { userAgent: "node" },
+  location: { href: "chrome-extension://test/src/dashboard.html", hostname: "", pathname: "/src/dashboard.html" },
+  document: documentStub, chrome: chromeStub,
+  setTimeout: () => 0, clearTimeout: () => {}, setInterval: () => 0, clearInterval: () => {},
+  requestAnimationFrame: undefined, devicePixelRatio: 1, innerWidth: 1280, innerHeight: 900,
+  localStorage: { getItem: () => null, setItem: () => {} },
+};
+guardSandbox.globalThis = guardSandbox.self;
+guardSandbox.window = guardSandbox.self;
+guardSandbox.window.addEventListener = () => {};
+guardSandbox.window.removeEventListener = () => {};
+guardSandbox.window.getComputedStyle = () => ({ backgroundColor: "rgb(0,0,0)", color: "rgb(255,255,255)" });
+vm.createContext(guardSandbox);
+for (const f of ["indicators.js", "assets.js", "feed.js", "engine.js", "storage.js",
+                 "auto.js", "backtest.js", "workers.js", "asset-selector.js", "quotex.js"]) {
+  vm.runInContext(fs.readFileSync(path.join(root, "src/lib", f), "utf8"), guardSandbox);
+}
+let guardError = "";
+try {
+  vm.runInContext(fs.readFileSync(path.join(root, "src/dashboard.js"), "utf8"), guardSandbox);
+} catch (e) {
+  guardError = String(e && e.message || e);
+}
+check("a missing lib aborts startup naming the missing global",
+  /CYBER_STRATEGIES/.test(guardError), guardError || "(no error thrown)");
+check("the startup error tells the user how to fix it",
+  /reload the unpacked extension/i.test(guardError), guardError || "(no error thrown)");
+
+/* ---------- an OPTIONAL lib must not abort startup ---------- */
+// workers.js is guarded at its use site (`WORKERS && WORKERS.runBrowser`) with a
+// synchronous fallback, so treating it as required would break a working path.
+const optSandbox = {
+  self: {}, console: { log: () => {}, error: () => {}, warn: () => {} },
+  Date, Math, JSON, navigator: { userAgent: "node" },
+  location: { href: "chrome-extension://test/src/dashboard.html", hostname: "", pathname: "/src/dashboard.html" },
+  document: documentStub, chrome: chromeStub,
+  setTimeout: () => 0, clearTimeout: () => {}, setInterval: () => 0, clearInterval: () => {},
+  requestAnimationFrame: undefined, devicePixelRatio: 1, innerWidth: 1280, innerHeight: 900,
+  localStorage: { getItem: () => null, setItem: () => {} },
+};
+optSandbox.globalThis = optSandbox.self;
+optSandbox.window = optSandbox.self;
+optSandbox.window.addEventListener = () => {};
+optSandbox.window.removeEventListener = () => {};
+optSandbox.window.getComputedStyle = () => ({ backgroundColor: "rgb(0,0,0)", color: "rgb(255,255,255)" });
+vm.createContext(optSandbox);
+for (const f of ["indicators.js", "assets.js", "strategy.js", "feed.js", "engine.js",
+                 "storage.js", "auto.js", "backtest.js", "asset-selector.js", "quotex.js"]) {
+  vm.runInContext(fs.readFileSync(path.join(root, "src/lib", f), "utf8"), optSandbox);
+}
+let optError = "";
+try {
+  vm.runInContext(fs.readFileSync(path.join(root, "src/dashboard.js"), "utf8"), optSandbox);
+} catch (e) {
+  optError = String(e && e.message || e);
+}
+check("a missing OPTIONAL lib (workers.js) does not abort startup",
+  optError === "", optError || "(no error thrown)");
 
 if (failed) { console.error("FAILED " + failed); process.exitCode = 1; }
 else console.log("OK — dashboard chart alignment checks passed");

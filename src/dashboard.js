@@ -13,6 +13,46 @@
   const QUOTEX = self.CYBER_QUOTEX || null;
   const AS = self.CYBER_ASSET_SELECTOR || null;
 
+  /**
+   * A library that failed to load used to surface as a cryptic
+   * "STRAT is not defined" / "Cannot read properties of undefined" thrown from
+   * deep inside an event handler, with nothing pointing at the <script> that
+   * never ran. Check up front and name the culprit instead.
+   */
+  function fatalStartup(message) {
+    try {
+      const box = document.createElement("div");
+      box.id = "startup-error";
+      box.setAttribute("style",
+        "position:fixed;left:0;right:0;top:0;z-index:9999;padding:14px 18px;" +
+        "background:#3b0d12;border-bottom:1px solid #ff5c6c;color:#ffd9dd;" +
+        "font:13px/1.5 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap");
+      box.textContent = message;
+      (document.body || document.documentElement).appendChild(box);
+    } catch (_) {
+      /* DOM not ready — the console error below still lands. */
+    }
+    throw new Error("CYBER BINARY dashboard could not start: " + message);
+  }
+
+  // WORKERS is intentionally absent: line ~1398 guards it
+  // (`WORKERS && WORKERS.runBrowser`) and falls back to running the matrix
+  // synchronously, so a missing workers.js must not abort the dashboard.
+  // QUOTEX / AS are already `|| null` and optional by design.
+  const missingLibs = [
+    ["CYBER_FEED", FEED], ["CYBER_ENGINE", ENG], ["CYBER_ASSETS", ASSETS],
+    ["CYBER_STRATEGIES", STRAT], ["CYBER_STORE", STORE], ["CYBER_HIST", HIST],
+    ["CYBER_AUTO", AUTO],
+  ].filter(([, lib]) => !lib).map(([name]) => name);
+
+  if (missingLibs.length) {
+    fatalStartup(
+      "missing " + missingLibs.join(", ") + ".\n" +
+      "dashboard.html loads these from src/lib/ — reload the unpacked extension " +
+      "at chrome://extensions so every file is present, then reopen the dashboard."
+    );
+  }
+
   // Active local feed (for the dashboard's own chart when live data is missing).
   const localFeed = FEED.createFeed({ tfMs: 60000, max: 400 });
   localFeed.setSeries(FEED.syntheticSeries(ASSETS.get("EURUSD"), 240));
@@ -1828,6 +1868,25 @@
     else setTimeout(run, 16);
   }, { passive: true });
 
+  // Show the build that actually loaded. A stale unpacked-extension directory
+  // (files copied by hand, or an older folder left loaded in Chrome) otherwise
+  // looks identical to a current one, and any error it throws gets blamed on
+  // the code in the repo instead of the copy on disk.
+  function paintBuildStamp() {
+    const kicker = $("app-kicker");
+    if (!kicker) return;
+    let version = "";
+    try {
+      if (hasChrome && chrome.runtime && typeof chrome.runtime.getManifest === "function") {
+        const m = chrome.runtime.getManifest();
+        version = m && m.version ? String(m.version).slice(0, 32) : "";
+      }
+    } catch (_) { /* not in an extension context */ }
+    const label = "Auto-Adaptive Engine & High-Accuracy Assets" + (version ? " · v" + version : "");
+    kicker.textContent = label;
+    if (version) kicker.title = "Loaded extension build v" + version;
+  }
+
   refreshSelectors();
   bindSelectors();
   bindAutoTab();
@@ -1838,6 +1897,7 @@
   bindSettingsTab();
   loadAutoSettings();
   scale();
+  paintBuildStamp();
   paintQuotexPill();
   if (activeTab === "instruments") refreshInstrumentsTab();
 
