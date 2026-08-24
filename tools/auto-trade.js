@@ -225,6 +225,7 @@ async function main() {
   });
   controller.setMode("click");
   controller.setArmed(true);
+  controller.setAccountInfo({ isDemo: true, balance: 1000, currency: "USD" });
 
   const recentBar = () => Math.floor(fakeNow / 60000) * 60000 - 60000;
   // 20 identical signals for the SAME bar (content.js calls per tick)
@@ -282,6 +283,7 @@ async function main() {
   });
   confirmedController.setMode("click");
   confirmedController.setArmed(true);
+  confirmedController.setAccountInfo({ isDemo: true, balance: 1000, currency: "USD" });
   advance(60000);
   // Wait for persisted safety-ledger hydration before taking the baseline.
   for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
@@ -304,6 +306,7 @@ async function main() {
   });
   concurrentController.setMode("click");
   concurrentController.setArmed(true);
+  concurrentController.setAccountInfo({ isDemo: true, balance: 1000, currency: "USD" });
   advance(60000);
   const concurrentBar = recentBar();
   const firstPending = concurrentController.handleSignal(makeSignal("CALL", concurrentBar, 80, "NZDUSD"));
@@ -341,6 +344,7 @@ async function main() {
     });
     persistenceController.setMode("click");
     persistenceController.setArmed(true);
+    persistenceController.setAccountInfo({ isDemo: true, balance: 1000, currency: "USD" });
     advance(60000);
     await persistenceController.handleSignal(makeSignal("CALL", recentBar(), 80, "FAILSAFEUSD"));
   } finally {
@@ -381,6 +385,54 @@ async function main() {
     check("symbol-valued P&L APIs fail closed",
       await safeSignalController.updateDailyPnl(Symbol("pnl")) === false &&
       await safeSignalController.settleOrder("order-symbol", Symbol("pnl"), "EURUSD") === false);
+  }
+
+  // ---- v2.6.9: account mode + balance detection ----
+  {
+    const decisions = [];
+    const stakes = [];
+    const acct = AUTO.startAuto({
+      onTrade: (d) => decisions.push(d),
+      executeTrade: async (args) => { stakes.push(args.stake); return { ok: true, confirmed: true, id: "acct" }; },
+    });
+    acct.setMode("click");
+    acct.setArmed(true);
+    acct.setAccountInfo({ isDemo: false, balance: 250, currency: "USD" }); // LIVE account
+    advance(60000);
+    const liveBar = recentBar();
+    await acct.handleSignal(makeSignal("CALL", liveBar, 85, "EURUSD_otc"));
+    check("demo-only default blocks a LIVE account",
+      decisions.length === 1 && /demo-only/i.test(decisions[0].blockedReason || ""), decisions[0] && decisions[0].blockedReason);
+
+    await STORE.setSettings({ accountMode: "any", cooldownBars: 0 });
+    await acct.handleSignal(makeSignal("PUT", liveBar + 1, 85, "EURUSD_otc"));
+    check("accountMode=any allows the LIVE account",
+      decisions.length === 2 && decisions[1].ok === true && stakes.length === 1);
+
+    advance(10000);
+    await STORE.setSettings({ accountMode: "live", stakeMode: "percent", stakePercent: 2, cooldownBars: 0 });
+    acct.setAccountInfo({ isDemo: false, balance: 1000, currency: "USD" });
+    await acct.handleSignal(makeSignal("CALL", liveBar + 2, 85, "EURUSD_otc"));
+    check("percent staking: 2% of 1000 sends stake 20",
+      stakes.length === 2 && Math.abs(stakes[1] - 20) < 0.01, "stake=" + stakes[1]);
+
+    advance(10000);
+    await STORE.setSettings({ minBalance: 5000, cooldownBars: 0 });
+    acct.setAccountInfo({ isDemo: false, balance: 120, currency: "USD" });
+    await acct.handleSignal(makeSignal("PUT", liveBar + 3, 85, "EURUSD_otc"));
+    check("min-balance stop blocks trades below the floor",
+      decisions.length === 4 && /below minimum/i.test(decisions[3].blockedReason || ""), decisions[3] && decisions[3].blockedReason);
+
+    advance(10000);
+    const unknown = AUTO.startAuto({ onTrade: (d) => decisions.push(d) });
+    unknown.setMode("alerts");
+    unknown.setArmed(true);
+    // deliberately NO setAccountInfo — account mode unknown
+    await unknown.handleSignal(makeSignal("CALL", recentBar(), 85, "GBPCAD_otc"));
+    check("unknown account (no balance event) is blocked for safety",
+      decisions.length >= 5 && /unknown/i.test(decisions[decisions.length - 1].blockedReason || ""),
+      decisions.map((d) => d.blockedReason || ("ok:" + (d.action && d.action.kind || "trade"))).join(" | "));
+    await STORE.setSettings({ accountMode: "demo", stakeMode: "fixed", minBalance: 0 });
   }
 
   if (failed) { console.error("FAILED " + failed); process.exitCode = 1; return; }

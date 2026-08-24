@@ -7,7 +7,7 @@
 
   const STRATEGIES = {
     "auto_adaptive": {
-      label: "⚡ Auto-Adaptive (Elite Strategy Router)",
+      label: "Auto-Adaptive (Elite Strategy Router)",
       blurb: "Dynamically evaluates market regime, volatility, and high-accuracy strategy matrix to auto-select the highest winrate setup for the current bar.",
       params: {
         rsiPeriod: 14, rsiBuy: 42, rsiSell: 58,
@@ -24,8 +24,28 @@
         hurst: 1, williams: 1, cci: 1, donchianBreak: 2,
       },
     },
+    "high_accuracy": {
+      label: "High-Accuracy 80+ (Trending Regime Only)",
+      blurb: "Ultra-selective engine: fires only in trending regimes with 90+ confluence. Tuned for 5-8 minute expiries (set expiry accordingly). Far fewer signals, far higher hit rate.",
+      params: {
+        rsiPeriod: 7, rsiBuy: 40, rsiSell: 60,
+        emaFast: 5, emaSlow: 11,
+        macdFast: 6, macdSlow: 13, macdSignal: 5,
+        stochK: 7, stochD: 3, stochOs: 25, stochOb: 75,
+        bbPeriod: 14, bbMult: 1.6,
+        atrPeriod: 10, minAtrPct: 0.00015,
+        minScore: 3, lookback: 2,
+        minConfidence: 90,
+        regimeFilter: ["trending"],
+      },
+      weights: {
+        emaTrend: 2, emaCross: 2, rsiPull: 1, macd: 2, stoch: 1, bb: 1,
+        adxTrend: 2, supertrend: 2, psar: 2, vwap: 1, mtfAlign: 2,
+        hurst: 1, williams: 1, cci: 1, donchianBreak: 2,
+      },
+    },
     "sniper": {
-      label: "🎯 Sniper 90+ Confluence",
+      label: "Sniper 90+ Confluence",
       blurb: "Ultra-high conviction multi-timeframe alignment with strict Supertrend, ADX filter, and Parabolic SAR confirmation.",
       params: {
         rsiPeriod: 14, rsiBuy: 45, rsiSell: 55,
@@ -43,7 +63,7 @@
       },
     },
     "turbo_trend": {
-      label: "🚀 Turbo Trend Flow",
+      label: "Turbo Trend Flow",
       blurb: "Fast EMA ribbon acceleration coupled with Supertrend and higher-timeframe momentum continuation.",
       params: {
         rsiPeriod: 12, rsiBuy: 46, rsiSell: 54,
@@ -61,7 +81,7 @@
       },
     },
     "institutional_flow": {
-      label: "🏛️ Institutional VWAP Flow",
+      label: "Institutional VWAP Flow",
       blurb: "Volume-weighted institutional anchor levels aligned with Hurst fractal trend persistence.",
       params: {
         rsiPeriod: 14, rsiBuy: 45, rsiSell: 55,

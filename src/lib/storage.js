@@ -23,6 +23,10 @@
       dailyProfitCap: 0,          // $ — 0 = no cap
       minConfidence: 65,          // refuse signals below this confidence
       cooldownBars: 2,            // min bars between trades
+      accountMode: "demo",        // v2.6.9 demo|live|any — auto refuses the wrong account type
+      stakeMode: "fixed",         // v2.6.9 fixed|percent
+      stakePercent: 1,            // v2.6.9 percent of balance per trade (0.1-10)
+      minBalance: 0,              // v2.6.9 stop auto below this balance (0 = off)
       minIntervalMs: 5000,        // hard anti-double-submit interval
       calibration: true,          // adjust confidence by observed hit rate
       autoHighAccuracy: true,     // filter trades by high-accuracy assets EV > 0
@@ -114,6 +118,10 @@
     s.dailyProfitCap = finiteIn(s.dailyProfitCap, DEFAULTS.settings.dailyProfitCap, 0, 1000000000);
     s.minConfidence = finiteIn(s.minConfidence, DEFAULTS.settings.minConfidence, 0, 100);
     s.cooldownBars = finiteIn(s.cooldownBars, DEFAULTS.settings.cooldownBars, 0, 1440);
+    s.accountMode = s.accountMode === "live" || s.accountMode === "any" ? s.accountMode : "demo";
+    s.stakeMode = s.stakeMode === "percent" ? "percent" : "fixed";
+    s.stakePercent = finiteIn(s.stakePercent, DEFAULTS.settings.stakePercent, 0.1, 10);
+    s.minBalance = finiteIn(s.minBalance, DEFAULTS.settings.minBalance, 0, 1e9);
     s.minIntervalMs = finiteIn(s.minIntervalMs, DEFAULTS.settings.minIntervalMs, 1000, 3600000);
     s.calibration = !!s.calibration;
     s.autoHighAccuracy = s.autoHighAccuracy !== false;

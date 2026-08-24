@@ -40,6 +40,7 @@
 
   var live = {
     candles: Object.create(null), // asset@period -> latest candles array
+    candlesVerified: Object.create(null), // asset@period -> batch was symbol-verified
     ticks: Object.create(null),   // asset -> last tick { price, time }
     instruments: [],  // broker-discovered instruments
     balance: null,
@@ -53,6 +54,7 @@
 
   var internalSubscriptionSend = false;
   var candleKeyOrder = [];
+  var candlesVerified = Object.create(null); // asset@period -> batch was symbol-verified
   var tickKeyOrder = [];
   var backgroundTickAt = Object.create(null);
   var lastBackgroundEmitAt = 0;
@@ -99,13 +101,18 @@
       var period = msg.period || live.lastWsPeriod || 60;
       var key = asset + "@" + period;
       live.candles[key] = Array.isArray(msg.candles) ? msg.candles.slice(-5000) : [];
+      if (msg.verified != null) live.candlesVerified[key] = !!msg.verified;
       var oldKeyAt = candleKeyOrder.indexOf(key);
       if (oldKeyAt >= 0) candleKeyOrder.splice(oldKeyAt, 1);
       candleKeyOrder.push(key);
-      while (candleKeyOrder.length > 24) delete live.candles[candleKeyOrder.shift()];
+      while (candleKeyOrder.length > 24) {
+        var droppedKey = candleKeyOrder.shift();
+        delete live.candles[droppedKey];
+        delete live.candlesVerified[droppedKey];
+      }
       // History is low-frequency and remains available per asset/timeframe;
       // it never changes activeChart.
-      emit("candle", { asset: asset, period: period, candles: live.candles[key] });
+      emit("candle", { asset: asset, period: period, candles: live.candles[key], verified: live.candlesVerified[key] === true });
     },
     onTick: function (q) {
       if (!q || !q.symbol) return;
@@ -192,10 +199,14 @@
    * to (bar time, price) by the content script (fixed once per closed bar),
    * so they can never repaint: re-rendering only re-projects fixed anchors.
    * Rendering here tries, in order:
-   *   1. native `series.setMarkers()` — best: the chart scrolls/zooms and
+   *   1. native `series.setMarkers()` (v4) — the chart scrolls/zooms and
    *      the arrows stay glued to their bars;
-   *   2. an overlay canvas above the price chart (approximate mapping from
-   *      the feed bars the content script sends alongside the markers).
+   *   2. native `LightweightCharts.createSeriesMarkers(series, …)` plugin
+   *      (v5 removed series.setMarkers) — same glued-to-candles behaviour;
+   *   3. an overlay canvas above the price chart (approximate mapping from
+   *      the feed bars the content script sends alongside the markers),
+   *      re-projected on every visible-range change so scroll/zoom can not
+   *      detach the arrows from their candles.
    * The chart instance is captured by:
    *   a. wrapping window.LightweightCharts.createChart at document_start
    *      (the page-hook runs in the MAIN world before page scripts);
@@ -211,6 +222,10 @@
     var lastPayload = null;  // raw { asset, markers, bars } from content
     var overlay = null;      // { el, canvas, ctx, target }
     var mode = "none";       // "native" | "overlay" | "none"
+    var lwcModule = null;     // window.LightweightCharts module ref (v5 createSeriesMarkers)
+    var markersPlugin = null; // v5 ISeriesMarkersPluginApi bound to `series`
+    var pluginSeries = null;  // series the markers plugin was created for
+    var rangeBoundChart = null; // chart whose timeScale redraw subscription is installed
     var CALL_COLOR = "#3dff9a";
     var PUT_COLOR = "#ff5d7a";
     var MAX = 600;
@@ -226,6 +241,20 @@
       return !!s && typeof s === "object" && (typeof s.setMarkers === "function" || typeof s.setData === "function");
     }
 
+    // v5 charts create every series through addSeries(SeriesDefinition, …)
+    // instead of addCandlestickSeries(). Detect whether a created series is
+    // the PRICE series (candlestick/bar) from the series itself or from the
+    // passed definition, so the marker target is never a moving average.
+    function isPriceSeriesLike(s, definition) {
+      var type = "";
+      try { type = s && typeof s.seriesType === "function" ? String(s.seriesType()) : ""; } catch (_) {}
+      if (/candlestick|bar/i.test(type)) return true;
+      try {
+        var d = definition && (typeof definition.type === "function" ? definition.type() : definition.type);
+        return /candlestick|bar/i.test(String(d == null ? "" : d));
+      } catch (_) { return false; }
+    }
+
     function hookSeries(s) {
       if (!s || typeof s !== "object" || s.__cyberHooked) return s;
       s.__cyberHooked = true;
@@ -239,7 +268,7 @@
               var norm = Q.normalizeCandles(parsed || { raw: data });
               if (norm.length) {
                 var p = (parsed && parsed.period) || live.lastWsPeriod || 60;
-                routerHandlers.onCandle({ asset: sym, period: p, candles: norm });
+                routerHandlers.onCandle({ asset: sym, period: p, candles: norm, verified: true });
               }
             }
           } catch (_) {}
@@ -254,7 +283,7 @@
               var sym2 = (live.activeChart && live.activeChart.symbol) || live.lastWsSymbol || "EURUSD";
               var norm2 = Q.normalizeCandles({ raw: [bar] });
               if (norm2.length) {
-                routerHandlers.onCandle({ asset: sym2, period: live.lastWsPeriod || 60, candles: norm2 });
+                routerHandlers.onCandle({ asset: sym2, period: live.lastWsPeriod || 60, candles: norm2, verified: true });
               }
             }
           } catch (_) {}
@@ -317,12 +346,17 @@
       if (chart && currentArea > 0 && (nextArea === 0 || nextArea < currentArea)) return true;
       chart = c;
       chartContainer = container || chartContainer;
+      // The old chart's redraw subscription died with it; re-bind to the new
+      // chart's timeScale immediately (a markers message may not follow).
+      rangeBoundChart = null;
+      if (mode === "overlay") bindOverlayRangeWatcher();
       series = findExistingSeries(c);
       if (series) hookSeries(series);
       // Wrap series adders so a re-created main series (asset / timeframe
       // switch) is captured too. Candlestick/bar adders REPLACE the marker
-      // target (they are the price chart); overlays (line/area/…/addSeries)
-      // only fill in if we have no target yet.
+      // target (they are the price chart); overlays (line/area/…) only fill
+      // in if we have no target yet. On v5 every series comes from
+      // addSeries(), so the created series/definition type decides.
       var names = ["addCandlestickSeries", "addBarSeries", "addLineSeries",
         "addAreaSeries", "addBaselineSeries", "addHistogramSeries", "addSeries"];
       for (var i = 0; i < names.length; i++) (function (n) {
@@ -333,7 +367,14 @@
           if (isSeriesLike(s)) {
             hookSeries(s);
             if (n === "addCandlestickSeries" || n === "addBarSeries") series = s;
+            else if (n === "addSeries" && isPriceSeriesLike(s, arguments[0])) series = s;
             else if (!series) series = s;
+            if (series === s) {
+              // A new price series replaced the old one: its v5 markers
+              // plugin (if any) died with the old series.
+              pluginSeries = null;
+              applyNative();
+            }
           }
           return s;
         };
@@ -356,6 +397,10 @@
       while (time >= 1e14) time /= 1000;
       var sec = Math.floor(time >= 1e11 ? time / 1000 : time);
       if (!Number.isSafeInteger(sec) || sec <= 0) return null;
+      // Post-normalization epoch sanity (2000-01-01 … 2100-01-01 UTC), the
+      // same floor src/lib/markers.js applies — garbage epochs must never
+      // project an arrow onto the chart.
+      if (sec < 946684800 || sec > 4102444800) return null;
       var period = markerPeriod();
       return Math.floor(sec / period) * period;
     }
@@ -400,28 +445,85 @@
       // The platform may have recreated the main series (asset/timeframe
       // switch) since the last markers message — re-resolve it if needed.
       if (!series && chart) series = findExistingSeries(chart);
+      applyNative();
+    }
+
+    // v5 removed series.setMarkers() in favour of
+    // LightweightCharts.createSeriesMarkers(series, markers), whose plugin
+    // owns .setMarkers(). Native markers stay glued to their candles through
+    // every scroll/zoom; the overlay canvas below is only a last resort.
+    function ensureMarkersPlugin() {
+      if (!series) return null;
+      if (markersPlugin && pluginSeries === series &&
+          typeof markersPlugin.setMarkers === "function") return markersPlugin;
+      if (markersPlugin) {
+        try { if (typeof markersPlugin.detach === "function") markersPlugin.detach(); } catch (_) {}
+      }
+      markersPlugin = null;
+      pluginSeries = null;
+      var create = lwcModule && typeof lwcModule.createSeriesMarkers === "function"
+        ? lwcModule.createSeriesMarkers : null;
+      if (!create) return null;
+      try {
+        markersPlugin = create(series, []);
+        pluginSeries = series;
+      } catch (_) { markersPlugin = null; }
+      return markersPlugin && typeof markersPlugin.setMarkers === "function" ? markersPlugin : null;
+    }
+
+    function applyNative() {
+      // v3/v4: markers live on the series itself.
       if (series && typeof series.setMarkers === "function") {
         try {
           series.setMarkers(nativeList);
           mode = "native";
           hideOverlay();
-          return;
-        } catch (_) { /* some builds throw on setMarkers — fall back */ }
+          return true;
+        } catch (_) { /* some builds throw on setMarkers — fall through */ }
+      }
+      // v5: markers are a series primitive owned by a plugin.
+      var plugin = ensureMarkersPlugin();
+      if (plugin) {
+        try {
+          plugin.setMarkers(nativeList);
+          mode = "native";
+          hideOverlay();
+          return true;
+        } catch (_) { /* fall back to overlay */ }
       }
       mode = "overlay";
+      bindOverlayRangeWatcher();
+      ensureOverlayHeartbeat();
       drawOverlay();
+      return false;
     }
 
-    function applyNative() {
-      if (!series || typeof series.setMarkers !== "function") return;
+    // Overlay arrows are projected from fixed anchors, so they must be
+    // re-projected whenever the visible range moves (scroll, zoom, new
+    // bars). Without this the canvas kept stale pixel positions and the
+    // arrows visibly detached from their candles.
+    function bindOverlayRangeWatcher() {
+      if (rangeBoundChart || !chart) return;
       try {
-        series.setMarkers(nativeList);
-        mode = "native";
-        hideOverlay();
-      } catch (_) {
-        mode = "overlay";
-        drawOverlay();
-      }
+        var ts = chart.timeScale();
+        if (ts && typeof ts.subscribeVisibleLogicalRangeChange === "function") {
+          ts.subscribeVisibleLogicalRangeChange(function () { scheduleOverlayRedraw(); });
+          rangeBoundChart = chart;
+        }
+      } catch (_) {}
+    }
+
+    // The price axis autoscales on new ticks WITHOUT moving the logical
+    // range, so an exact-overlay's y can drift while x stays glued. A slow
+    // repaint heartbeat keeps both honest; it no-ops outside overlay mode.
+    var overlayHeartbeat = null;
+    function ensureOverlayHeartbeat() {
+      if (overlayHeartbeat || typeof setInterval !== "function") return;
+      try {
+        overlayHeartbeat = setInterval(function () {
+          if (mode === "overlay") scheduleOverlayRedraw();
+        }, 500);
+      } catch (_) {}
     }
 
     /* ---------- overlay fallback ---------- */
@@ -514,6 +616,14 @@
       try { timeScale = chart && typeof chart.timeScale === "function" ? chart.timeScale() : null; } catch (_) {}
       var exactTime = !!timeScale && typeof timeScale.timeToCoordinate === "function";
       var exactPrice = !!series && typeof series.priceToCoordinate === "function";
+      if (!exactTime) {
+        // No chart API → every x would be an approximation spread across the
+        // viewport, freezing in place when the chart pans/zooms: the
+        // "floating arrows" defect. Arrows are only ever drawn when they can
+        // be glued to their bar; discovery keeps retrying in the background.
+        try { scheduleScan(); } catch (_) {}
+        return;
+      }
       var periodMs = markerPeriod() * 1000;
       for (var k = 0; k < markers.length; k++) {
         var m = markers[k];
@@ -592,9 +702,14 @@
       scanTimer = setInterval(function () {
         tries++;
         try { scanOnce(); } catch (_) {}
-        // Keep scanning briefly after the first capture: multi-chart layouts
-        // often mount mini charts first and the large main chart later.
-        if (tries > 12) { clearInterval(scanTimer); scanTimer = null; }
+        // Lazy SPAs mount the trade chart long after first paint, and asset
+        // switches can re-mount it — a fixed burst gave up too early. After
+        // the initial burst, keep a slow background lane forever so a
+        // late-mounted chart is always eventually captured.
+        if (tries === 15) {
+          clearInterval(scanTimer);
+          scanTimer = setInterval(function () { try { scanOnce(); } catch (_) {} }, 10000);
+        }
       }, 2000);
     }
 
@@ -615,6 +730,19 @@
         for (var c = 0; c < containers.length && c < 80; c++) {
           var inst = fiberScan(containers[c]);
           if (inst && captureChart(inst, containers[c])) found = true;
+        }
+      } catch (_) {}
+      // b2) climb from the big canvases themselves — the definitive chart
+      // leaf — up the ancestor chain looking for React fiber state.
+      try {
+        var canvases = document.querySelectorAll("canvas");
+        for (var v = 0; v < canvases.length && v < 12; v++) {
+          var cnode = canvases[v];
+          for (var up = 0; cnode && up < 8; up++) {
+            var viaCanvas = fiberScan(cnode);
+            if (viaCanvas && captureChart(viaCanvas, cnode)) found = true;
+            cnode = cnode.parentElement;
+          }
         }
       } catch (_) {}
       // c) common window handles
@@ -640,17 +768,22 @@
     }
 
     function walkFiber(fiber, depth) {
-      if (!fiber || depth > 60) return null;
+      if (!fiber || depth > 60 || inspectBudget <= 0) return null;
       var found = inspectObj(fiber.memoizedProps, 0);
       if (found) return found;
       found = inspectObj(fiber.memoizedState, 0);
       if (found) return found;
       found = inspectObj(fiber.stateNode, 0);
       if (found) return found;
-      // Only walk the `return` chain (parent components) — bounded and
-      // linear, avoids exponential blowup from child/sibling traversal.
-      if (fiber.return) return walkFiber(fiber.return, depth + 1);
-      return null;
+      // Walk parent, first-child, and sibling links. The chart instance is
+      // usually created inside a leaf component, so child/sibling links
+      // matter as much as the parent chain; inspectBudget bounds the total
+      // work so this can not blow up.
+      found = fiber.return ? walkFiber(fiber.return, depth + 1) : null;
+      if (found) return found;
+      found = fiber.child ? walkFiber(fiber.child, depth + 1) : null;
+      if (found) return found;
+      return fiber.sibling ? walkFiber(fiber.sibling, depth + 1) : null;
     }
 
     function inspectObj(obj, depth) {
@@ -683,39 +816,47 @@
       return null;
     }
 
-    // Trap window.LightweightCharts (set by the page's bundle) so any chart
+    // Trap chart-library globals (set by the page's bundle) so any chart
     // created later is captured. Installed synchronously at document_start.
-    try {
-      var _lwc = window.LightweightCharts;
-      Object.defineProperty(window, "LightweightCharts", {
-        configurable: true,
-        enumerable: true,
-        get: function () { return _lwc; },
-        set: function (v) {
-          _lwc = v;
-          if (v && typeof v.createChart === "function" && !v.__cyberWrapped) {
-            var origCreate = v.createChart;
-            v.createChart = function () {
-              var container = arguments[0];
-              var c = origCreate.apply(this, arguments);
-              try { captureChart(c, container); } catch (_) {}
-              return c;
-            };
-            try { v.__cyberWrapped = true; } catch (_) {}
-          }
-        },
-      });
-      if (_lwc && typeof _lwc.createChart === "function" && !_lwc.__cyberWrapped) {
-        var origCreate2 = _lwc.createChart;
-        _lwc.createChart = function () {
-          var container = arguments[0];
-          var c = origCreate2.apply(this, arguments);
-          try { captureChart(c, container); } catch (_) {}
-          return c;
-        };
-        try { _lwc.__cyberWrapped = true; } catch (_) {}
-      }
-    } catch (_) {}
+    // The module ref is kept even for builds whose charts never touch our
+    // wrappers: v5 marker rendering needs createSeriesMarkers() from it.
+    function trapChartGlobal(name) {
+      try {
+        var _lwc = window[name];
+        Object.defineProperty(window, name, {
+          configurable: true,
+          enumerable: true,
+          get: function () { return _lwc; },
+          set: function (v) {
+            _lwc = v;
+            if (name === "LightweightCharts") lwcModule = v;
+            if (v && typeof v.createChart === "function" && !v.__cyberWrapped) {
+              var origCreate = v.createChart;
+              v.createChart = function () {
+                var container = arguments[0];
+                var c = origCreate.apply(this, arguments);
+                try { captureChart(c, container); } catch (_) {}
+                return c;
+              };
+              try { v.__cyberWrapped = true; } catch (_) {}
+            }
+          },
+        });
+        if (_lwc && typeof _lwc.createChart === "function" && !_lwc.__cyberWrapped) {
+          if (name === "LightweightCharts") lwcModule = _lwc;
+          var origCreate2 = _lwc.createChart;
+          _lwc.createChart = function () {
+            var container = arguments[0];
+            var c = origCreate2.apply(this, arguments);
+            try { captureChart(c, container); } catch (_) {}
+            return c;
+          };
+          try { _lwc.__cyberWrapped = true; } catch (_) {}
+        }
+      } catch (_) {}
+    }
+    trapChartGlobal("LightweightCharts");
+    trapChartGlobal("lightweightCharts");
 
     try {
       window.addEventListener("resize", scheduleOverlayRedraw);
@@ -741,8 +882,11 @@
       orders: live.orders.slice(0, 20),
       ticks: live.ticks,
       candles: live.candles,
+      candlesVerified: live.candlesVerified,
       assetIdMap: live.assetIdMap,
       lastWsSymbol: live.lastWsSymbol,
+      markersMode: MARKERS.mode(),
+      markersChart: MARKERS.hasChart(),
       lastWsPeriod: live.lastWsPeriod,
       activeChart: live.activeChart,
       socket: !!handle.lastWs,

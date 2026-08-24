@@ -46,6 +46,8 @@
   const feeds = Object.create(null);
   const historySeeded = Object.create(null);   // assetId -> first batch applied
   const realHistoryReady = Object.create(null); // assetId -> enough genuine 1m bars for execution
+  const realBarCount = Object.create(null);     // assetId -> genuine 1m bars currently in the feed
+  const ingestTrustLog = Object.create(null);   // assetId -> last console note about untrusted batches
   const historyRequestedAt = Object.create(null);
   const chartHistory = Object.create(null);    // assetId -> period -> {candles, ts}
   const lastAcceptedQuoteAt = Object.create(null);
@@ -561,6 +563,11 @@
           try { chrome.runtime.sendMessage({ type: "CYBER_AUTO_STATE", payload: state }).catch(() => {}); } catch (_) {}
         },
       });
+
+    // v2.6.10: a balance event may have arrived before the controller
+    // existed; push the detected account immediately so the account gate
+    // and percent staking work from the first armed signal.
+    syncAutoAccount();
       autoController.setMode(s.autoMode || "off");
       autoController.setArmed(isPrimaryContext && !!s.armed);
     }
@@ -660,7 +667,7 @@
     }, wait);
   }
 
-  function ingestLiveCandles(asset, period, candles) {
+  function ingestLiveCandles(asset, period, candles, verified) {
     if (!asset || !Array.isArray(candles) || !candles.length) return;
     const det = typeof asset === "string" && asset.length <= 80 ? ASSETS.ensureRegistered(asset) : null;
     if (!det) return;
@@ -682,7 +689,7 @@
       const time = Math.abs(rawTime) >= 1e14 ? Math.floor(rawTime / 1000)
         : Math.abs(rawTime) >= 1e11 ? Math.floor(rawTime) : Math.floor(rawTime * 1000);
       if (![time, open, close, rawHigh, rawLow].every(Number.isFinite) ||
-          time < 946684800000 || time > Date.now() + 300000 ||
+          time < 946684800000 || time > Date.now() + 86400000 ||
           open <= 0 || close <= 0 || rawHigh <= 0 || rawLow <= 0 ||
           Math.max(open, close, rawHigh, rawLow) > 1e12) continue;
       const rawVolume = Number(c.volume);
@@ -698,7 +705,26 @@
 
     // The engine runs on 1m bars; accept 60s history directly and build 1m
     // from ticks for everything else (the chart shows the broker timeframe).
-    const useForEngine = safePeriod === 60;
+    // v2.6.6: the batch must ALSO be trusted. Symbol-verified batches (or
+    // chart-library data) may seed/extend the engine feed. Batches that were
+    // attributed to this asset by fallback can never seed it, and can extend
+    // it only when their price scale matches — candles from a different
+    // asset must never reach the signal computation.
+    const seriesForScale = feed.series();
+    const scaleRef = seriesForScale.length ? seriesForScale[seriesForScale.length - 1].close : null;
+    const trust = self.CYBER_ENGINE.historyTrustDecision({
+      verified: verified === true,
+      historySeeded: !!historySeeded[id],
+      feedClose: scaleRef,
+      batchClose: real[real.length - 1].close,
+    });
+    if (!trust.engine && safePeriod === 60) {
+      if (!ingestTrustLog[id] || Date.now() - ingestTrustLog[id] > 60000) {
+        ingestTrustLog[id] = Date.now();
+        try { console.warn("[CYBER] candle batch for " + id + " kept for display only: " + trust.reason); } catch (_) {}
+      }
+    }
+    const useForEngine = safePeriod === 60 && trust.engine;
     if (useForEngine && (!historySeeded[id] || feed.series().length <= 120)) {
       historySeeded[id] = true;
       // First real 1m batch REPLACES the synthetic seed wholesale (never
@@ -710,10 +736,14 @@
       const ev = feed.mergeCandles(real);
       settleFeedEvent(ev, id);
     }
+    if (useForEngine) realBarCount[id] = feed.series().length;
     if (useForEngine && feed.series().length >= 2) persistLiveCandles(id, true);
     if (useForEngine && feed.series().length >= 40) realHistoryReady[id] = true;
     const newestRealTime = real[real.length - 1].time;
-    if (useForEngine && newestRealTime >= Date.now() - 2 * TF_MS && newestRealTime <= Date.now() + TF_MS) {
+    // v2.6.5: the upper bound tolerates broker-server clock skew (old bound
+    // was +1 minute, which made "live" detection fail whenever the server
+    // clock ran ahead of the user's PC).
+    if (useForEngine && newestRealTime >= Date.now() - 2 * TF_MS && newestRealTime <= Date.now() + 86400000) {
       lastAcceptedQuoteAt[id] = Date.now();
     }
     // Merge incremental batches instead of replacing the dashboard series
@@ -753,6 +783,20 @@
     return QUOTEX.parseInstruments(value).slice(0, 2000);
   }
 
+  /** v2.6.9: push the detected account (demo/live + balance) into the
+   * auto-trade controller so the account-mode gate and percent staking use
+   * live broker facts, never assumptions. */
+  function syncAutoAccount() {
+    if (!autoController || typeof autoController.setAccountInfo !== "function" || !lastBalance) return;
+    try {
+      autoController.setAccountInfo({
+        isDemo: typeof lastBalance.isDemo === "boolean" ? lastBalance.isDemo : null,
+        balance: Number(lastBalance.balance),
+        currency: lastBalance.currency,
+      });
+    } catch (_) {}
+  }
+
   function normalizeBalance(value) {
     return QUOTEX && typeof QUOTEX.parseBalance === "function" ? QUOTEX.parseBalance(value) : null;
   }
@@ -760,7 +804,7 @@
   function confirmationLifecycle(data) {
     const receivedAt = Date.now();
     const rawOpen = Number(data && data.openTime);
-    const openTime = Number.isSafeInteger(rawOpen) && rawOpen >= receivedAt - 86400000 && rawOpen <= receivedAt + 300000
+    const openTime = Number.isSafeInteger(rawOpen) && rawOpen >= receivedAt - 86400000 && rawOpen <= receivedAt + 86400000
       ? rawOpen : receivedAt;
     const rawExpiry = Number(data && (data.expiryTime || data.closeTime));
     const duration = Math.max(0, Math.min(86400, Math.floor(Number(data && data.duration) || 0)));
@@ -780,7 +824,12 @@
     const currentDate = new Date(now);
     const dayStart = Date.UTC(currentDate.getUTCFullYear(), currentDate.getUTCMonth(), currentDate.getUTCDate());
     if (fromSnapshot && !Number.isSafeInteger(closeTime)) return false;
-    if (Number.isSafeInteger(closeTime) && (closeTime < dayStart || closeTime > now + 300000)) return false;
+    // v2.6.13: the close-time upper bound must tolerate broker-server clock
+    // skew, like every other broker-timestamp check. The old +5-minute bound
+    // silently rejected real closes whenever the server clock ran ahead, so
+    // losses never reached the daily-loss cap — the safety ledger disarmed
+    // itself on a skewed clock. 24h still rejects unit-mixup garbage.
+    if (Number.isSafeInteger(closeTime) && (closeTime < dayStart || closeTime > now + 86400000)) return false;
     const hasFallbackIdentity = data.asset && (data.openTime != null || data.closeTime != null);
     const closeKey = data.id != null && data.id !== "" ? data.id
       : (data.requestId != null && data.requestId !== "" ? data.requestId
@@ -815,6 +864,7 @@
     if (balance) {
       lastBalance = balance;
       try { chrome.runtime.sendMessage({ type: "CYBER_QUOTEX_BALANCE", payload: lastBalance }).catch(() => {}); } catch (_) {}
+      syncAutoAccount();
     }
     if (Array.isArray(snap.orders)) {
       lastOrders = snap.orders.map(normalizeOrderEvent).filter(Boolean).slice(0, 50);
@@ -852,6 +902,8 @@
     }
     const candlesMap = snap.candles && typeof snap.candles === "object" && !Array.isArray(snap.candles)
       ? snap.candles : {};
+    const candlesVerified = snap.candlesVerified && typeof snap.candlesVerified === "object" && !Array.isArray(snap.candlesVerified)
+      ? snap.candlesVerified : {};
     const candleKeys = Object.keys(candlesMap).slice(0, 50);
     for (const key of candleKeys) {
       const m = key.match(/^(.{1,80})@(\d{1,6})$/);
@@ -859,7 +911,7 @@
       const list = candlesMap[key];
       const period = Number(m[2]);
       if (Array.isArray(list) && list.length && period >= 1 && period <= 86400) {
-        ingestLiveCandles(m[1], period, list);
+        ingestLiveCandles(m[1], period, list, candlesVerified[key] === true);
       }
     }
   }
@@ -892,6 +944,24 @@
       sig.asset = asset ? asset.id : activeAsset;
       sig.assetName = asset ? asset.name : activeAsset;
       sig.strategy = currentStrategy;
+      // v2.6.6: live-data gate. Until the feed holds genuine broker history
+      // for THIS asset, any CALL/PUT the engine computes is derived partly
+      // from the synthetic warm-up seed — a false signal. Hold WAIT, show the
+      // honest reason, and never attach a marker for it. Trade execution and
+      // auto-trading were already blocked on realHistoryReady; this closes
+      // the display/marker path so no synthetic-derived signal is ever shown.
+      const liveGate = self.CYBER_ENGINE.liveSignalGate({
+        historySeeded: !!historySeeded[activeAsset],
+        realBars: realBarCount[activeAsset] || 0,
+      });
+      if (!liveGate.allowed) {
+        if (sig.direction !== "WAIT") {
+          sig.gateReason = "live-data";
+          sig.direction = "WAIT";
+          sig.ready = false;
+        }
+        sig.reason = liveGate.reason;
+      }
       if (closed && closed.time != null) {
         sig.time = closed.time;
         // Signals are decided at the close of this 1m bar, not its open.
@@ -1115,7 +1185,8 @@
     const qstat = lastQuotexStatus && typeof lastQuotexStatus.state === "string"
       ? "· qx:" + lastQuotexStatus.state.slice(0, 32) : "";
     const balanceNumber = Number(lastBalance && lastBalance.balance);
-    const bal = Number.isFinite(balanceNumber) ? "· bal " + balanceNumber.toFixed(2) : "";
+    const modeTag = lastBalance && lastBalance.isDemo === false ? " LIVE" : (lastBalance && lastBalance.isDemo === true ? " DEMO" : "");
+    const bal = Number.isFinite(balanceNumber) ? "\u00b7 bal " + balanceNumber.toFixed(2) + modeTag : "";
     const metaText =
       (sig && sig.reason ? String(sig.reason).slice(0, 256) + " · " : "") +
       "WR " + wrTxt + " · " +
@@ -1151,7 +1222,12 @@
     while (Math.abs(ts) >= 1e14) ts /= 1000;
     if (Math.abs(ts) < 1e11) ts *= 1000;
     ts = Math.floor(ts);
-    if (!Number.isSafeInteger(ts) || ts < Date.now() - 7 * 86400000 || ts > Date.now() + 60000 ||
+    // v2.6.10: history batches tolerate 24h of server clock skew, but a LIVE
+    // quote running ahead by more than 10 minutes is a glitch: accepting it
+    // would open a far-future bucket that swallows every subsequent real
+    // tick (canIngest rejects t < current.time forever). 10 minutes covers
+    // any realistic broker-vs-client drift on a real-time stream.
+    if (!Number.isSafeInteger(ts) || ts < Date.now() - 7 * 86400000 || ts > Date.now() + 600000 ||
         (typeof targetFeed.canIngest === "function" && !targetFeed.canIngest(ts))) return false;
 
     // Before genuine 1m history is available the feed contains a synthetic
@@ -1317,7 +1393,7 @@
       }
       case "candle": {
         if (p && p.asset && Array.isArray(p.candles)) {
-          ingestLiveCandles(p.asset, p.period, p.candles);
+          ingestLiveCandles(p.asset, p.period, p.candles, p.verified === true);
         }
         break;
       }
@@ -1326,6 +1402,7 @@
         if (!balance) break;
         lastBalance = balance;
         try { chrome.runtime.sendMessage({ type: "CYBER_QUOTEX_BALANCE", payload: balance }).catch(() => {}); } catch (_) {}
+        syncAutoAccount();
         break;
       }
       case "instruments": {
@@ -1614,7 +1691,11 @@
     }
     // This executor is automation-only; use the freshly loaded settings so a
     // stake/expiry change during eligibility cannot submit stale values.
-    const stake = Number(s.stake);
+    // v2.6.9: args.stake carries the controller's decision (e.g. a
+    // percent-of-balance computation from seconds ago); prefer it when valid,
+    // otherwise fall back to the freshly loaded settings stake.
+    const argsStake = Number(args.stake);
+    const stake = Number.isFinite(argsStake) && argsStake > 0 && argsStake <= 1000000 ? argsStake : Number(s.stake);
     const expiry = Number(s.expiry);
     if (!Number.isFinite(stake) || stake <= 0 || stake > 1000000) {
       return { ok: false, confirmed: false, error: "stake must be between 0 and 1,000,000" };

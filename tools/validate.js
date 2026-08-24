@@ -584,8 +584,150 @@ if (!safeSummary || safeSummary.trades !== 4 || safeSummary.draws !== 0 || safeS
   console.error("historic summary sanitation/drawdown failed"); failed++;
 }
 
-if (failed) {
-  console.error("FAILED", failed);
-  process.exit(1);
+// Full-catalog coverage: with no liveOnly flag every requested asset must be
+// backtested even when only ONE of them has cached broker candles — the
+// dashboard previously restricted runs to live-cached assets only.
+{
+  const allAssets = sandbox.self.CYBER_ASSETS.list().slice(0, 6).map((a) => a.id);
+  const cachedId = allAssets[0];
+  const cachedBars = [];
+  for (let cb = 0; cb < 240; cb++) {
+    const ct = cacheStart + cb * 60000;
+    cachedBars.push({ time: ct, open: 1.1, high: 1.105, low: 1.095, close: 1.1 + Math.sin(cb / 7) * 0.003 });
+  }
+  const cachedByAsset = Object.create(null);
+  cachedByAsset[cachedId] = cachedBars;
+  const allMatrix = HIST.runMatrix({
+    days: 1, strategies: ["confluence"], assets: allAssets, minBars: 50, cachedByAsset,
+  });
+  const covered = new Set(allMatrix.results.map((r) => r.asset));
+  if (allMatrix.count !== allAssets.length || allAssets.some((id) => !covered.has(id))) {
+    console.error("backtest matrix dropped assets without a live candle cache"); failed++;
+  }
+  const cachedTail = HIST.getSeries(sandbox.self.CYBER_ASSETS.get(cachedId), { days: 1, cachedByAsset });
+  if (cachedTail[cachedTail.length - 1].time !== cacheStart + 239 * 60000 ||
+      cachedTail[cachedTail.length - 1].close !== cachedBars[239].close) {
+    console.error("cachedByAsset bars were not preferred for the cached asset"); failed++;
+  }
+}
+
+// Worker-pool browser backtest: several historic workers, aggregated
+// progress, merged results, and per-chunk recovery when a worker dies.
+async function poolTest() {
+  const timerQueue = [];
+  const poolSandbox = {
+    self: {}, console, URL, TextDecoder,
+    setTimeout: (fn) => { timerQueue.push(fn); return timerQueue.length; },
+    clearTimeout: () => {},
+    location: { hostname: "qxbroker.com" },
+  };
+  poolSandbox.globalThis = poolSandbox.self;
+  poolSandbox.window = poolSandbox.self;
+  // The workers module binds `root` to `self`, so the browser globals it
+  // probes (Worker / chrome.runtime / navigator) must live there — exactly
+  // like the real extension where self IS the global scope.
+  poolSandbox.self.chrome = { runtime: { getURL: (p) => p } };
+  poolSandbox.self.navigator = { hardwareConcurrency: 4 };
+  const spawned = [];
+  let failFirst = false;
+  class FakeWorker {
+    constructor() { this.terminated = false; spawned.push(this); }
+    postMessage(payload) {
+      const w = this;
+      Promise.resolve().then(() => {
+        if (failFirst && spawned.indexOf(w) === 0) {
+          if (w.onerror) w.onerror(new Error("worker died"));
+          return;
+        }
+        poolSandbox.self.CYBER_WORKERS.runBrowserChunked({
+          assets: payload.assets, strategies: payload.strategies, days: payload.days,
+          seed: payload.seed, horizon: payload.horizon, minConf: payload.minConf,
+          minBars: payload.minBars, cachedByAsset: payload.cachedByAsset, liveOnly: payload.liveOnly,
+          onProgress: (p) => { if (w.onmessage) w.onmessage({ data: { type: "progress", i: p.i } }); },
+        }).then((result) => { if (w.onmessage) w.onmessage({ data: { type: "done", result } }); });
+      });
+    }
+    terminate() { this.terminated = true; }
+  }
+  poolSandbox.self.Worker = FakeWorker;
+  vm.createContext(poolSandbox);
+  for (const f of ["indicators.js", "assets.js", "strategy.js", "feed.js", "engine.js", "backtest.js", "workers.js"]) {
+    vm.runInContext(fs.readFileSync(path.join(root, "src/lib", f), "utf8"), poolSandbox);
+  }
+  const WORKERS = poolSandbox.self.CYBER_WORKERS;
+  // Drain the stubbed setTimeout queue until the run under test settles.
+  // The fake workers start their work in microtasks, so the queue can be
+  // momentarily empty while more steps are still coming.
+  async function pump(isSettled) {
+    let idle = 0;
+    while (!isSettled() || timerQueue.length) {
+      if (timerQueue.length) {
+        idle = 0;
+        const fns = timerQueue.splice(0);
+        for (const fn of fns) fn();
+      } else if (++idle > 1000) {
+        break; // safety valve
+      }
+      await new Promise((r) => setImmediate(r));
+    }
+  }
+  function tracked(promise, flag) {
+    return promise.then(
+      (value) => { flag.done = true; return value; },
+      (error) => { flag.done = true; throw error; }
+    );
+  }
+  const ids = poolSandbox.self.CYBER_ASSETS.list().slice(0, 8).map((a) => a.id);
+
+  // 1) healthy pool: 4 workers × 2 assets each, all rows merged
+  let lastProgress = null;
+  const flag1 = { done: false };
+  const runPromise = tracked(WORKERS.runBrowser({
+    assets: ids, strategies: ["trend"], days: 1, minBars: 50,
+    onProgress: (p) => { lastProgress = p; },
+  }), flag1);
+  await pump(() => flag1.done);
+  const merged = await runPromise;
+  const unique = new Set(merged.results.map((r) => r.asset));
+  if (spawned.length < 2) { console.error("worker pool did not spawn multiple workers"); failed++; }
+  if (merged.count !== ids.length || unique.size !== ids.length || ids.some((id) => !unique.has(id))) {
+    console.error("worker pool lost or duplicated asset results"); failed++;
+  }
+  if (!lastProgress || lastProgress.total !== ids.length || lastProgress.i !== lastProgress.total) {
+    console.error("worker pool progress was not aggregated to the full job total"); failed++;
+  }
+
+  // 2) one worker dies: only its chunk is replayed, coverage stays complete
+  spawned.length = 0;
+  failFirst = true;
+  const flag2 = { done: false };
+  const recoverPromise = tracked(WORKERS.runBrowser({
+    assets: ids, strategies: ["trend"], days: 1, minBars: 50,
+  }), flag2);
+  await pump(() => flag2.done);
+  const recovered = await recoverPromise;
+  const recoveredUnique = new Set(recovered.results.map((r) => r.asset));
+  if (recoveredUnique.size !== ids.length || ids.some((id) => !recoveredUnique.has(id))) {
+    console.error("worker pool failed to recover a dead worker's chunk"); failed++;
+  }
+}
+
+(async () => {
+  await poolTest();
+  if (failed) {
+    console.error("FAILED", failed);
+    process.exit(1);
+  }
+  {
+  const builder = require("./build-hook.js");
+  const generated = fs.readFileSync(path.join(root, "src/page-hook.js"), "utf8")
+    .replace(/ \* Generated: .*\n/, " * Generated: <normalized>\n");
+  if (generated !== builder.build().source) {
+    console.error("FAIL src/page-hook.js matches its sources (no generated-file drift) — run: node tools/build-hook.js (edit src/lib/quotex.js or tools/page-hook.shell.js, never the generated file)");
+    process.exitCode = 1;
+  } else {
+    console.log("ok   src/page-hook.js matches its sources (no generated-file drift)");
+  }
 }
 console.log("OK — structure + engine + backtest checks passed");
+})();

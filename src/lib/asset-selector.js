@@ -104,13 +104,17 @@
     const payoutFactor = 1 + payout / 100;
     const expectedValue = winProb * payoutFactor - 1;
 
-    // 4. Market / Volatility Quality
+    // 4. Market / Volatility Quality — one plain confluence pass (the old
+    //    auto_adaptive call here ran ~12 full analyses per asset, 12x the
+    //    cost, and inherited adaptive routing quirks into ranking).
     let regimeQuality = 70;
     let activeSignal = null;
+    let hasLiveCandles = false;
 
     if (candlesMap && Array.isArray(candlesMap[asset.id]) && candlesMap[asset.id].length >= 40 && ENG) {
+      hasLiveCandles = true;
       const candles = candlesMap[asset.id];
-      const sig = ENG.analyze(candles, { strategy: "auto_adaptive", lean: false });
+      const sig = ENG.analyze(candles, { strategy: "confluence" });
       if (sig && sig.ready) {
         activeSignal = sig;
         if (sig.direction === "CALL" || sig.direction === "PUT") regimeQuality += 15;
@@ -118,6 +122,15 @@
         else if (sig.regime === "choppy") regimeQuality -= 15;
       }
     }
+
+    // v2.6.8: evidence accounting. A fabricated prior must never outrank a
+    // measured asset, and an asset with zero evidence must never be
+    // "recommended" — that was fake confidence ranking unknown pairs above
+    // proven ones.
+    const dataConfidence = Math.max(0, Math.min(1,
+      Math.min(1, totalTrades / 20) * 0.6 + (matrixWinrate !== null ? 0.25 : 0) + (hasLiveCandles ? 0.15 : 0)
+    ));
+    const hasEvidence = totalTrades >= 3 || matrixWinrate !== null || (hasLiveCandles && activeSignal !== null);
 
     // 5. Accuracy Score (0..100)
     const evScore = Math.max(0, Math.min(100, (expectedValue + 0.2) * 150));
@@ -144,9 +157,11 @@
       expectedValuePct: Math.round(expectedValue * 1000) / 10,
       accuracyScore,
       regimeQuality,
+      dataConfidence: Math.round(dataConfidence * 100) / 100,
+      hasEvidence,
       recommendedStrategy: recommendedStrat,
       recommendedStrategyLabel: recommendedStratLabel,
-      recommended: accuracyScore >= 60 && payout >= 65 && expectedValue > 0,
+      recommended: hasEvidence && accuracyScore >= 60 && payout >= 65 && expectedValue > 0,
       currentSignal: activeSignal,
     };
   }
@@ -177,6 +192,11 @@
     }
 
     evaluated.sort((x, y) => {
+      // v2.6.8: evidence tier first — a measured asset always outranks a
+      // prior-only asset, even when the prior's fabricated score is higher.
+      const tx = x.hasEvidence ? 1 : 0, ty = y.hasEvidence ? 1 : 0;
+      if (ty !== tx) return ty - tx;
+      if (tx && ty && y.dataConfidence !== x.dataConfidence) return y.dataConfidence - x.dataConfidence;
       if (y.accuracyScore !== x.accuracyScore) return y.accuracyScore - x.accuracyScore;
       return y.expectedValue - x.expectedValue;
     });
@@ -202,6 +222,11 @@
    * Returns the single best high-accuracy asset.
    */
   function getBestAsset(opts) {
+    opts = opts || {};
+    // v2.6.8: closed markets cannot be traded — exclude them unless the
+    // caller explicitly asks otherwise. The old code could return a closed
+    // asset and auto-trade would then fail every placement on it.
+    if (opts.includeClosed !== true) opts = Object.assign({}, opts, { openOnly: true });
     const ranked = rankAssets(opts);
     return ranked.length ? ranked[0] : null;
   }

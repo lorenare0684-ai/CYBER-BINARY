@@ -135,11 +135,38 @@ function hookTests() {
   };
 
   const seriesB = { setMarkers: () => { throw new Error("setMarkers unsupported"); } };
-  const chartB = { timeScale: () => ({}), series: () => [seriesB], addCandlestickSeries: () => seriesB };
+  // Overlay-mode chart: v4-style marker calls fail and the module must fall
+  // back to the overlay canvas, re-projecting on visible-range changes.
+  let rangeChangeCb = null;
+  let overlayClears = 0;
+  const chartB = {
+    timeScale: () => ({ subscribeVisibleLogicalRangeChange: (cb) => { rangeChangeCb = cb; } }),
+    series: () => [seriesB],
+    addCandlestickSeries: () => seriesB,
+  };
+
+  // v5 chart: series has NO setMarkers; markers come from
+  // LightweightCharts.createSeriesMarkers(series, markers) plugins.
+  const pluginCalls = [];
+  let pluginTarget = null;
+  const plugin = { setMarkers(list) { pluginCalls.push(JSON.parse(JSON.stringify(list))); } };
+  const seriesV5a = { setData() {}, update() {}, seriesType: () => "Candlestick" };
+  const seriesV5b = { setData() {}, update() {}, seriesType: () => "Candlestick" };
+  const lineSeriesV5 = { setData() {}, update() {}, seriesType: () => "Line" };
+  let v5CandleCalls = 0;
+  const chartV5 = {
+    timeScale: () => ({}),
+    series: () => [seriesV5a],
+    addSeries(def) {
+      return def && String(def.type && def.type()) === "Candlestick"
+        ? (++v5CandleCalls === 1 ? seriesV5a : seriesV5b)
+        : lineSeriesV5;
+    },
+  };
 
   // ---- DOM stubs ----
   const ctxStub = {
-    setTransform() {}, clearRect() {}, beginPath() {}, moveTo() {}, lineTo() {},
+    setTransform() {}, clearRect() { overlayClears++; }, beginPath() {}, moveTo() {}, lineTo() {},
     closePath() {}, fill() {}, fillRect() {},
   };
   function makeEl(tag) {
@@ -158,6 +185,7 @@ function hookTests() {
   const body = makeEl("body");
   let created = [];
   const intervalFns = [];
+  const timerFns = [];
   let msgListener = null;
   const posted = [];
 
@@ -188,7 +216,7 @@ function hookTests() {
     addEventListener: () => {},
     setInterval: (fn) => { intervalFns.push(fn); return intervalFns.length; },
     clearInterval: () => {},
-    setTimeout: () => 0,
+    setTimeout: (fn) => { timerFns.push(fn); return timerFns.length; },
     devicePixelRatio: 1,
     WebSocket: function () {},
     document: {
@@ -249,6 +277,48 @@ function hookTests() {
   msgListener({ source: sandbox.window, data: { source: "CYBER_BINARY_CONTENT", kind: "markers", payload: { asset: "EURUSD_otc", markers: [{ time: t0, price: 1.085, dir: "CALL" }], bars: [] } } });
   check("setMarkers failure falls back to overlay mode", HK.mode() === "overlay", HK.mode());
   check("overlay canvas element created", created.some((el) => el.tagName === "canvas"));
+
+  // 2b) overlay arrows must re-project when the chart's visible range moves
+  // (scroll / zoom / new bars) instead of freezing at stale pixels.
+  check("overlay subscribes to visible-range changes", typeof rangeChangeCb === "function");
+  overlayClears = 0;
+  rangeChangeCb();
+  const redrawTimer = timerFns[timerFns.length - 1];
+  check("range change schedules an overlay redraw", typeof redrawTimer === "function");
+  if (typeof redrawTimer === "function") redrawTimer();
+  check("overlay redraw repaints the canvas", overlayClears >= 1, "clears=" + overlayClears);
+
+  // 2c) v5 chart: series.setMarkers does not exist; markers must render
+  // natively through a createSeriesMarkers() plugin glued to the price
+  // series, not through the approximate overlay.
+  sandbox.window.LightweightCharts = {
+    createChart: () => chartV5,
+    createSeriesMarkers: (s) => { pluginTarget = s; return plugin; },
+  };
+  const madeV5 = sandbox.window.LightweightCharts.createChart({});
+  // page adds its candlestick through the v5 addSeries(SeriesDefinition) API
+  const firstCandle = madeV5.addSeries({ type: () => "Candlestick" }, {});
+  check("v5 addSeries(Candlestick) captured as the price series", firstCandle === seriesV5a);
+  // a moving average must NOT steal the marker target
+  madeV5.addSeries({ type: () => "Line" }, {});
+  msgListener({ source: sandbox.window, data: { source: "CYBER_BINARY_CONTENT", kind: "markers", payload: {
+    asset: "EURUSD_otc",
+    markers: [{ time: t0, price: 1.085, dir: "PUT" }, { time: t0 + 60000, price: 1.086, dir: "CALL" }],
+    bars: [],
+  } } });
+  check("v5 renders natively via createSeriesMarkers plugin", HK.mode() === "native" && pluginCalls.length >= 1, HK.mode() + " calls=" + pluginCalls.length);
+  check("v5 plugin targets the candlestick series", pluginTarget === seriesV5a);
+  const pluginList = pluginCalls[pluginCalls.length - 1];
+  check("v5 plugin receives timeframe-aligned native list",
+    pluginList.length === 2 && pluginList[0].time === Math.floor(Math.floor(t0 / 1000) / 60) * 60 &&
+    pluginList[0].shape === "arrowDown" && pluginList[1].shape === "arrowUp",
+    JSON.stringify(pluginList));
+  // asset/timeframe switch: page re-creates the candlestick series → the
+  // plugin must be re-created for the new series (the old one died with it).
+  pluginTarget = null;
+  madeV5.addSeries({ type: () => "Candlestick" }, {});
+  check("v5 re-created price series becomes the marker target", pluginTarget === seriesV5b, String(pluginTarget === seriesV5b));
+  check("v5 native mode survives series switch", HK.mode() === "native", HK.mode());
 
   // 3) fiber-discovered chart (chartA) renders natively + idempotently
   const hk2 = (function loadSecondHook() {
@@ -345,6 +415,121 @@ function hookTests() {
   })();
   void hk2;
 }
+
+
+// ---------- Part 4: floating-arrow regressions (v2.6.14) ----------
+// The live bug: on builds where the chart API is never captured, the overlay
+// drew APPROXIMATE arrows (all cached bars spread across the viewport) and
+// nothing re-projected on pan/zoom → arrows floated on screen. Rules now:
+//   - no chart API → arrows are NOT drawn (a floating arrow is a false visual)
+//   - chart captured → exact overlay projection draws and tracks
+//   - discovery keeps scanning forever (lazy-mounted charts)
+//   - the range watcher re-binds after a chart switch
+function floatingArrowTests() {
+  const vm = require("vm");
+  let fills = 0, clears = 0;
+  const ctx2 = {
+    setTransform() {}, clearRect() { clears++; }, beginPath() {}, moveTo() {}, lineTo() {},
+    closePath() {}, fill() { fills++; }, fillRect() {},
+  };
+  function el(tag) {
+    return {
+      tagName: tag, style: {}, children: [], isConnected: true,
+      appendChild(c) { this.children.push(c); return c; }, remove() { this.isConnected = false; },
+      width: 0, height: 0,
+      getContext: tag === "canvas" ? () => ctx2 : undefined,
+      getBoundingClientRect: () => ({ width: 900, height: 450, left: 0, top: 0, right: 900, bottom: 450 }),
+    };
+  }
+  const bigCanvas = el("canvas");
+  const intervals = [];
+  let subCalls = 0;
+  let chartApi = null;
+  const t0 = 1717000000000;
+  const chartStub = () => ({
+    timeScale: () => ({
+      timeToCoordinate: () => 120,
+      subscribeVisibleLogicalRangeChange: () => { subCalls++; },
+    }),
+    addSeries: () => seriesStub(),
+    series: () => [],
+  });
+  const seriesStub = () => ({
+    setData: () => {}, update: () => {},
+    priceToCoordinate: () => 200,
+    setMarkers: () => { throw new Error("v5 removed setMarkers"); },
+  });
+  const sandbox = {
+    self: {}, console, Date,
+    location: { hostname: "qxbroker.com", pathname: "/trade", href: "x", host: "qxbroker.com" },
+    navigator: { userAgent: "node-test" },
+    postMessage: () => {}, addEventListener: () => {},
+    setInterval: (fn, ms) => { intervals.push({ fn, ms }); return intervals.length; },
+    clearInterval: () => {}, setTimeout: (fn) => (typeof fn === "function" ? (fn(), undefined) : 0),
+    devicePixelRatio: 1, WebSocket: function () {},
+    document: {
+      body: el("body"), documentElement: el("div"),
+      createElement: (t) => el(t),
+      querySelectorAll: (sel) => (String(sel) === "canvas" ? [bigCanvas] : []),
+      contains: () => true,
+    },
+  };
+  sandbox.globalThis = sandbox.self; sandbox.window = sandbox.self;
+  sandbox.window.addEventListener = sandbox.addEventListener;
+  vm.createContext(sandbox);
+  vm.runInContext(fs.readFileSync(path.join(root, "src/page-hook.js"), "utf8"), sandbox);
+  const HK = sandbox.window.__cyber && sandbox.window.__cyber.markers;
+  if (!HK || typeof HK.applyMarkers !== "function") { check("floating-arrow hook API", false); return; }
+
+  // bar times live on the period grid (the real feed normalizes them there);
+  // the marker anchor may be mid-minute and is bucketed onto the grid.
+  const barT = Math.floor(t0 / 60000) * 60000;
+  const bars = [
+    { time: barT, open: 1.084, high: 1.087, low: 1.083, close: 1.086 },
+    { time: barT + 60000, open: 1.086, high: 1.088, low: 1.085, close: 1.087 },
+  ];
+  const mk = [{ time: t0, price: 1.085, dir: "CALL" }];
+
+  // 1) no chart API anywhere → overlay mode, canvas cleared, ZERO arrows drawn
+  HK.applyMarkers({ asset: "EURUSD_otc", period: 60, markers: mk, bars });
+  check("no chart API → overlay mode", HK.mode() === "overlay", HK.mode());
+  check("no chart API → NO floating arrows drawn (fills=0)", fills === 0, "fills=" + fills);
+  check("no chart API → canvas still cleared (no stale frame)", clears >= 1, "clears=" + clears);
+
+  // 2) chart appears later → exact projection draws arrows (suppression is
+  //    chart-gated, not dead code)
+  chartApi = chartStub();
+  sandbox.window.LightweightCharts = { createChart: () => chartApi };
+  sandbox.window.LightweightCharts.createChart(bigCanvas);
+  check("late-mounted chart captured via global trap", HK.hasChart());
+  HK.applyMarkers({ asset: "EURUSD_otc", period: 60, markers: mk, bars });
+  check("chart captured → exact-overlay arrows drawn", fills >= 1, "fills=" + fills);
+  check("chart captured → range watcher bound", subCalls >= 1, "sub=" + subCalls);
+
+  // 3) chart switch → the watcher must re-bind to the NEW chart's timeScale
+  const before = subCalls;
+  const bigger = el("div");
+  bigger.getBoundingClientRect = () => ({ width: 1200, height: 600, left: 0, top: 0, right: 1200, bottom: 600 });
+  const chart2 = chartStub();
+  // a NEW library object creates a genuinely different chart (the old trap
+  // already wrapped the previous one); bigger container wins the swap
+  sandbox.window.LightweightCharts = { createChart: () => chart2 };
+  sandbox.window.LightweightCharts.createChart(bigger);
+  check("larger chart replaces the marker chart", HK.hasChart());
+  check("range watcher re-binds after chart switch", subCalls > before, subCalls + " vs " + before);
+
+  // 4) discovery persists: after the burst, a slow 10s lane is installed and
+  //    still finds charts (lazy SPA mounts)
+  const burst = intervals.find((i) => i.ms === 2000);
+  check("scan burst lane installed", !!burst);
+  for (let i = 0; i < 15; i++) burst.fn();
+  const slow = intervals.filter((i) => i.ms === 10000);
+  check("slow discovery lane installed after burst", slow.length >= 1, "lanes=" + slow.length);
+}
+
+storeTests();
+hookTests();
+floatingArrowTests();
 
 storeTests();
 hookTests();

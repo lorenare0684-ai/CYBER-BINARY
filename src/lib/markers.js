@@ -50,9 +50,18 @@
       var rawTime = m ? numberOrNull(m.time) : null;
       var price = m ? numberOrNull(m.price) : null;
       var key = m && typeof m.asset === "string" ? m.asset.trim() : "";
-      if (!m || !Number.isSafeInteger(rawTime) || rawTime < 0 ||
+      if (!m || !Number.isSafeInteger(rawTime) ||
+          // Candle epochs are millisecond timestamps from 2000-01-01 UTC
+          // (946684800000) through 2100 — the same floor content.js applies
+          // to broker candles. 0/negative/absurd epochs used to create
+          // markers pinned to 1970 at the chart's left edge.
+          rawTime < 946684800000 || rawTime > 4102444800000 ||
           (m.dir !== "CALL" && m.dir !== "PUT") || !Number.isFinite(price) ||
-          price <= 0 || price > 1e15 || !/^[A-Za-z0-9._-]{1,64}$/.test(key)) return false;
+          price <= 0 || price > 1e15 || !/^[A-Za-z0-9._-]{1,64}$/.test(key) ||
+          // The charset regex alone admits JS prototype names; they must
+          // never become map keys even on null-prototype objects.
+          key.toLowerCase() === "__proto__" || key.toLowerCase() === "prototype" ||
+          key.toLowerCase() === "constructor") return false;
       var list = byAsset[key];
       if (!list) {
         if (assetCount >= 512) return false;
@@ -164,7 +173,11 @@
       if (rawTime == null) continue;
       while (Math.abs(rawTime) >= 1e14) rawTime /= 1000;
       var sec = Math.floor(Math.abs(rawTime) >= 1e11 ? rawTime / 1000 : rawTime);
-      if (!Number.isSafeInteger(sec) || sec < 0 || (m.dir !== "CALL" && m.dir !== "PUT")) continue;
+      // Post-normalization epoch sanity: candles live between 2000-01-01
+      // and 2100. Anything else (0, pre-2000, absurd futures) is garbage
+      // that used to render as a 1970-pinned arrow.
+      if (!Number.isSafeInteger(sec) || sec < 946684800 || sec > 4102444800 ||
+          (m.dir !== "CALL" && m.dir !== "PUT")) continue;
       var dir = m.dir;
       byTime[sec] = {
         time: sec,

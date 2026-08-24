@@ -68,6 +68,7 @@
       dayKey: new Date().toISOString().slice(0, 10),
       dailyPnl: 0,
       frozenAssets: Object.create(null), // assetId → unfreezeAt
+      account: { isDemo: null, balance: null, currency: null, at: 0 }, // v2.6.9 live/demo detection
       log: [],
     };
     const rawMax = numberValue(opts && opts.maxLog);
@@ -170,9 +171,28 @@
       safeCallback("onLog", { level, msg, at: Date.now() });
     }
 
+    /** v2.6.9: feed the controller the broker's account info (from balance
+     * events). isDemo true/false is authoritative; null means unknown and
+     * the account-mode gate stays closed for safety. */
+    function setAccountInfo(info) {
+      if (!info || typeof info !== "object") return;
+      const bal = numberValue(info.balance);
+      const isDemo = typeof info.isDemo === "boolean" ? info.isDemo : null;
+      const currency = typeof info.currency === "string" && info.currency.trim()
+        ? info.currency.trim().slice(0, 16) : ctx.account.currency;
+      ctx.account = {
+        isDemo,
+        balance: bal != null && bal >= 0 && bal <= 1e15 ? bal : ctx.account.balance,
+        currency,
+        at: Date.now(),
+      };
+      emitState();
+    }
+
     function snapshot() {
       return {
         running: ctx.running,
+        account: Object.assign({}, ctx.account),
         armed: ctx.armed,
         mode: ctx.mode,
         tradesToday: ctx.tradesToday,
@@ -198,7 +218,7 @@
 
     async function canTrade(signal) {
       await hydratePromise;
-      const s = await loadSettings();
+      let s = await loadSettings();
       if (!s) return { ok: false, reason: "Settings not loaded" };
       if (!ctx.armed) return { ok: false, reason: "Auto not armed" };
       if (ctx.mode === "off") return { ok: false, reason: "Mode off" };
@@ -229,6 +249,29 @@
       }
       if (s.dailyProfitCap && s.dailyProfitCap > 0 && ctx.dailyPnl >= s.dailyProfitCap) {
         return { ok: false, reason: `Daily profit cap reached` };
+      }
+      // v2.6.9: account-mode gate. Default is "demo" — the safest posture:
+      // auto-trade refuses to touch a LIVE balance unless the user
+      // explicitly switched accountMode to "live"/"any", and refuses to
+      // guess when no balance event has identified the account yet.
+      const accountMode = s.accountMode === "live" || s.accountMode === "any" ? s.accountMode : "demo";
+      if (accountMode !== "any") {
+        if (ctx.account.isDemo == null) {
+          return { ok: false, reason: "Account mode unknown (no balance event yet) — set Account to Any to override" };
+        }
+        if (accountMode === "demo" && ctx.account.isDemo === false) {
+          return { ok: false, reason: "Demo-only mode: connected account is LIVE (switch Account to Live/Any to trade it)" };
+        }
+        if (accountMode === "live" && ctx.account.isDemo === true) {
+          return { ok: false, reason: "Live-only mode: connected account is DEMO" };
+        }
+      }
+      // v2.6.9: minimum-balance stop (0 disables). Only enforced when the
+      // balance is actually known.
+      const minBalance = numberValue(s.minBalance);
+      if (minBalance != null && minBalance > 0 && ctx.account.balance != null &&
+          ctx.account.balance < minBalance) {
+        return { ok: false, reason: `Balance below minimum (${ctx.account.balance.toFixed(2)} < ${minBalance})` };
       }
       const confidence = numberValue(signal.confidence);
       if (confidence == null || confidence < 0 || confidence > 100) {
@@ -273,6 +316,26 @@
         }
         delete ctx.frozenAssets[asset];
         persistSafety();
+      }
+      // v2.6.9: percent-of-balance staking. Replaces the fixed stake with a
+      // live balance slice when stakeMode is "percent" and the balance is
+      // known; clamped to [1, balance] so rounding can never exceed funds.
+      if (s.stakeMode === "percent") {
+        const pct = Math.max(0.1, Math.min(10, numberValue(s.stakePercent) || 1));
+        if (ctx.account.balance == null || !(ctx.account.balance > 0)) {
+          return { ok: false, reason: "Percent staking needs a detected balance (no balance event yet)" };
+        }
+        const raw = ctx.account.balance * pct / 100;
+        // v2.6.10: never let the minimum-stake floor exceed funds — a 0.50
+        // balance must be refused, not staked at 1.00.
+        if (raw < 1) {
+          return { ok: false, reason: `Balance too low for percent staking (${ctx.account.balance.toFixed(2)} at ${pct}% = ${raw.toFixed(2)}; minimum stake is 1)` };
+        }
+        // Clamp to the executor's stake ceiling so the controller never
+        // submits an order it already knows will be refused (percent mode on
+        // a huge balance would otherwise compute multi-billion stakes).
+        const computed = Math.min(ctx.account.balance, raw, 1000000);
+        s = Object.assign({}, s, { stake: Math.round(computed * 100) / 100 });
       }
       return { ok: true, settings: s };
     }
@@ -574,6 +637,7 @@
     hydratePromise.then(emitState).catch(() => {});
     return {
       handleSignal,
+      setAccountInfo,
       setMode,
       setArmed,
       stop,
