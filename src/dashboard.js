@@ -35,6 +35,7 @@
   let qxInstruments = [];
   let qxBalance = null;
   let qxOrders = [];
+  let lastOrderError = null;   // last broker-side order rejection {error, at}
   let pendingLiveState = null;
   let liveRenderQueued = false;
   let demoTimer = null;
@@ -54,6 +55,15 @@
     if (sec === 60) return "1m";
     if (sec % 60 === 0) return (sec / 60) + "m";
     return sec + "s";
+  }
+
+  /** Candle axis label. UTC by default — the broker chart is a UTC chart. */
+  function axisTimeLabel(time, utc) {
+    const d = new Date(Number(time));
+    if (!Number.isFinite(d.getTime())) return "";
+    const two = (n) => (n < 10 ? "0" + n : String(n));
+    if (utc !== false) return two(d.getUTCHours()) + ":" + two(d.getUTCMinutes());
+    return two(d.getHours()) + ":" + two(d.getMinutes());
   }
 
   function $(id) { return document.getElementById(id); }
@@ -383,10 +393,12 @@
     ctx.fillStyle = "rgba(255,255,255,0.45)";
     ctx.font = "9px system-ui, sans-serif";
     const labelEvery = Math.max(1, Math.floor(view.length / 6));
+    // The Quotex platform charts in UTC. Labelling the same epochs in the
+    // machine's local zone shifted every candle by the UTC offset, so the
+    // dashboard never lined up with the broker chart side by side.
+    const useUtc = o.timeBasis !== "local";
     for (let i = 0; i < view.length; i += labelEvery) {
-      const d = new Date(view[i].time);
-      const lbl = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-      ctx.fillText(lbl, xFor(i), priceH + 12);
+      ctx.fillText(axisTimeLabel(view[i].time, useUtc), xFor(i), priceH + 12);
     }
 
     if (useMacd && self.CYBER_TA) {
@@ -433,7 +445,9 @@
 
     ctx.fillStyle = "rgba(255,255,255,0.35)";
     ctx.font = "9px system-ui, sans-serif";
-    ctx.fillText("CYBER BINARY · " + (o.label || o.timeframe || "1m") + " · " + view.length + " bars", padL + 4, 12);
+    const newestLabel = view.length ? axisTimeLabel(view[view.length - 1].time, o.timeBasis !== "local") : "";
+    ctx.fillText("CYBER BINARY · " + (o.label || o.timeframe || "1m") + " · " + view.length + " bars" +
+      (newestLabel ? " · last " + newestLabel + " UTC" : ""), padL + 4, 12);
   }
 
   /* ---------- tab routing ---------- */
@@ -985,6 +999,15 @@
       cls += "warn"; label = "Quotex · fallback";
     } else {
       cls += "dim";
+    }
+    // A broker-side order rejection stays visible for 60s so the real reason
+    // is never hidden behind a generic "confirmation timeout" in the log.
+    if (lastOrderError && Date.now() - lastOrderError.at <= 60000) {
+      cls = "pill warn";
+      label = "Quotex · order rejected";
+      pill.title = lastOrderError.error;
+    } else {
+      pill.title = "";
     }
     pill.className = cls;
     pill.textContent = label;
@@ -1769,6 +1792,16 @@
           typeof msg.payload === "object" && !Array.isArray(msg.payload)) {
         qxOrders = mergeOrders([msg.payload].concat(qxOrders));
         if (activeTab === "instruments") refreshInstrumentsTab();
+      }
+      if (msg && msg.type === "CYBER_QUOTEX_TRADE_ERROR" && msg.payload &&
+          typeof msg.payload === "object" && !Array.isArray(msg.payload)) {
+        // The broker rejected an order the extension sent. Show the real
+        // reason instead of a generic confirmation timeout.
+        lastOrderError = {
+          error: String(msg.payload.error || "broker rejected the order").slice(0, 240),
+          at: Date.now(),
+        };
+        paintQuotexPill();
       }
     });
     chrome.runtime.sendMessage({ type: "CYBER_GET_STATE" }, (res) => {

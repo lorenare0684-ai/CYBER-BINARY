@@ -498,7 +498,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   // Forward platform events only from the primary tab.
   if (msg.type === "CYBER_QUOTEX_STATUS" || msg.type === "CYBER_QUOTEX_INSTRUMENTS" ||
-      msg.type === "CYBER_QUOTEX_BALANCE" || msg.type === "CYBER_QUOTEX_TRADE_RESULT") {
+      msg.type === "CYBER_QUOTEX_BALANCE" || msg.type === "CYBER_QUOTEX_TRADE_RESULT" ||
+      msg.type === "CYBER_QUOTEX_TRADE_ERROR") {
     isPrimarySender(sender).then((primary) => {
       if (!primary) {
         sendResponse({ ok: false, primary: false });

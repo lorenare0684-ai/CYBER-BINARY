@@ -4,6 +4,22 @@ Chrome extension (Manifest V3) that attaches to a Quotex / QX Broker chart, buil
 
 > Live signal analysis and explicitly armed automated execution for Quotex. This third-party tool can place real trades. Binary options are high risk, losses can quickly outweigh returns, and no result or profit is guaranteed.
 
+## What's new in v2.6.15 — Critical Fix: Broker Confirmation + Chart Alignment
+
+**The bugs (user-reported)**: every automated trade logged `ERROR Trade not confirmed: broker order confirmation timeout`, and the dashboard chart still did not match the Quotex candles.
+
+**Root cause 1 — the confirmation was never received.** `orders/open` was emitted as `42["orders/open",{…}]`, i.e. *without a Socket.IO callback id*, so the broker had no channel to answer on. The one frame that does answer — the ACK `43<ackId>[{order…}]` — was also mis-decoded: the decoder read the ACK body as an event name (`String({…})` → `"[object Object]"`) and dropped it as `unknown`. Result: `waitForBrokerOrder()` could only ever run out its 8s timer, even for orders that were live on the platform.
+
+**Root cause 2 — the dashboard drew a different series than the platform.** For 1m the chart was built purely from broker history batches, so it froze at the last response while Quotex kept drawing the forming candle. For 5m/15m the opposite happened: every resampled tick-built bucket *overwrote* the broker's own candle, so the whole series disagreed. And the time axis was labelled with `toLocaleTimeString()`, i.e. the machine's zone, while the Quotex chart is UTC — every candle looked shifted by the UTC offset.
+
+**The fixes**:
+- **ACK-correlated confirmation**: `placeTradeWs()` now sends `42<ackId>["orders/open",…]` and registers the ack id against the request; `decodeFrame()` returns a real ACK body for `43<ackId>[{…}]` (the headered `43["event",{…}]` variant still decodes as an event); the router attributes the ACK to the request that sent it and emits an `opened` order carrying **our** requestId. A minimal ACK (`{"id":…}`) still confirms, filled from the registered request.
+- **Real rejection reasons**: an error ACK is surfaced as `order_error` → the automation log shows the broker's own text ("Not enough funds") instead of a generic timeout, and the dashboard pill flags the rejection for 60s.
+- **Second confirmation source**: a strictly matching account order-open push (asset + direction + amount, 10s window) now confirms a WS placement too, for broker builds that never echo the client requestId. Both waiters are always released — a superseded waiter can never look "unsent" and trigger a duplicate DOM click.
+- **Chart = broker candles + live forming bar**: closed buckets are never rewritten; only the newest, still-open bucket follows the tick feed, on every timeframe (1m included). The axis is labelled UTC and the header states the basis and the newest candle time (`… · last 09:47 UTC`).
+
+Locked by 2 new suites — `tools/trade-confirm.js` (27 checks: ACK wire format, correlation, rejection text, un-correlated confirmation, fail-closed timeout, 1m/5m chart alignment) and `tools/dashboard-chart.js` (6 checks: real render path under TZ=Asia/Kolkata). Run against v2.6.14 they fail 19 and 2 checks respectively, including the exact reported symptoms. Full suite green (17 tools); baselines unchanged.
+
 ## What's new in v2.6.14 — Critical Fix: Floating Arrows on the Platform Chart
 
 **The bug (user-reported)**: on the Quotex site, signal arrows were not attached to candles — they stayed frozen in place while the chart was panned/zoomed, "floating on screen".
@@ -269,6 +285,8 @@ node tools/adaptive-test.js          # auto-adaptive strategy & high-accuracy as
 node tools/backtest.js              # legacy single-asset backtest
 node tools/historic.js              # full matrix across 170+ assets × strategies
 node tools/search.js                # bounded parameter grid search
+node tools/trade-confirm.js         # broker ACK confirmation + chart alignment
+node tools/dashboard-chart.js       # dashboard chart renders the broker's UTC candles
 ```
 
 ## Project layout
@@ -292,6 +310,8 @@ src/lib/workers.js       # parallel backtest (Node worker_threads, browser chunk
 src/lib/quotex.js        # Socket.IO v3 adapter, asset catalog, placeTrade
 icons/
 tools/adaptive-test.js   # v2.6: test suite for adaptive strategies & assets
+tools/trade-confirm.js   # v2.6.15: orders/open ACK correlation + chart series
+tools/dashboard-chart.js # v2.6.15: chart axis/basis under a non-UTC machine zone
 ```
 
 **Live-trading notice.** This is a third-party Quotex signal and automation client. Explicitly armed click mode can place real orders. Binary options have a built-in payout edge against the trader (most brokers require more than 50% wins to break even), so no signal, backtest, or automation result is a profit guarantee. Automation remains off and disarmed by default.
