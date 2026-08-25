@@ -572,3 +572,17 @@ body::before {
   .history li { grid-template-columns: 48px 1fr; }
   .history li > span:last-child { grid-column: 2; }
 }
+
+/* Backtest v2.9 improved */
+.bt-subtabs { margin: 10px 0; }
+.bt-subtabs .ghost-btn.active {
+  background: linear-gradient(135deg, rgba(0,229,255,0.22), rgba(255,45,247,0.18));
+  color: #e8eefc;
+  border-color: rgba(127,245,255,0.3);
+}
+.bt-pane { animation: fadeIn 0.2s ease; }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+.table.tight th, .table.tight td { padding: 5px 7px; font-size: 11px; }
+#bt-heatmap table { min-width: 600px; }
+#bt-heatmap td { text-align: center; min-width: 60px; }
+#bt-trades-table { font-variant-numeric: tabular-nums; }

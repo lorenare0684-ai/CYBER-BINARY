@@ -1556,56 +1556,164 @@
     });
   }
 
-  /* ---------- backtest tab ---------- */
-  function runBacktest() {
+  /* ---------- backtest tab (v2.9 improved) ---------- */
+  let btWalkResults = null;
+  let btMonteResults = null;
+  let btAllTrades = [];
+
+  function drawEquityWithDrawdown(canvas, equity) {
+    if (!canvas) return;
+    const parent = canvas.parentElement;
+    const w = Math.max(180, Math.min(4096, (parent && parent.clientWidth) || window.innerWidth || 800));
+    const priceH = Math.max(120, Math.round(w * 0.26));
+    const ddH = Math.max(40, Math.round(w * 0.08));
+    const timeAxisH = 18;
+    const h = priceH + ddH + timeAxisH + 12;
+    const dpr = Math.max(1, Math.min(2, Number(window.devicePixelRatio) || 1));
+    canvas.width = Math.floor(w * dpr);
+    canvas.height = Math.floor(h * dpr);
+    canvas.style.width = w + "px";
+    canvas.style.height = h + "px";
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    ctx.fillStyle = "#0c1422";
+    ctx.fillRect(0, 0, w, h);
+    if (!Array.isArray(equity) || equity.length < 2) {
+      ctx.fillStyle = "rgba(255,255,255,0.45)";
+      ctx.font = "11px system-ui, sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText("No equity data — run backtest first", w/2, h/2);
+      return;
+    }
+    const eq = equity.filter(e => e && Number.isFinite(e.equity));
+    if (eq.length < 2) return;
+    let lo = Infinity, hi = -Infinity, maxDD = 0;
+    for (const e of eq) {
+      if (e.equity < lo) lo = e.equity;
+      if (e.equity > hi) hi = e.equity;
+      if (Number.isFinite(e.drawdown) && e.drawdown > maxDD) maxDD = e.drawdown;
+    }
+    const pad = (hi - lo) * 0.1 || 1;
+    lo -= pad; hi += pad;
+    if (maxDD < 0.1) maxDD = 1;
+    const yEq = (v) => priceH - ((v - lo) / (hi - lo)) * (priceH - 16) - 8;
+    const yDD = (v) => priceH + 8 + ddH - (v / maxDD) * (ddH - 8) - 4;
+    const xFor = (i) => 8 + (i / (eq.length - 1)) * (w - 16);
+
+    // Zero line
+    const zeroY = yEq(0);
+    ctx.strokeStyle = "rgba(255,255,255,0.08)";
+    ctx.beginPath(); ctx.moveTo(0, zeroY); ctx.lineTo(w, zeroY); ctx.stroke();
+
+    // Equity line
+    ctx.strokeStyle = "#4aa3ff";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    for (let i = 0; i < eq.length; i++) {
+      const x = xFor(i), y = yEq(eq[i].equity);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+    const grad = ctx.createLinearGradient(0, 0, 0, priceH);
+    grad.addColorStop(0, "rgba(74,163,255,0.3)");
+    grad.addColorStop(1, "rgba(74,163,255,0)");
+    ctx.fillStyle = grad;
+    ctx.lineTo(w - 8, priceH - 8);
+    ctx.lineTo(8, priceH - 8);
+    ctx.closePath();
+    ctx.fill();
+
+    // Drawdown area (red)
+    ctx.fillStyle = "rgba(255,93,122,0.25)";
+    ctx.beginPath();
+    ctx.moveTo(xFor(0), yDD(0));
+    for (let i = 0; i < eq.length; i++) {
+      ctx.lineTo(xFor(i), yDD(eq[i].drawdown || 0));
+    }
+    ctx.lineTo(xFor(eq.length-1), yDD(0));
+    ctx.closePath();
+    ctx.fill();
+    ctx.strokeStyle = "rgba(255,93,122,0.6)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let i = 0; i < eq.length; i++) {
+      const x = xFor(i), y = yDD(eq[i].drawdown || 0);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    ctx.fillStyle = "rgba(255,255,255,0.5)";
+    ctx.font = "9px system-ui, sans-serif";
+    ctx.textAlign = "left";
+    ctx.fillText("Equity · " + eq.length + " pts · P&L " + eq[eq.length-1].equity.toFixed(2) + " · MaxDD " + maxDD.toFixed(2), 8, 12);
+    ctx.fillText("Drawdown", 8, priceH + 16);
+  }
+
+  function runBacktest(isWalkForward) {
     const rawDays = Number($("bt-days").value);
     const rawHorizon = Number($("bt-horizon").value);
     const rawMinConf = Number($("bt-minconf").value);
-    const days = Number.isFinite(rawDays) ? Math.max(1, Math.min(31, Math.floor(rawDays))) : 7;
-    const horizon = Number.isFinite(rawHorizon) ? Math.max(1, Math.min(60, Math.floor(rawHorizon))) : 3;
+    const rawPayout = Number($("bt-payout") ? $("bt-payout").value : 85);
+    const days = Number.isFinite(rawDays) ? Math.max(1, Math.min(60, Math.floor(rawDays))) : 7;
+    const horizon = Number.isFinite(rawHorizon) ? Math.max(0.5, Math.min(60, rawHorizon)) : 3;
     const minConf = Number.isFinite(rawMinConf) ? Math.max(0, Math.min(100, rawMinConf)) : 0;
+    const payoutPct = Number.isFinite(rawPayout) ? Math.max(0, Math.min(200, rawPayout)) : 85;
+    const payout = payoutPct / 100;
+    const useAdaptive = $("bt-adaptive") ? $("bt-adaptive").checked : false;
     const kind = $("bt-kinds").value;
     const kinds = kind === "all" ? null : [kind];
-    // The matrix runs across the WHOLE catalog (kind-filtered), not just the
-    // assets that happen to have a live candle cache. Cached broker candles
-    // are still preferred wherever they exist; every other asset is covered
-    // by the deterministic per-asset simulator, so a run always includes all
-    // assets and the per-asset table says which data each row used.
-    const o = { days, horizon, minConf, kinds, minBars: 50 };
 
-    const btn = $("bt-run");
+    // Build payout map from live instruments if available
+    const payoutByAsset = Object.create(null);
+    if (qxInstruments && qxInstruments.length) {
+      for (const it of qxInstruments) {
+        if (!it || !it.symbol || !it.id) continue;
+        const p = Number(it.payout);
+        if (Number.isFinite(p) && p > 0) {
+          const norm = p > 1 ? p / 100 : p;
+          payoutByAsset[it.id] = norm;
+          payoutByAsset[it.symbol] = norm;
+        }
+      }
+    }
+
+    const o = {
+      days, horizon, minConf, kinds, minBars: 50,
+      payout, payoutByAsset, useAdaptiveExpiry: useAdaptive,
+      adaptiveExpiryMin: settings && settings.adaptiveExpiryMin ? settings.adaptiveExpiryMin : 1,
+      adaptiveExpiryMax: settings && settings.adaptiveExpiryMax ? settings.adaptiveExpiryMax : 5,
+    };
+
+    const btn = isWalkForward ? $("bt-walk") : $("bt-run");
+    if (!btn) return;
     btn.disabled = true;
     const origLabel = btn.textContent;
     btn.textContent = "Loading Quotex candles…";
 
-    function tick(progress, total) {
+    function tick(progress) {
       const i = progress && typeof progress === "object" ? progress.i : progress;
-      const n = progress && typeof progress === "object" ? progress.total : total;
-      if (n) btn.textContent = "Running backtest " + i + " / " + n + "…";
+      const n = progress && typeof progress === "object" ? progress.total : 0;
+      if (n) btn.textContent = (isWalkForward ? "Walk-Forward " : "Backtest ") + i + " / " + n + "…";
     }
 
     const assetPool = ASSETS.list().filter((a) => !kinds || kinds.some((kindName) =>
       typeof ASSETS.matchesKind === "function" ? ASSETS.matchesKind(a, kindName) : a.kind === kindName)).slice(0, 256);
-    const minNeeded = Math.max(40, 50 + horizon + 1);
-    let historyProbeError = "";
+    const minNeeded = Math.max(40, 50 + Math.ceil(horizon) + 1);
+
     const nudgeHistory = () => {
       if (!hasChrome) return Promise.resolve(true);
-      return chrome.runtime.sendMessage({ type: "CYBER_REQUEST_HISTORY", limit: 5000 })
+      return chrome.runtime.sendMessage({ type: "CYBER_REQUEST_HISTORY", limit: 5000, allTimeframes: true })
         .then((response) => {
-          if (!response || !response.ok) {
-            throw new Error((response && response.error) || "The selected Quotex tab could not request history.");
-          }
+          if (!response || !response.ok) throw new Error((response && response.error) || "history request failed");
           return true;
         });
     };
-    const seedProbe = nudgeHistory().catch((e) => {
-      historyProbeError = String((e && e.message) || e || "history request failed").slice(0, 256);
-      return false;
-    });
+    const seedProbe = nudgeHistory().catch(() => false);
 
     const readLiveRows = () => STORE.load().then((snapshot) => {
-      const storedByAsset = snapshot && snapshot.candles && typeof snapshot.candles === "object"
-        ? snapshot.candles : {};
+      const storedByAsset = snapshot && snapshot.candles && typeof snapshot.candles === "object" ? snapshot.candles : {};
       return assetPool.map((a) => {
         const stored = storedByAsset[a.id];
         const immediate = liveCandlesByAsset[a.id];
@@ -1619,22 +1727,13 @@
     })));
 
     const waitForLiveRows = async () => {
-      // Cached broker candles are preferred but never required: this probe
-      // just gives an open Quotex chart a few seconds to deliver fresh
-      // history before the run starts. Assets without a cache fall back to
-      // the simulator, so the wait must stay short.
       const deadline = Date.now() + 5000;
-      let nudged = false;
       let rows = await readLiveRows();
       while (!rows.some((row) => Array.isArray(row.bars) && row.bars.length >= minNeeded) && Date.now() < deadline) {
         const secondsLeft = Math.max(1, Math.ceil((deadline - Date.now()) / 1000));
         const bestBars = rows.reduce((m, r) => Math.max(m, Array.isArray(r.bars) ? r.bars.length : 0), 0);
-        btn.textContent = "Waiting for broker candles… " + bestBars + "/" + minNeeded + " (" + secondsLeft + "s)";
-        if (!nudged && (historyProbeError || bestBars < minNeeded) && deadline - Date.now() <= 3000) {
-          nudged = true;
-          nudgeHistory().catch(() => {});
-        }
-        await new Promise((resolve) => setTimeout(resolve, 500));
+        btn.textContent = "Waiting candles… " + bestBars + "/" + minNeeded + " (" + secondsLeft + "s)";
+        await new Promise((resolve) => setTimeout(resolve, 400));
         rows = await readLiveRows();
       }
       return rows;
@@ -1646,9 +1745,6 @@
         const bars = Array.isArray(row.bars) ? row.bars : [];
         if (bars.length >= minNeeded) cachedByAsset[row.asset.id] = bars;
       });
-      // Tag each asset's data source so the UI can show it honestly:
-      // "live" (cache covers the whole window), "live+sim" (cache padded by
-      // the simulator) or "sim" (no cache for this asset).
       const minutes = days * 24 * 60;
       btDataByAsset = Object.create(null);
       for (const a of assetPool) {
@@ -1660,8 +1756,7 @@
       o.cachedByAsset = cachedByAsset;
       o.onProgress = tick;
       const useWorkers = WORKERS && WORKERS.runBrowser;
-      return useWorkers
-        ? WORKERS.runBrowser(o)
+      return useWorkers ? WORKERS.runBrowser(o)
         : new Promise((resolve, reject) => setTimeout(() => {
           try { resolve(HIST.runMatrix(o)); } catch (e) { reject(e); }
         }, 30));
@@ -1669,18 +1764,20 @@
 
     loadLiveCache.then((r) => {
       btResults = r;
-      paintBacktest(r, o);
-      if (r && r.error) {
-        const body = $("bt-assets") && $("bt-assets").querySelector("tbody");
-        if (body) body.innerHTML = "<tr><td colspan='6'>" + esc(r.error) + "</td></tr>";
+      if (isWalkForward) {
+        // For walk-forward, we need to run WF per asset? We'll aggregate first asset's WF as demo
+        // Actually run walk-forward on combined series of best asset or first with live data
+        runWalkForwardAnalysis(o);
+      } else {
+        paintBacktest(r, o);
       }
     }).catch((e) => {
       const message = String(e && e.message || e || "Backtest failed");
-      const failure = { results: [], count: 0, liveOnly: true, error: message };
+      const failure = { results: [], count: 0, error: message };
       btResults = failure;
       paintBacktest(failure, o);
       const body = $("bt-assets") && $("bt-assets").querySelector("tbody");
-      if (body) body.innerHTML = "<tr><td colspan='6'>" + esc(message) + "</td></tr>";
+      if (body) body.innerHTML = "<tr><td colspan='8'>" + esc(message) + "</td></tr>";
       console.error(e);
     }).then(() => {
       btn.disabled = false;
@@ -1688,58 +1785,462 @@
     });
   }
 
+  function runWalkForwardAnalysis(opts) {
+    // Walk-forward on the active asset's live candles for detailed view
+    const active = ASSETS.get(activeAsset) || ASSETS.list()[0];
+    if (!active) return;
+    const cached = btDataByAsset && btDataByAsset[active.id] !== "sim" && liveCandlesByAsset[active.id] ? liveCandlesByAsset[active.id] : null;
+    let series = null;
+    if (HIST && HIST.getSeries) {
+      series = HIST.getSeries(active, { days: opts.days, cachedByAsset: opts.cachedByAsset });
+    }
+    if (!series || series.length < 400) {
+      // fallback to first asset with enough data
+      const pool = ASSETS.list();
+      for (const a of pool) {
+        if (liveCandlesByAsset[a.id] && liveCandlesByAsset[a.id].length >= 400) {
+          series = liveCandlesByAsset[a.id];
+          break;
+        }
+      }
+    }
+    if (!series || series.length < 400) {
+      const body = $("bt-walk-table") && $("bt-walk-table").querySelector("tbody");
+      if (body) body.innerHTML = "<tr><td colspan='8'>Need at least 400 candles for walk-forward — open Quotex to cache live data</td></tr>";
+      return;
+    }
+    try {
+      const wf = ENG.walkForward(series, {
+        strategy: activeStrategy || "auto_adaptive",
+        horizon: opts.horizon, minConf: opts.minConf, payout: opts.payout,
+        useAdaptiveExpiry: opts.useAdaptiveExpiry, folds: 5,
+      });
+      btWalkResults = wf;
+      paintWalkForward(wf);
+      activateBtTab("walk");
+    } catch (e) {
+      console.error("walkForward failed", e);
+    }
+  }
+
+  function runMonteCarloAnalysis() {
+    if (!btResults || !btResults.results || !btResults.results.length) {
+      alert("Run backtest first to generate trades for Monte Carlo");
+      return;
+    }
+    // Collect all trades from results
+    const allTrades = [];
+    for (const r of btResults.results) {
+      if (r.trades && Array.isArray(r.trades)) {
+        for (const t of r.trades) allTrades.push(t);
+      } else if (r.equity && r.equity.length) {
+        // synthesize from equity diff
+      }
+    }
+    // If no detailed trades, use aggregated pnl series
+    let tradesForMC = allTrades;
+    if (tradesForMC.length < 10) {
+      // Build from equity curve
+      const seq = [];
+      let prev = 0;
+      for (const r of btResults.results.slice(0, 50)) {
+        const pnl = Number(r.pnlWithPayout != null ? r.pnlWithPayout : r.pnl) || 0;
+        const t = Number(r.total) || 1;
+        const avg = t ? pnl / t : 0;
+        for (let i = 0; i < Math.min(t, 20); i++) seq.push({ pnlPayout: avg });
+      }
+      tradesForMC = seq;
+    }
+    if (tradesForMC.length < 10) {
+      alert("Not enough trades for Monte Carlo — need at least 10");
+      return;
+    }
+    try {
+      const mc = ENG.monteCarlo(tradesForMC, { sims: 1000 });
+      btMonteResults = mc;
+      paintMonteCarlo(mc);
+      activateBtTab("monte");
+    } catch (e) {
+      console.error("monteCarlo failed", e);
+    }
+  }
+
+  function paintWalkForward(wf) {
+    if (!wf || wf.error) {
+      const body = $("bt-walk-table") && $("bt-walk-table").querySelector("tbody");
+      if (body) body.innerHTML = "<tr><td colspan='8'>" + esc(wf && wf.error || "Walk-forward failed") + "</td></tr>";
+      return;
+    }
+    const body = $("bt-walk-table") && $("bt-walk-table").querySelector("tbody");
+    if (!body) return;
+    body.innerHTML = "";
+    for (const f of wf.folds) {
+      const tr = document.createElement("tr");
+      const testWR = f.test.winrate || 0;
+      const cls = testWR >= 55 ? "win" : testWR <= 45 ? "loss" : "";
+      tr.innerHTML = "<td>" + f.fold + "</td>" +
+        "<td>" + fmtPct(f.train.winrate) + "</td>" +
+        "<td>" + (Number(f.train.pnl)||0).toFixed(2) + "</td>" +
+        "<td class='" + cls + "'>" + fmtPct(f.test.winrate) + "</td>" +
+        "<td>" + (Number(f.test.pnl)||0).toFixed(2) + "</td>" +
+        "<td>" + (Number(f.test.profitFactor)||0).toFixed(2) + "</td>" +
+        "<td>" + (Number(f.test.expectedValue)||0).toFixed(1) + "%</td>" +
+        "<td>" + (Number(f.test.sharpe)||0).toFixed(2) + "</td>";
+      body.appendChild(tr);
+    }
+    if ($("bt-walk-wr")) $("bt-walk-wr").textContent = fmtPct(wf.combined.winrate);
+    if ($("bt-walk-pnl")) $("bt-walk-pnl").textContent = (wf.combined.pnl||0).toFixed(2);
+    if ($("bt-walk-avg")) $("bt-walk-avg").textContent = fmtPct(wf.combined.avgWinrate);
+    if ($("bt-walk-cons")) $("bt-walk-cons").textContent = fmtPct(wf.combined.consistency);
+  }
+
+  function paintMonteCarlo(mc) {
+    if (!mc || mc.error) return;
+    if ($("bt-monte-avg")) $("bt-monte-avg").textContent = (mc.avgPnL||0).toFixed(2);
+    if ($("bt-monte-median")) $("bt-monte-median").textContent = (mc.median && mc.median.finalPnL || 0).toFixed(2);
+    if ($("bt-monte-p5")) $("bt-monte-p5").textContent = (mc.p5 && mc.p5.finalPnL || 0).toFixed(2);
+    if ($("bt-monte-p95")) $("bt-monte-p95").textContent = (mc.p95 && mc.p95.finalPnL || 0).toFixed(2);
+    if ($("bt-monte-pos")) $("bt-monte-pos").textContent = fmtPct(mc.positiveRate);
+    if ($("bt-monte-dd")) $("bt-monte-dd").textContent = (mc.avgDD||0).toFixed(2);
+
+    // Draw distribution
+    const canvas = $("bt-monte-chart");
+    if (!canvas || !mc.results || !mc.results.length) return;
+    const w = Math.max(180, Math.min(4096, (canvas.parentElement && canvas.parentElement.clientWidth) || 800));
+    const h = Math.max(120, Math.round(w * 0.22));
+    const dpr = Math.max(1, Math.min(2, Number(window.devicePixelRatio)||1));
+    canvas.width = Math.floor(w * dpr);
+    canvas.height = Math.floor(h * dpr);
+    canvas.style.width = w + "px";
+    canvas.style.height = h + "px";
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0,0,w,h);
+    ctx.fillStyle = "#0c1422";
+    ctx.fillRect(0,0,w,h);
+    const vals = mc.results.map(r=>r.finalPnL).sort((a,b)=>a-b);
+    const lo = vals[0], hi = vals[vals.length-1];
+    const range = hi - lo || 1;
+    // Histogram
+    const bins = 40;
+    const counts = new Array(bins).fill(0);
+    for (const v of vals) {
+      const idx = Math.min(bins-1, Math.max(0, Math.floor((v - lo)/range * bins)));
+      counts[idx]++;
+    }
+    const maxC = Math.max(...counts) || 1;
+    const padL = 40, padR = 10, padT = 10, padB = 20;
+    const plotW = w - padL - padR, plotH = h - padT - padB;
+    ctx.fillStyle = "rgba(74,163,255,0.6)";
+    for (let i = 0; i < bins; i++) {
+      const x = padL + (i / bins) * plotW;
+      const bw = plotW / bins * 0.8;
+      const bh = (counts[i] / maxC) * plotH;
+      ctx.fillRect(x, padT + plotH - bh, bw, bh);
+    }
+    ctx.fillStyle = "rgba(255,255,255,0.5)";
+    ctx.font = "9px system-ui, sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText(lo.toFixed(1), padL, h - 2);
+    ctx.fillText(hi.toFixed(1), padL + plotW, h - 2);
+    ctx.textAlign = "left";
+    ctx.fillText("P&L distribution (" + mc.simulations + " sims)", 8, 12);
+  }
+
+  function activateBtTab(name) {
+    const panes = document.querySelectorAll(".bt-pane");
+    panes.forEach(p => {
+      p.style.display = p.dataset.btPane === name ? "block" : "none";
+      p.classList.toggle("active", p.dataset.btPane === name);
+    });
+    const tabs = document.querySelectorAll("[data-bt-tab]");
+    tabs.forEach(t => t.classList.toggle("active", t.dataset.btTab === name));
+  }
+
   function paintBacktest(matrix, opts) {
     matrix = matrix && Array.isArray(matrix.results) ? matrix : { results: [] };
     const sum = HIST.summarize(matrix) || {
-      trades: 0, winrate: 0, pnl: 0, byStrategy: {}, byKind: {},
+      trades: 0, winrate: 0, pnl: 0, pnlWithPayout: 0, expectedValue: 0,
+      byStrategy: {}, byKind: {}, byRegime: {},
     };
     $("bt-trades").textContent = String(sum.trades || 0);
     $("bt-winrate").textContent = fmtPct(sum && sum.winrate);
-    $("bt-pnl").textContent = String(sum && sum.pnl || 0);
+    if ($("bt-ev")) $("bt-ev").textContent = sum.expectedValue != null ? sum.expectedValue.toFixed(1) + "%" : "—";
+    $("bt-pnl").textContent = sum.pnlWithPayout != null ? sum.pnlWithPayout.toFixed(2) : (sum.pnl != null ? String(sum.pnl) : "—");
+    if ($("bt-pf")) $("bt-pf").textContent = sum.avgProfitFactor != null ? sum.avgProfitFactor.toFixed(2) : "—";
     const maxDrawdown = finite(sum && sum.maxDrawdown, null);
     $("bt-dd").textContent = maxDrawdown == null ? "—" : maxDrawdown.toFixed(2);
+    if ($("bt-sharpe")) $("bt-sharpe").textContent = sum.avgSharpe != null ? sum.avgSharpe.toFixed(2) : "—";
+    if ($("bt-recovery")) {
+      const rec = sum.trades ? (sum.pnlWithPayout || sum.pnl || 0) / (maxDrawdown || 1) : 0;
+      $("bt-recovery").textContent = Number.isFinite(rec) ? rec.toFixed(2) : "—";
+    }
+    if ($("bt-kelly")) {
+      const wr = sum.winrate || 0;
+      const p = wr / 100, q = 1 - p, b = (opts && opts.payout) || 0.85;
+      const kelly = b > 0 ? (p - q / b) * 100 : 0;
+      $("bt-kelly").textContent = kelly.toFixed(1) + "%";
+    }
+    if ($("bt-exposure")) {
+      // exposure from avg of results
+      const totalBars = opts.days * 24 * 60;
+      const exp = totalBars ? (sum.trades / (totalBars * (sum.assets || 1))) * 100 : 0;
+      $("bt-exposure").textContent = exp.toFixed(1) + "%";
+    }
 
+    // Equity curve: aggregate all trades sorted by time if available, else by results order
+    let allEquity = [];
     let running = 0;
-    const seq = [{ equity: 0 }];
-    for (const r of matrix.results.slice(0, 2000)) {
-      running += finite(r && r.pnl, 0);
-      seq.push({ equity: running });
-    }
-    lastBtEquity = matrix.error ? null : seq;
-    drawChart($("bt-equity"), matrix.error ? [] : seq, {
-      equity: true,
-      equityLabel: "runs",
-      emptyMessage: matrix.error ? "No genuine Quotex history received — see status below." : undefined,
-    });
-
-    const stBody = $("bt-strategies").querySelector("tbody");
-    stBody.innerHTML = "";
-    for (const k of Object.keys(sum.byStrategy).sort((a, b) => sum.byStrategy[b].winrate - sum.byStrategy[a].winrate)) {
-      const v = sum.byStrategy[k];
-      const tr = document.createElement("tr");
-      tr.innerHTML = "<td>" + esc(k) + "</td><td>" + finite(v.total, 0) + "</td><td class='win'>" + finite(v.wins, 0) + "</td><td class='loss'>" + finite(v.losses, 0) + "</td><td>" + finite(v.winrate, 0).toFixed(1) + "%</td>";
-      stBody.appendChild(tr);
-    }
-
-    const aBody = $("bt-assets").querySelector("tbody");
-    aBody.innerHTML = "";
-    const perAsset = {};
+    const allTradesFlat = [];
     for (const r of matrix.results) {
-      if (!perAsset[r.asset]) perAsset[r.asset] = { wins: 0, losses: 0, pnl: 0, dd: 0, name: r.name };
-      perAsset[r.asset].wins += r.wins;
-      perAsset[r.asset].losses += r.losses;
-      perAsset[r.asset].pnl += r.pnl;
-      if (r.maxDrawdown > perAsset[r.asset].dd) perAsset[r.asset].dd = r.maxDrawdown;
+      if (r.equity && r.equity.length) {
+        // equity already has pnlWithPayout progression per result, but we need combined
+      }
+      if (r.trades && Array.isArray(r.trades)) {
+        for (const t of r.trades) allTradesFlat.push(t);
+      }
     }
-    const sourceLabel = { live: "Live", "live+sim": "Live+Sim", sim: "Sim" };
-    for (const k of Object.keys(perAsset).sort((a, b) => perAsset[b].pnl - perAsset[a].pnl)) {
-      const v = perAsset[k];
-      const t = v.wins + v.losses;
-      const wr = t ? (v.wins / t) * 100 : 0;
-      const source = btDataByAsset && btDataByAsset[k] ? sourceLabel[btDataByAsset[k]] || "Sim" : "—";
-      const tr = document.createElement("tr");
-      tr.innerHTML = "<td>" + esc(v.name || k) + "</td><td>" + t + "</td><td class='" + (wr >= 55 ? "win" : wr <= 45 ? "loss" : "") + "'>" + wr.toFixed(1) + "%</td><td>" + finite(v.pnl, 0) + "</td><td>" + finite(v.dd, 0) + "</td><td>" + source + "</td>";
-      aBody.appendChild(tr);
+    // Sort trades by entryTime if available
+    allTradesFlat.sort((a,b) => (a.entryTime||0) - (b.entryTime||0));
+    btAllTrades = allTradesFlat.slice(-500);
+    let eqPeak = -Infinity;
+    for (let i = 0; i < allTradesFlat.length; i++) {
+      const t = allTradesFlat[i];
+      running += Number(t.pnlPayout != null ? t.pnlPayout : t.pnl) || 0;
+      if (running > eqPeak) eqPeak = running;
+      allEquity.push({ equity: running, drawdown: eqPeak - running, time: t.entryTime, i });
+    }
+    if (allEquity.length < 2) {
+      // fallback to per-result pnl aggregation
+      running = 0;
+      allEquity = [{ equity: 0, drawdown: 0 }];
+      for (const r of matrix.results.slice(0, 2000)) {
+        running += finite(r && (r.pnlWithPayout != null ? r.pnlWithPayout : r.pnl), 0);
+        const dd = allEquity.length ? Math.max(0, allEquity[allEquity.length-1].equity - running) : 0;
+        allEquity.push({ equity: running, drawdown: 0 });
+      }
+    }
+    lastBtEquity = matrix.error ? null : allEquity;
+    if (matrix.error) {
+      drawChart($("bt-equity"), [], { emptyMessage: "No genuine Quotex history — see status below." });
+    } else {
+      drawEquityWithDrawdown($("bt-equity"), allEquity);
+    }
+
+    // Per-strategy sorted by EV
+    const stBody = $("bt-strategies") ? $("bt-strategies").querySelector("tbody") : null;
+    if (stBody) {
+      stBody.innerHTML = "";
+      const sortedStrat = Object.keys(sum.byStrategy).sort((a,b) => {
+        const av = sum.byStrategy[a], bv = sum.byStrategy[b];
+        const aEV = av.pnl != null ? av.pnl : av.winrate;
+        const bEV = bv.pnl != null ? bv.pnl : bv.winrate;
+        return bEV - aEV;
+      });
+      for (const k of sortedStrat) {
+        const v = sum.byStrategy[k];
+        const ev = v.total ? (v.winrate/100 * (opts.payout||0.85) - (1-v.winrate/100))*100 : 0;
+        const pf = v.wins && v.losses ? (v.wins * (opts.payout||0.85)) / v.losses : (v.wins ? 99 : 0);
+        const tr = document.createElement("tr");
+        tr.innerHTML = "<td>" + esc(k) + "</td>" +
+          "<td>" + finite(v.total,0) + "</td>" +
+          "<td class='" + (v.winrate>=55?"win":v.winrate<=45?"loss":"") + "'>" + finite(v.winrate,0).toFixed(1) + "%</td>" +
+          "<td class='" + (ev>0?"win":"loss") + "'>" + ev.toFixed(1) + "%</td>" +
+          "<td>" + (Number.isFinite(pf)?pf.toFixed(2):"—") + "</td>" +
+          "<td>—</td>" +
+          "<td>" + finite(v.pnl,0).toFixed(2) + "</td>";
+        stBody.appendChild(tr);
+      }
+    }
+
+    // Per-asset
+    const aBody = $("bt-assets") ? $("bt-assets").querySelector("tbody") : null;
+    if (aBody) {
+      aBody.innerHTML = "";
+      const perAsset = {};
+      for (const r of matrix.results) {
+        if (!perAsset[r.asset]) perAsset[r.asset] = { wins: 0, losses: 0, pnl: 0, pnlPayout: 0, dd: 0, name: r.name, pf: 0, ev: 0 };
+        perAsset[r.asset].wins += r.wins;
+        perAsset[r.asset].losses += r.losses;
+        perAsset[r.asset].pnl += Number(r.pnl)||0;
+        perAsset[r.asset].pnlPayout += Number(r.pnlWithPayout != null ? r.pnlWithPayout : r.pnl)||0;
+        if (r.maxDrawdown > perAsset[r.asset].dd) perAsset[r.asset].dd = r.maxDrawdown;
+        if (r.profitFactor) perAsset[r.asset].pf = r.profitFactor;
+        if (r.expectedValue) perAsset[r.asset].ev = r.expectedValue;
+      }
+      const sourceLabel = { live: "Live", "live+sim": "Live+Sim", sim: "Sim" };
+      const sortedAssets = Object.keys(perAsset).sort((a,b) => perAsset[b].pnlPayout - perAsset[a].pnlPayout);
+      for (const k of sortedAssets.slice(0, 100)) {
+        const v = perAsset[k];
+        const t = v.wins + v.losses;
+        const wr = t ? (v.wins / t) * 100 : 0;
+        const ev = t ? (wr/100 * (opts.payout||0.85) - (1-wr/100))*100 : 0;
+        const pf = v.losses ? (v.wins * (opts.payout||0.85)) / v.losses : (v.wins ? 99 : 0);
+        const source = btDataByAsset && btDataByAsset[k] ? sourceLabel[btDataByAsset[k]] || "Sim" : "—";
+        const tr = document.createElement("tr");
+        tr.innerHTML = "<td>" + esc(v.name || k) + "</td>" +
+          "<td>" + t + "</td>" +
+          "<td class='" + (wr>=55?"win":wr<=45?"loss":"") + "'>" + wr.toFixed(1) + "%</td>" +
+          "<td class='" + (ev>0?"win":"loss") + "'>" + ev.toFixed(1) + "%</td>" +
+          "<td>" + v.pnlPayout.toFixed(2) + "</td>" +
+          "<td>" + (Number.isFinite(pf)?pf.toFixed(2):"—") + "</td>" +
+          "<td>" + finite(v.dd,0).toFixed(2) + "</td>" +
+          "<td>" + source + "</td>";
+        aBody.appendChild(tr);
+      }
+    }
+
+    // Regime breakdown
+    const regBody = $("bt-regimes") ? $("bt-regimes").querySelector("tbody") : null;
+    if (regBody) {
+      regBody.innerHTML = "";
+      const regAgg = sum.byRegime || {};
+      for (const k of Object.keys(regAgg).sort((a,b) => (regAgg[b].wins + regAgg[b].losses) - (regAgg[a].wins + regAgg[a].losses))) {
+        const v = regAgg[k];
+        const t = v.wins + v.losses;
+        const wr = t ? (v.wins / t) * 100 : 0;
+        const ev = t ? (wr/100 * (opts.payout||0.85) - (1-wr/100))*100 : 0;
+        const tr = document.createElement("tr");
+        tr.innerHTML = "<td>" + esc(k) + "</td><td>" + t + "</td>" +
+          "<td class='" + (wr>=55?"win":wr<=45?"loss":"") + "'>" + wr.toFixed(1) + "%</td>" +
+          "<td class='" + (ev>0?"win":"loss") + "'>" + ev.toFixed(1) + "%</td>" +
+          "<td>" + (Number(v.pnl)||0).toFixed(2) + "</td>";
+        regBody.appendChild(tr);
+      }
+    }
+
+    // Expiry breakdown
+    const expBody = $("bt-expiry") ? $("bt-expiry").querySelector("tbody") : null;
+    if (expBody) {
+      expBody.innerHTML = "";
+      const expAgg = {};
+      for (const r of matrix.results) {
+        if (!r.byExpiry) continue;
+        for (const ek of Object.keys(r.byExpiry)) {
+          if (!expAgg[ek]) expAgg[ek] = { wins: 0, losses: 0, draws: 0, pnl: 0 };
+          expAgg[ek].wins += r.byExpiry[ek].wins||0;
+          expAgg[ek].losses += r.byExpiry[ek].losses||0;
+          expAgg[ek].draws += r.byExpiry[ek].draws||0;
+          expAgg[ek].pnl += r.byExpiry[ek].pnl||0;
+        }
+      }
+      for (const k of Object.keys(expAgg).sort((a,b) => Number(a)-Number(b))) {
+        const v = expAgg[k];
+        const t = v.wins + v.losses;
+        const wr = t ? (v.wins / t) * 100 : 0;
+        const ev = t ? (wr/100 * (opts.payout||0.85) - (1-wr/100))*100 : 0;
+        const tr = document.createElement("tr");
+        tr.innerHTML = "<td>" + esc(k) + "m</td><td>" + t + "</td>" +
+          "<td class='" + (wr>=55?"win":wr<=45?"loss":"") + "'>" + wr.toFixed(1) + "%</td>" +
+          "<td class='" + (ev>0?"win":"loss") + "'>" + ev.toFixed(1) + "%</td>" +
+          "<td>" + (Number(v.pnl)||0).toFixed(2) + "</td>";
+        expBody.appendChild(tr);
+      }
+    }
+
+    // Confidence calibration
+    const calBody = $("bt-calib") ? $("bt-calib").querySelector("tbody") : null;
+    if (calBody) {
+      calBody.innerHTML = "";
+      const calAgg = {};
+      for (const r of matrix.results) {
+        for (const c of (r.calibration || [])) {
+          if (!calAgg[c.bucket]) calAgg[c.bucket] = { w: 0, l: 0, pnl: 0 };
+          calAgg[c.bucket].w += c.wins;
+          calAgg[c.bucket].l += c.losses;
+          calAgg[c.bucket].pnl += (c.wins * (opts.payout||0.85) - c.losses);
+        }
+      }
+      for (const b of Object.keys(calAgg).map(Number).sort((a,b) => a-b)) {
+        const v = calAgg[b];
+        const t = v.w + v.l;
+        const wr = t ? (v.w / t) * 100 : 0;
+        const ev = t ? (wr/100 * (opts.payout||0.85) - (1-wr/100))*100 : 0;
+        const tr = document.createElement("tr");
+        tr.innerHTML = "<td>" + b + "%</td><td>" + t + "</td>" +
+          "<td class='" + (wr>=b?"win":"loss") + "'>" + wr.toFixed(1) + "%</td>" +
+          "<td class='" + (ev>0?"win":"loss") + "'>" + ev.toFixed(1) + "%</td>";
+        calBody.appendChild(tr);
+      }
+    }
+
+    // Hourly
+    const hourBody = $("bt-hours") ? $("bt-hours").querySelector("tbody") : null;
+    if (hourBody) {
+      hourBody.innerHTML = "";
+      const hourAgg = {};
+      for (const r of matrix.results) {
+        if (!r.byHour) continue;
+        for (const hk of Object.keys(r.byHour)) {
+          if (!hourAgg[hk]) hourAgg[hk] = { wins: 0, losses: 0, draws: 0, pnl: 0 };
+          hourAgg[hk].wins += r.byHour[hk].wins||0;
+          hourAgg[hk].losses += r.byHour[hk].losses||0;
+          hourAgg[hk].draws += r.byHour[hk].draws||0;
+          hourAgg[hk].pnl += r.byHour[hk].pnl||0;
+        }
+      }
+      for (const hk of Object.keys(hourAgg).map(Number).sort((a,b) => a-b)) {
+        const v = hourAgg[hk];
+        const t = v.wins + v.losses;
+        const wr = t ? (v.wins / t) * 100 : 0;
+        const ev = t ? (wr/100 * (opts.payout||0.85) - (1-wr/100))*100 : 0;
+        const tr = document.createElement("tr");
+        tr.innerHTML = "<td>" + hk + ":00 UTC</td><td>" + t + "</td>" +
+          "<td class='" + (wr>=55?"win":wr<=45?"loss":"") + "'>" + wr.toFixed(1) + "%</td>" +
+          "<td class='" + (ev>0?"win":"loss") + "'>" + ev.toFixed(1) + "%</td>" +
+          "<td>" + (Number(v.pnl)||0).toFixed(2) + "</td>";
+        hourBody.appendChild(tr);
+      }
+    }
+
+    // Trade log
+    const tradesBody = $("bt-trades-table") ? $("bt-trades-table").querySelector("tbody") : null;
+    if (tradesBody) {
+      tradesBody.innerHTML = "";
+      const trades = btAllTrades.slice(-200).reverse();
+      for (let idx = 0; idx < trades.length; idx++) {
+        const t = trades[idx];
+        const outcome = t.draw ? "DRAW" : t.won ? "WIN" : "LOSS";
+        const cls = t.draw ? "" : t.won ? "win" : "loss";
+        const tr = document.createElement("tr");
+        tr.innerHTML = "<td>" + (idx+1) + "</td>" +
+          "<td>" + esc(fmtTime(t.entryTime)) + "</td>" +
+          "<td>" + esc(t.asset || activeAsset || "—") + "</td>" +
+          "<td class='" + cls + "'>" + esc(t.dir || "") + "</td>" +
+          "<td>" + esc(fmtPx(t.entry)) + "</td>" +
+          "<td>" + esc(fmtPx(t.exit)) + "</td>" +
+          "<td>" + (t.priceChangePct != null ? t.priceChangePct.toFixed(3) + "%" : "—") + "</td>" +
+          "<td>" + (t.confidence||0) + "%</td>" +
+          "<td>" + esc(t.regime||"—") + "</td>" +
+          "<td>" + (t.expiryMinutes||"—") + "m</td>" +
+          "<td class='" + cls + "'>" + outcome + "</td>" +
+          "<td class='" + cls + "'>" + (Number(t.pnlPayout != null ? t.pnlPayout : t.pnl)||0).toFixed(2) + "</td>";
+        tradesBody.appendChild(tr);
+      }
+    }
+
+    // Heatmap
+    const heatmapEl = $("bt-heatmap");
+    if (heatmapEl && matrix.results.length) {
+      const assets = [...new Set(matrix.results.map(r=>r.asset))].slice(0, 20);
+      const strats = [...new Set(matrix.results.map(r=>r.strategy))];
+      let html = "<table class='table tight'><thead><tr><th>Asset\\Strategy</th>";
+      for (const s of strats) html += "<th>" + esc(s.slice(0,12)) + "</th>";
+      html += "</tr></thead><tbody>";
+      for (const a of assets) {
+        html += "<tr><td><strong>" + esc(a) + "</strong></td>";
+        for (const s of strats) {
+          const found = matrix.results.find(r=>r.asset===a && r.strategy===s);
+          const wr = found ? found.winrate : 0;
+          const bg = wr >= 60 ? "background:rgba(61,255,154,0.25)" : wr >= 50 ? "background:rgba(255,196,87,0.2)" : wr ? "background:rgba(255,93,122,0.2)" : "";
+          const cls = wr >= 55 ? "win" : wr <= 45 && wr ? "loss" : "";
+          html += "<td class='" + cls + "' style='" + bg + "'>" + (found ? wr.toFixed(1)+"%" : "—") + "</td>";
+        }
+        html += "</tr>";
+      }
+      html += "</tbody></table>";
+      heatmapEl.innerHTML = html;
     }
 
     const sourcesEl = $("bt-sources");
@@ -1747,64 +2248,36 @@
       if (matrix.error) {
         sourcesEl.textContent = "";
       } else {
+        const perAsset = {};
+        for (const r of matrix.results) if (!perAsset[r.asset]) perAsset[r.asset] = true;
         const counts = { live: 0, "live+sim": 0, sim: 0 };
         for (const k of Object.keys(perAsset)) {
           if (btDataByAsset && btDataByAsset[k] && counts[btDataByAsset[k]] != null) counts[btDataByAsset[k]]++;
         }
         const covered = Object.keys(perAsset).length;
-        sourcesEl.textContent = "Covered " + covered + " asset" + (covered === 1 ? "" : "s") +
-          " — " + counts.live + " live-cached, " + counts["live+sim"] + " live+simulated, " +
-          counts.sim + " simulated. Cached Quotex candles are used when available; the rest of the catalog runs on the deterministic simulator.";
+        sourcesEl.textContent = "Covered " + covered + " assets — " + counts.live + " live, " + counts["live+sim"] + " live+sim, " + counts.sim + " sim. Payout " + (opts.payout*100).toFixed(0) + "% · Horizon " + opts.horizon + "m · " + (opts.useAdaptiveExpiry ? "Adaptive expiry" : "Fixed expiry") + ". EV = WR×payout − LR. PF = gross profit / gross loss. Sharpe = mean/std. Kelly = optimal stake %.";
       }
-    }
-
-    const regBody = $("bt-regimes").querySelector("tbody");
-    regBody.innerHTML = "";
-    const regAgg = {};
-    for (const r of matrix.results) {
-      for (const reg of Object.keys(r.byRegime || {})) {
-        if (!regAgg[reg]) regAgg[reg] = { wins: 0, losses: 0 };
-        regAgg[reg].wins += r.byRegime[reg].wins;
-        regAgg[reg].losses += r.byRegime[reg].losses;
-      }
-    }
-    for (const k of Object.keys(regAgg).sort((a, b) => (regAgg[b].wins + regAgg[b].losses) - (regAgg[a].wins + regAgg[a].losses))) {
-      const v = regAgg[k];
-      const t = v.wins + v.losses;
-      const wr = t ? (v.wins / t) * 100 : 0;
-      const tr = document.createElement("tr");
-      tr.innerHTML = "<td>" + esc(k) + "</td><td>" + t + "</td><td class='" + (wr >= 55 ? "win" : wr <= 45 ? "loss" : "") + "'>" + wr.toFixed(1) + "%</td>";
-      regBody.appendChild(tr);
-    }
-
-    const calBody = $("bt-calib").querySelector("tbody");
-    calBody.innerHTML = "";
-    const calAgg = {};
-    for (const r of matrix.results) {
-      for (const c of (r.calibration || [])) {
-        if (!calAgg[c.bucket]) calAgg[c.bucket] = { w: 0, l: 0 };
-        calAgg[c.bucket].w += c.wins;
-        calAgg[c.bucket].l += c.losses;
-      }
-    }
-    for (const b of Object.keys(calAgg).map(Number).sort((a, b) => a - b)) {
-      const v = calAgg[b];
-      const t = v.w + v.l;
-      const wr = t ? (v.w / t) * 100 : 0;
-      const tr = document.createElement("tr");
-      tr.innerHTML = "<td>" + b + "%</td><td>" + t + "</td><td class='" + (wr >= b ? "win" : "loss") + "'>" + wr.toFixed(1) + "%</td>";
-      calBody.appendChild(tr);
     }
   }
 
   function bindBacktest() {
-    $("bt-run").addEventListener("click", runBacktest);
+    // Sub-tab switching
+    const btTabs = document.querySelectorAll("[data-bt-tab]");
+    btTabs.forEach(btn => {
+      btn.addEventListener("click", () => activateBtTab(btn.dataset.btTab));
+    });
+
+    $("bt-run").addEventListener("click", () => runBacktest(false));
+    const walkBtn = $("bt-walk");
+    if (walkBtn) walkBtn.addEventListener("click", () => runBacktest(true));
+    const monteBtn = $("bt-monte");
+    if (monteBtn) monteBtn.addEventListener("click", runMonteCarloAnalysis);
+
     const exportBtn = $("bt-export");
     if (exportBtn) exportBtn.addEventListener("click", () => {
       const origLabel = exportBtn.textContent;
       STORE.load().then((snapshot) => {
-        const candles = snapshot && snapshot.candles && typeof snapshot.candles === "object" && !Array.isArray(snapshot.candles)
-          ? snapshot.candles : {};
+        const candles = snapshot && snapshot.candles && typeof snapshot.candles === "object" && !Array.isArray(snapshot.candles) ? snapshot.candles : {};
         const assets = Object.keys(candles).filter((k) => Array.isArray(candles[k]) && candles[k].length);
         const bars = assets.reduce((n, k) => n + candles[k].length, 0);
         const payload = {
@@ -1821,18 +2294,41 @@
         a.download = "cyber-binary-candles-" + new Date().toISOString().replace(/[:.]/g, "-").slice(0, 16) + ".json";
         a.click();
         setTimeout(() => URL.revokeObjectURL(url), 1000);
-        exportBtn.textContent = assets.length
-          ? "Exported " + assets.length + " assets / " + bars + " bars"
-          : "No live candle cache yet — open Quotex first";
+        exportBtn.textContent = assets.length ? "Exported " + assets.length + " assets / " + bars + " bars" : "No live cache — open Quotex first";
         setTimeout(() => { exportBtn.textContent = origLabel; }, 3000);
       }).catch(() => {
         exportBtn.textContent = "Export failed";
         setTimeout(() => { exportBtn.textContent = origLabel; }, 3000);
       });
     });
+
+    const exportTradesBtn = $("bt-export-trades");
+    if (exportTradesBtn) exportTradesBtn.addEventListener("click", () => {
+      if (!btAllTrades || !btAllTrades.length) {
+        exportTradesBtn.textContent = "No trades — run backtest first";
+        setTimeout(() => { exportTradesBtn.textContent = "Export trades"; }, 2000);
+        return;
+      }
+      const rows = [["time_utc","asset","dir","entry","exit","change_pct","confidence","regime","strategy","expiry_m","result","pnl","pnl_payout"]];
+      for (const t of btAllTrades) {
+        rows.push([
+          isoTime(t.entryTime), t.asset||activeAsset, t.dir, t.entry, t.exit,
+          t.priceChangePct, t.confidence, t.regime, t.selectedStrategy, t.expiryMinutes,
+          t.draw ? "DRAW" : t.won ? "WIN" : "LOSS", t.pnl, t.pnlPayout
+        ]);
+      }
+      const csv = rows.map(r => r.map(csvCell).join(",")).join("\n");
+      const blob = new Blob([csv], { type: "text/csv" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = "cyber-binary-backtest-trades-" + new Date().toISOString().slice(0,10) + ".csv"; a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    });
   }
 
-  /* ---------- history tab ---------- */
+
+
+    /* ---------- history tab ---------- */
   function refreshHistoryTab() {
     const token = ++historyRenderToken;
     STORE.getStats().then((stats) => {
