@@ -151,6 +151,8 @@
               <span class="chart-title" id="chart-title">— · 1m</span>
               <span class="chart-price" id="chart-price-badge">—</span>
               <span class="chart-change" id="chart-change-badge"></span>
+              <span class="badge" id="chart-regime-badge" style="display:none">—</span>
+              <span class="badge blue" id="chart-session-badge" style="display:none">—</span>
             </div>
             <div class="chart-toolbar-right">
               <div class="chart-type-group">
@@ -165,18 +167,22 @@
                 <label class="check small"><input type="checkbox" id="chart-vol" checked> Vol</label>
                 <label class="check small"><input type="checkbox" id="chart-macd" checked> MACD</label>
                 <label class="check small"><input type="checkbox" id="chart-rsi"> RSI</label>
+                <label class="check small"><input type="checkbox" id="chart-orders" checked> Orders</label>
+                <label class="check small"><input type="checkbox" id="chart-regime" checked> Regime</label>
+                <label class="check small"><input type="checkbox" id="chart-levels" checked> Levels</label>
               </div>
-              <button id="chart-reset" class="ghost-btn tiny" title="Reset zoom & pan">Reset</button>
+              <button id="chart-reset" class="ghost-btn tiny" title="Reset zoom & pan (double-click chart also resets)">Reset</button>
               <button id="chart-export" class="ghost-btn tiny" title="Export PNG">PNG</button>
               <button id="chart-fullscreen" class="ghost-btn tiny" title="Fullscreen">⛶</button>
             </div>
           </div>
           <div class="chart-canvas-wrap">
-            <canvas id="chart" width="800" height="340"></canvas>
+            <canvas id="chart" width="800" height="380"></canvas>
             <div id="chart-demo-badge" class="demo-badge" hidden>DEMO DATA — synthetic candles. Open the Quotex trade tab so the extension can capture real candles.</div>
           </div>
+          <div class="chart-legend" id="chart-indicator-legend" style="min-height:22px"></div>
           <div class="chart-statusbar">
-            <span id="chart-info-left">Scroll to zoom · Drag to pan · Hover for details</span>
+            <span id="chart-info-left">Scroll to zoom · Drag to pan · Double-click reset · Hover for OHLC + indicators</span>
             <span id="chart-info-right"></span>
           </div>
         </section>
@@ -186,6 +192,24 @@
           <article><span>Accuracy Score</span><strong id="accuracy">—</strong></article>
           <article><span>Wins</span><strong id="wins">0</strong></article>
           <article><span>Losses</span><strong id="losses">0</strong></article>
+        </section>
+
+        <section class="chart-wrap pro-chart" id="perf-chart-wrap">
+          <div class="chart-toolbar" style="padding:8px 14px">
+            <div class="chart-toolbar-left">
+              <span class="chart-title">Performance Timeline (last 100 trades)</span>
+            </div>
+            <div class="chart-toolbar-right">
+              <button id="perf-export" class="ghost-btn tiny">PNG</button>
+            </div>
+          </div>
+          <div class="chart-canvas-wrap">
+            <canvas id="perf-chart" width="800" height="140"></canvas>
+          </div>
+          <div class="chart-statusbar">
+            <span>Cyan = winrate % · Green area = cumulative P&L</span>
+            <span></span>
+          </div>
         </section>
 
         <section class="confluence-section">

@@ -311,6 +311,11 @@
       if (CHARTS.bindMainChartInteractions) {
         try { CHARTS.bindMainChartInteractions(canvas); } catch(_) {}
       }
+      // Preserve last opts for redraws (zoom/pan/tooltip)
+      try {
+        const st = CHARTS.getState ? CHARTS.getState(canvas) : null;
+        if (st) st._lastOpts = mergedOpts;
+      } catch(_) {}
       CHARTS.drawMainChart(canvas, candles, mergedOpts);
       // Update toolbar title/price badges if main chart
       try {
@@ -632,6 +637,8 @@
       if (cfg.empty) cfg.empty.style.display = count ? "none" : "block";
       for (const o of all.slice(0, 20)) {
         const tr = document.createElement("tr");
+        tr.className = "clickable";
+        tr.title = "Click to switch to this asset on chart";
         const dirCls = o.direction === "CALL" || o.dir === "CALL" ? "win" : o.direction === "PUT" || o.dir === "PUT" ? "loss" : "";
         const asset = esc(o.asset || "—");
         const dir = esc(o.direction || o.dir || "—");
@@ -658,6 +665,13 @@
         } else {
           tr.innerHTML = `<td><strong>${asset}</strong></td><td class="${dirCls}">${dir}</td><td>${stake}</td><td>${entry}</td><td>${expiry}</td><td>${timeLeft}</td><td class="${statusCls}">${status}</td>`;
         }
+        // Click to switch asset on chart
+        tr.addEventListener("click", () => {
+          if (o.asset) {
+            try { selectAsset(o.asset); } catch(_) {}
+            activateTab("live");
+          }
+        });
         cfg.tbody.appendChild(tr);
       }
     }
@@ -889,12 +903,41 @@
       ul.innerHTML = "";
       history.forEach((h) => {
         const li = document.createElement("li");
+        li.className = "clickable";
+        li.title = "Click to view " + (h.asset||"") + " on chart";
         const outcome = tradeOutcome(h);
         li.innerHTML =
           '<span class="' + outcome.cls + '">' + outcome.label + '</span>' +
           '<span class="meta">' + esc(h.dir || "") + " · " + esc(h.asset || "—") + " · conf " + esc(finite(h.confidence, 0)) + "%" +
             " · " + esc(strategyLabel(h.strategy, h.strategyLabel) || "—") + "<br>" + esc(tradeTimeline(h, true)) + '</span>' +
           '<span class="' + outcome.cls + '">' + esc(fmtMoney(h.pnl)) + '</span>';
+        li.addEventListener("click", () => {
+          if (h.asset) {
+            try { selectAsset(h.asset); } catch(_) {}
+            // Scroll chart to that time if possible
+            const CH = self.CYBER_CHARTS || null;
+            const canvas = $("chart");
+            if (CH && canvas) {
+              const st = CH.getState ? CH.getState(canvas) : null;
+              if (st && st._lastNormalized && h.entryTime) {
+                // Find index of entry time and set scroll offset to center it
+                let et = Number(h.entryTime);
+                while (Math.abs(et)>=1e14) et/=1000;
+                if (Math.abs(et)<1e11) et*=1000;
+                et=Math.floor(et);
+                const norm = st._lastNormalized;
+                let idx=-1;
+                for(let i=0;i<norm.length;i++){ if(norm[i].time>=et){ idx=i; break; } }
+                if(idx>=0){
+                  const total=norm.length;
+                  const vis=st.visibleBars||120;
+                  st.scrollOffset = Math.max(0, total - idx - Math.floor(vis/2));
+                  CH.drawMainChart(canvas, norm, st._lastOpts||{});
+                }
+              }
+            }
+          }
+        });
         ul.appendChild(li);
       });
     }
@@ -903,12 +946,89 @@
       ? state.chartCandles : []).slice(-500);
     const markers = Array.isArray(state.markers) ? state.markers.slice(-600) : [];
     const nextChartKey = chartStateKey(chartCandles, state.chartPeriod, markers);
+    // Always update lastChartCandles/meta for integration even if key same? Keep key check for performance but enrich meta
     if (nextChartKey !== lastChartKey) {
       lastChartKey = nextChartKey;
       lastChartCandles = chartCandles.slice(-500);
-      lastChartMeta = { timeframe: tfLabel(state.chartPeriod || 60), markers, timeBasis: state.chartTimeBasis || "broker-utc" };
+    }
+    // Build enriched meta with integration
+    lastChartMeta = {
+      timeframe: tfLabel(state.chartPeriod || 60),
+      markers,
+      timeBasis: state.chartTimeBasis || "broker-utc",
+      signal: sig,
+      regime: sig.regime || state.regime || null,
+      session: sig.session || state.session || null,
+      openOrders: openOrders,
+      pending: lastVirtualPending || state.pending || null,
+      history: history,
+      decimals: assetDecimals(activeAsset),
+      label: (state.asset || activeAsset || "—") + " · " + tfLabel(state.chartPeriod || 60),
+    };
+    // Draw if key changed or every 2nd call to keep order lines fresh
+    if (nextChartKey !== lastChartKey || Date.now() % 2000 < 100) {
+      // Actually draw every time to keep live price line and order countdown fresh — but throttled by chartStateKey already
+      // So force draw with enriched meta
+      drawChart($("chart"), lastChartCandles, lastChartMeta);
+    } else {
+      // Still redraw to update order lines / price badge even when candles same
       drawChart($("chart"), lastChartCandles, lastChartMeta);
     }
+    // Update chart title with asset + regime + signal
+    try {
+      const titleEl = document.getElementById("chart-title");
+      if (titleEl) {
+        const assetName = state.asset || activeAsset || "—";
+        const regimeTxt = sig.regime ? " · " + sig.regime.toUpperCase() : "";
+        const stratTxt = sig.selectedStrategyLabel || signalStrategyLabel(sig, state) || "";
+        titleEl.textContent = assetName + " · " + tfLabel(state.chartPeriod || 60) + regimeTxt + (stratTxt ? " · " + stratTxt : "");
+      }
+      const regimeBadge = document.getElementById("chart-regime-badge");
+      if (regimeBadge) {
+        if (sig.regime) {
+          regimeBadge.textContent = sig.regime.toUpperCase();
+          regimeBadge.style.display = "inline-block";
+          const rc = (sig.regime||"").toLowerCase();
+          if (rc.includes("trend")) { regimeBadge.className="badge green"; }
+          else if (rc.includes("range")||rc.includes("choppy")) { regimeBadge.className="badge"; }
+          else if (rc.includes("volatile")||rc.includes("breakout")) { regimeBadge.className="badge blue"; }
+          else { regimeBadge.className="badge"; }
+        } else { regimeBadge.style.display="none"; }
+      }
+      const sessBadge = document.getElementById("chart-session-badge");
+      if (sessBadge) {
+        if (sig.session) {
+          sessBadge.textContent = sig.session.toUpperCase();
+          sessBadge.style.display="inline-block";
+        } else { sessBadge.style.display="none"; }
+      }
+    } catch(_) {}
+    // Update indicator legend with live metrics
+    try {
+      const m = sig.metrics || {};
+      const legend = document.getElementById("chart-indicator-legend");
+      if (legend && m) {
+        const rsi = m.rsi != null ? m.rsi.toFixed(1) : "—";
+        const stoch = m.stochK != null ? m.stochK.toFixed(1) : "—";
+        const adx = m.adx != null ? m.adx.toFixed(1) : "—";
+        const emaF = m.emaFast != null ? fmtPx(m.emaFast) : "—";
+        const emaS = m.emaSlow != null ? fmtPx(m.emaSlow) : "—";
+        const atr = m.atrPct != null ? (m.atrPct*100).toFixed(3)+"%" : "—";
+        const mtf = m.mtfBias != null ? m.mtfBias + "/" + (m.mtfChecked||0) : "—";
+        const exp = sig.suggestedExpiry != null ? sig.suggestedExpiry + "m" : "—";
+        legend.innerHTML = `<span>RSI ${rsi}</span> · <span>Stoch ${stoch}</span> · <span>ADX ${adx}</span> · <span>EMA ${emaF}/${emaS}</span> · <span>ATR ${atr}</span> · <span>MTF ${mtf}</span> · <span>EXP ${exp}</span> · <span style="color:${sig.direction==='CALL'?'#3dff9a':sig.direction==='PUT'?'#ff5d7a':'#8aa0c8'}">${sig.direction||'WAIT'} ${sig.confidence||0}%</span>`;
+      }
+    } catch(_) {}
+    // Performance chart
+    try {
+      const CH = self.CYBER_CHARTS || null;
+      const perfCanvas = $("perf-chart");
+      if (CH && perfCanvas && history && history.length>5) {
+        CH.drawPerformanceChart(perfCanvas, history, {});
+      }
+    } catch(_) {}
+
+
     const demoBadge = $("chart-demo-badge");
     if (demoBadge && chartCandles.length) demoBadge.hidden = true;
     if (state.autoState) updateAutoUI(state.autoState);
@@ -1871,7 +1991,9 @@
         const pf = v.losses ? (v.wins * (opts.payout||0.85)) / v.losses : (v.wins ? 99 : 0);
         const source = btDataByAsset && btDataByAsset[k] ? sourceLabel[btDataByAsset[k]] || "Sim" : "—";
         const tr = document.createElement("tr");
-        tr.innerHTML = "<td>" + esc(v.name || k) + "</td>" +
+        tr.className = "clickable";
+        tr.title = "Click to view " + (v.name||k) + " on live chart and filter trades";
+        tr.innerHTML = "<td><strong>" + esc(v.name || k) + "</strong></td>" +
           "<td>" + t + "</td>" +
           "<td class='" + (wr>=55?"win":wr<=45?"loss":"") + "'>" + wr.toFixed(1) + "%</td>" +
           "<td class='" + (ev>0?"win":"loss") + "'>" + ev.toFixed(1) + "%</td>" +
@@ -1879,6 +2001,30 @@
           "<td>" + (Number.isFinite(pf)?pf.toFixed(2):"—") + "</td>" +
           "<td>" + finite(v.dd,0).toFixed(2) + "</td>" +
           "<td>" + source + "</td>";
+        tr.addEventListener("click", () => {
+          try { selectAsset(k); } catch(_) {}
+          // Filter trade log to this asset
+          const filter = btAllTrades.filter(trd => (trd.asset||"")===k);
+          if (filter.length) {
+            // Rebuild equity for this asset only
+            let run=0, peak=-Infinity, eq=[];
+            const sorted = [...filter].sort((a,b)=>(a.entryTime||0)-(b.entryTime||0));
+            for (const td of sorted) { run+=Number(td.pnlPayout!=null?td.pnlPayout:td.pnl)||0; if(run>peak) peak=run; eq.push({ equity: run, drawdown: peak-run, time: td.entryTime }); }
+            if (eq.length>1) {
+              const CH = self.CYBER_CHARTS || null;
+              const c = $("bt-equity");
+              if (CH && c) CH.drawEquityChart(c, eq, { trades: sorted });
+              activateBtTab("trades");
+              // Highlight trades table filtered
+              const tb = $("bt-trades-table") && $("bt-trades-table").querySelector("tbody");
+              if (tb) {
+                tb.innerHTML="";
+                const rev=[...sorted].reverse().slice(0,200);
+                for (let idx=0; idx<rev.length; idx++){ const tt=rev[idx]; const out=tt.draw?"DRAW":tt.won?"WIN":"LOSS"; const cls=tt.draw?"":tt.won?"win":"loss"; const tr2=document.createElement("tr"); tr2.innerHTML="<td>"+(idx+1)+"</td><td>"+esc(fmtTime(tt.entryTime))+"</td><td>"+esc(tt.asset||k)+"</td><td class='"+cls+"'>"+esc(tt.dir||"")+"</td><td>"+esc(fmtPx(tt.entry))+"</td><td>"+esc(fmtPx(tt.exit))+"</td><td>"+(tt.priceChangePct!=null?tt.priceChangePct.toFixed(3)+"%":"—")+"</td><td>"+(tt.confidence||0)+"%</td><td>"+esc(tt.regime||"—")+"</td><td>"+(tt.expiryMinutes||"—")+"m</td><td class='"+cls+"'>"+out+"</td><td class='"+cls+"'>"+(Number(tt.pnlPayout!=null?tt.pnlPayout:tt.pnl)||0).toFixed(2)+"</td>"; tb.appendChild(tr2); }
+              }
+            }
+          }
+        });
         aBody.appendChild(tr);
       }
     }
@@ -1986,7 +2132,7 @@
       }
     }
 
-    // Trade log
+    // Trade log with integration to equity chart
     const tradesBody = $("bt-trades-table") ? $("bt-trades-table").querySelector("tbody") : null;
     if (tradesBody) {
       tradesBody.innerHTML = "";
@@ -1996,6 +2142,7 @@
         const outcome = t.draw ? "DRAW" : t.won ? "WIN" : "LOSS";
         const cls = t.draw ? "" : t.won ? "win" : "loss";
         const tr = document.createElement("tr");
+        tr.dataset.tradeIdx = String(btAllTrades.length - 1 - idx);
         tr.innerHTML = "<td>" + (idx+1) + "</td>" +
           "<td>" + esc(fmtTime(t.entryTime)) + "</td>" +
           "<td>" + esc(t.asset || activeAsset || "—") + "</td>" +
@@ -2008,6 +2155,24 @@
           "<td>" + (t.expiryMinutes||"—") + "m</td>" +
           "<td class='" + cls + "'>" + outcome + "</td>" +
           "<td class='" + cls + "'>" + (Number(t.pnlPayout != null ? t.pnlPayout : t.pnl)||0).toFixed(2) + "</td>";
+        // Hover integration with equity chart
+        tr.addEventListener("mouseenter", () => {
+          const CH = self.CYBER_CHARTS || null;
+          const eqCanvas = $("bt-equity");
+          if (CH && eqCanvas && CH.highlightEquityTrade) {
+            const tradeIdx = Number(tr.dataset.tradeIdx);
+            if (Number.isFinite(tradeIdx)) CH.highlightEquityTrade(eqCanvas, tradeIdx);
+          }
+          tr.style.background = "rgba(0,229,255,0.08)";
+        });
+        tr.addEventListener("mouseleave", () => {
+          tr.style.background = "";
+          const CH = self.CYBER_CHARTS || null;
+          const eqCanvas = $("bt-equity");
+          if (CH && eqCanvas && CH.highlightEquityTrade) {
+            CH.highlightEquityTrade(eqCanvas, null);
+          }
+        });
         tradesBody.appendChild(tr);
       }
     }
@@ -2145,12 +2310,20 @@
       ul.innerHTML = "";
       for (const h of list.slice(0, 100)) {
         const li = document.createElement("li");
+        li.className = "clickable";
+        li.title = "Click to view " + (h.asset||"") + " on chart";
         const outcome = tradeOutcome(h);
         li.innerHTML =
           '<span class="' + outcome.cls + '">' + outcome.label + '</span>' +
           '<span class="meta">' + esc(h.dir || "") + " · " + esc(h.asset || "—") + " · conf " + esc(finite(h.confidence, 0)) + "% · " + esc(h.regime || "—") +
             " · " + esc(strategyLabel(h.strategy, h.strategyLabel) || "—") + "<br>" + esc(tradeTimeline(h, true)) + '</span>' +
           '<span class="' + outcome.cls + '">' + esc(fmtMoney(h.pnl)) + '</span>';
+        li.addEventListener("click", () => {
+          if (h.asset) {
+            try { selectAsset(h.asset); } catch(_) {}
+            activateTab("live");
+          }
+        });
         ul.appendChild(li);
       }
     }).catch(() => {});
@@ -2430,7 +2603,7 @@
       if (!el) return;
       el.addEventListener("change", () => {
         state[key] = el.checked;
-        if (state._lastNormalized) CH.drawMainChart(canvas, state._lastNormalized, {});
+        if (state._lastNormalized) CH.drawMainChart(canvas, state._lastNormalized, state._lastOpts||{});
       });
     };
     bindCheck("chart-ema", "showEMA");
@@ -2438,6 +2611,9 @@
     bindCheck("chart-vol", "showVolume");
     bindCheck("chart-macd", "showMACD");
     bindCheck("chart-rsi", "showRSI");
+    bindCheck("chart-orders", "showOrders");
+    bindCheck("chart-regime", "showRegime");
+    bindCheck("chart-levels", "showLevels");
 
     const resetBtn = $("chart-reset");
     if (resetBtn) resetBtn.addEventListener("click", () => {
@@ -2500,6 +2676,12 @@
     if (monteExport) monteExport.addEventListener("click", () => {
       const c = $("bt-monte-chart");
       if (c && CH.exportCanvasPNG) CH.exportCanvasPNG(c, "cyber-binary-monte-" + new Date().toISOString().slice(0,10) + ".png");
+    });
+
+    const perfExport = $("perf-export");
+    if (perfExport) perfExport.addEventListener("click", () => {
+      const c = $("perf-chart");
+      if (c && CH.exportCanvasPNG) CH.exportCanvasPNG(c, "cyber-binary-performance-" + new Date().toISOString().slice(0,10) + ".png");
     });
   }
 
