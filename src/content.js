@@ -903,6 +903,33 @@
     return out;
   }
 
+  /** v2.8: expiry winrates per minute bucket for dynamic expiry learning */
+  function expiryWinrates(minSettled) {
+    const out = Object.create(null);
+    const history = stats.history;
+    if (!Array.isArray(history) || !history.length) return out;
+    const floor = Number.isFinite(Number(minSettled)) && Number(minSettled) > 0 ? Math.floor(Number(minSettled)) : 8;
+    const buckets = Object.create(null);
+    for (const h of history) {
+      if (!h || h.draw) continue;
+      const exp = Number(h.expiryMinutes);
+      if (!Number.isFinite(exp) || exp < 0.5 || exp > 1440) continue;
+      const key = String(Math.round(exp * 2) / 2); // 0.5 steps
+      if (!buckets[key]) buckets[key] = { w: 0, l: 0 };
+      if (h.won === true) buckets[key].w++;
+      else if (h.won === false) buckets[key].l++;
+    }
+    const PRIOR = 6;
+    for (const k of Object.keys(buckets)) {
+      const row = buckets[k];
+      const settled = row.w + row.l;
+      if (settled < floor) continue;
+      const wr = ((row.w + PRIOR * 0.5) / (settled + PRIOR)) * 100;
+      if (Number.isFinite(wr)) out[k] = Math.round(wr * 10) / 10;
+    }
+    return out;
+  }
+
   /** Push the active asset's markers plus bars from the SAME timeframe shown
    *  by Quotex. Sending 1m bars while the platform displayed 5m/15m made the
    *  overlay project arrows into the wrong horizontal slots. */
@@ -1458,6 +1485,9 @@
         // supplied it — so historical/live accuracy never influenced which
         // strategy got picked. Only the router consumes it.
         strategyWinrates: currentStrategy === "auto_adaptive" ? strategyWinrates() : null,
+        expiryWinrates: expiryWinrates(),
+        adaptiveExpiryMin: runtimeSettings && runtimeSettings.adaptiveExpiryMin,
+        adaptiveExpiryMax: runtimeSettings && runtimeSettings.adaptiveExpiryMax,
       });
       sig.asset = asset ? asset.id : activeAsset;
       sig.assetName = asset ? asset.name : activeAsset;
@@ -1555,7 +1585,22 @@
         // One virtual lifecycle per asset/bar even if strategy changes or the
         // user switches away and back before the next candle closes.
         lastVirtualBarByAsset[activeAsset] = key;
-        const expiryMinutes = Math.max(0.5, Math.min(1440, Number(runtimeSettings && runtimeSettings.expiry) || 3));
+        // v2.8: dynamic expiry for accuracy
+        let expiryMinutes;
+        if (runtimeSettings && runtimeSettings.expiryMode === "adaptive" && sig && sig.suggestedExpiry) {
+          const dyn = Number(sig.suggestedExpiry);
+          if (Number.isFinite(dyn) && dyn >= 0.5 && dyn <= 1440) {
+            const minB = Number(runtimeSettings.adaptiveExpiryMin);
+            const maxB = Number(runtimeSettings.adaptiveExpiryMax);
+            const clampedMin = Number.isFinite(minB) ? Math.max(0.5, minB) : 0.5;
+            const clampedMax = Number.isFinite(maxB) ? Math.min(1440, maxB) : 1440;
+            expiryMinutes = Math.max(Math.min(clampedMin, clampedMax), Math.min(Math.max(clampedMin, clampedMax), dyn));
+          } else {
+            expiryMinutes = Math.max(0.5, Math.min(1440, Number(runtimeSettings && runtimeSettings.expiry) || 3));
+          }
+        } else {
+          expiryMinutes = Math.max(0.5, Math.min(1440, Number(runtimeSettings && runtimeSettings.expiry) || 3));
+        }
         const assetPayout = Number(asset && asset.payout);
         const payout = Number.isFinite(assetPayout) && assetPayout > 0
           ? Math.min(10, assetPayout > 1 ? assetPayout / 100 : assetPayout) : 0.85;
@@ -2454,7 +2499,26 @@
     // otherwise fall back to the freshly loaded settings stake.
     const argsStake = Number(args.stake);
     const stake = Number.isFinite(argsStake) && argsStake > 0 && argsStake <= 1000000 ? argsStake : Number(s.stake);
-    const expiry = Number(s.expiry);
+    // v2.8: dynamic expiry — args.expiry (from auto controller) takes precedence when adaptive,
+    // otherwise use suggestedExpiry from current signal if adaptive mode, else fixed setting.
+    let expiry;
+    const argsExpiry = Number(args.expiry);
+    if (Number.isFinite(argsExpiry) && argsExpiry >= 0.5 && argsExpiry <= 1440) {
+      expiry = argsExpiry;
+    } else if (s.expiryMode === "adaptive" && cachedSignal && cachedSignal.suggestedExpiry) {
+      const dyn = Number(cachedSignal.suggestedExpiry);
+      if (Number.isFinite(dyn) && dyn >= 0.5 && dyn <= 1440) {
+        const minB = Number(s.adaptiveExpiryMin);
+        const maxB = Number(s.adaptiveExpiryMax);
+        const clampedMin = Number.isFinite(minB) ? Math.max(0.5, minB) : 0.5;
+        const clampedMax = Number.isFinite(maxB) ? Math.min(1440, maxB) : 1440;
+        expiry = Math.max(Math.min(clampedMin, clampedMax), Math.min(Math.max(clampedMin, clampedMax), dyn));
+      } else {
+        expiry = Number(s.expiry);
+      }
+    } else {
+      expiry = Number(s.expiry);
+    }
     if (!Number.isFinite(stake) || stake <= 0 || stake > 1000000) {
       return { ok: false, confirmed: false, error: "stake must be between 0 and 1,000,000" };
     }

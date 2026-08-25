@@ -54,6 +54,154 @@
   // 85% payout. Only strong-trend (94%+ WR) trades under auto-adaptive.
   const ADAPTIVE_SIT_OUT_REGIMES = ["choppy", "squeeze", "trending", "ranging"];
 
+  // ============================================================
+  // Dynamic expiry engine (v2.8): chooses expiry to improve accuracy
+  // based on regime, volatility, trend strength, strategy and confidence.
+  // ============================================================
+  const STRATEGY_EXPIRY_PROFILES = {
+    scalp:              { base: 1,   min: 1,   max: 2   },
+    turbo_trend:        { base: 2,   min: 1,   max: 3   },
+    sniper:             { base: 2,   min: 1.5, max: 3   },
+    confluence:         { base: 2,   min: 1.5, max: 3.5 },
+    institutional_flow: { base: 2.5, min: 2,   max: 4   },
+    breakout:           { base: 2.5, min: 2,   max: 4   },
+    otc:                { base: 2,   min: 1,   max: 3   },
+    momentum_pulse:     { base: 2,   min: 1.5, max: 3   },
+    high_accuracy:      { base: 2,   min: 1.5, max: 3   },
+    trend:              { base: 3,   min: 2,   max: 5   },
+    ribbon:             { base: 3,   min: 2,   max: 4   },
+    squeeze:            { base: 3,   min: 2,   max: 5   },
+  };
+
+  const REGIME_EXPIRY = {
+    "strong-trend":   { base: 3,   min: 2,   max: 5,   reason: "strong trend needs time to ride" },
+    "trending":       { base: 2.5, min: 2,   max: 4,   reason: "trending, allow continuation" },
+    "ranging":        { base: 1.5, min: 1,   max: 3,   reason: "ranging, quick mean reversion" },
+    "mean-reverting": { base: 1.5, min: 1,   max: 2.5, reason: "mean-reverting, short expiry" },
+    "squeeze":        { base: 3,   min: 2,   max: 5,   reason: "squeeze breakout needs expansion time" },
+    "choppy":         { base: 1,   min: 1,   max: 2,   reason: "choppy, minimal exposure" },
+    "unknown":        { base: 2,   min: 1,   max: 3.5, reason: "unknown regime" },
+  };
+
+  function clampExpiry(value, min, max) {
+    let v = Number(value);
+    if (!Number.isFinite(v)) v = 2;
+    v = Math.max(0.5, Math.min(1440, v));
+    if (min != null) v = Math.max(min, v);
+    if (max != null) v = Math.min(max, v);
+    // Round to nearest 0.5 for OTC (duration) but keep integer for regular if >1
+    // Quotex supports 1,2,3,4,5 etc. 0.5 steps are useful for 30s OTC.
+    return Math.round(v * 2) / 2;
+  }
+
+  function suggestExpiry(metrics, regime, strategyId, confidence, opts) {
+    opts = opts || {};
+    const stratProfile = STRATEGY_EXPIRY_PROFILES[strategyId] || STRATEGY_EXPIRY_PROFILES.confluence;
+    const regimeProfile = REGIME_EXPIRY[regime] || REGIME_EXPIRY.unknown;
+
+    // Start from strategy base, then blend with regime base (60% strategy, 40% regime)
+    let expiry = stratProfile.base * 0.6 + regimeProfile.base * 0.4;
+    let reasons = [];
+    reasons.push(`base ${stratProfile.base}m(${strategyId}) + ${regimeProfile.base}m(${regime})`);
+
+    // Volatility adjustment via atrPct
+    const atrPct = metrics && Number.isFinite(metrics.atrPct) ? metrics.atrPct : null;
+    if (atrPct != null) {
+      if (atrPct < 0.0002) { expiry += 1; reasons.push(`low vol ATR% ${(atrPct*100).toFixed(3)}% +1m`); }
+      else if (atrPct < 0.0004) { expiry += 0.5; reasons.push(`low-med vol +0.5m`); }
+      else if (atrPct > 0.0015) { expiry -= 0.5; reasons.push(`very high vol -0.5m`); }
+      else if (atrPct > 0.0009) { expiry -= 0.25; reasons.push(`high vol -0.25m`); }
+    }
+
+    // Trend strength via ADX
+    const adx = metrics && Number.isFinite(metrics.adx) ? metrics.adx : null;
+    if (adx != null) {
+      if (adx >= 35) { expiry += 1; reasons.push(`strong ADX ${adx.toFixed(0)} +1m`); }
+      else if (adx >= 28) { expiry += 0.5; reasons.push(`ADX ${adx.toFixed(0)} +0.5m`); }
+      else if (adx < 15) { expiry -= 0.5; reasons.push(`weak ADX ${adx.toFixed(0)} -0.5m`); }
+    }
+
+    // EMA separation as trend confirmation
+    const emaFast = metrics && Number.isFinite(metrics.emaFast) ? metrics.emaFast : null;
+    const emaSlow = metrics && Number.isFinite(metrics.emaSlow) ? metrics.emaSlow : null;
+    const atr = metrics && Number.isFinite(metrics.atr) ? metrics.atr : null;
+    if (emaFast != null && emaSlow != null && atr != null && atr > 0) {
+      const sep = Math.abs(emaFast - emaSlow) / atr;
+      if (sep > 2.5) { expiry += 0.5; reasons.push(`wide EMA sep ${sep.toFixed(1)}xATR +0.5m`); }
+      else if (sep < 0.5) { expiry -= 0.25; reasons.push(`narrow EMA sep -0.25m`); }
+    }
+
+    // RSI extremes = possible reversal, shorten expiry for quick reversion
+    const rsi = metrics && Number.isFinite(metrics.rsi) ? metrics.rsi : null;
+    if (rsi != null) {
+      if (rsi < 25 || rsi > 75) { expiry -= 0.5; reasons.push(`RSI extreme ${rsi.toFixed(0)} -0.5m`); }
+      else if (rsi < 35 || rsi > 65) { expiry -= 0.25; reasons.push(`RSI ${rsi.toFixed(0)} -0.25m`); }
+    }
+
+    // Confidence: high confidence allows longer hold, low confidence shortens
+    const conf = Number(confidence);
+    if (Number.isFinite(conf)) {
+      if (conf >= 92) { expiry += 0.5; reasons.push(`high conf ${conf}% +0.5m`); }
+      else if (conf < 70) { expiry -= 0.5; reasons.push(`low conf ${conf}% -0.5m`); }
+    }
+
+    // Bollinger width: squeeze = low width, breakout needs longer; wide = volatile
+    const bbUpper = metrics && Number.isFinite(metrics.bbUpper) ? metrics.bbUpper : null;
+    const bbLower = metrics && Number.isFinite(metrics.bbLower) ? metrics.bbLower : null;
+    const close = metrics && Number.isFinite(metrics.close) ? metrics.close : null;
+    if (bbUpper != null && bbLower != null && close != null && close > 0) {
+      const bw = (bbUpper - bbLower) / close;
+      if (bw < 0.001) { expiry += 0.5; reasons.push(`BB squeeze +0.5m`); }
+      else if (bw > 0.01) { expiry -= 0.25; reasons.push(`BB wide -0.25m`); }
+    }
+
+    // User bounds
+    const userMin = Number(opts.adaptiveExpiryMin);
+    const userMax = Number(opts.adaptiveExpiryMax);
+    const minBound = Number.isFinite(userMin) ? Math.max(0.5, Math.min(1440, userMin)) : Math.max(stratProfile.min, regimeProfile.min);
+    const maxBound = Number.isFinite(userMax) ? Math.max(0.5, Math.min(1440, userMax)) : Math.min(stratProfile.max, regimeProfile.max);
+    // Ensure min <= max
+    const finalMin = Math.min(minBound, maxBound);
+    const finalMax = Math.max(minBound, maxBound);
+
+    expiry = clampExpiry(expiry, finalMin, finalMax);
+
+    // Historical learning: if expiry winrates provided, bias toward best
+    if (opts.expiryWinrates && typeof opts.expiryWinrates === 'object') {
+      let bestExpiry = null, bestWR = -1;
+      for (const k of Object.keys(opts.expiryWinrates)) {
+        const wr = Number(opts.expiryWinrates[k]);
+        if (!Number.isFinite(wr)) continue;
+        if (wr > bestWR) { bestWR = wr; bestExpiry = Number(k); }
+      }
+      if (bestExpiry != null && bestWR >= 55 && Math.abs(bestExpiry - expiry) <= 2) {
+        // Nudge 25% toward historically best expiry if it's profitable
+        const nudge = (bestExpiry - expiry) * 0.25;
+        const nudged = clampExpiry(expiry + nudge, finalMin, finalMax);
+        if (nudged !== expiry) {
+          reasons.push(`history best ${bestExpiry}m WR ${bestWR.toFixed(0)}% nudge ${nudge>0?'+':''}${nudge.toFixed(1)}m`);
+          expiry = nudged;
+        }
+      }
+    }
+
+    return {
+      minutes: expiry,
+      reason: reasons.join(' · '),
+      breakdown: {
+        strategy: strategyId,
+        regime,
+        base: stratProfile.base,
+        regimeBase: regimeProfile.base,
+        atrPct,
+        adx,
+        confidence: conf,
+        min: finalMin,
+        max: finalMax,
+      }
+    };
+  }
+
   /**
    * High-accuracy signal gates. A preset (or explicit opts.params) may set
    * `regimeFilter` (array of regime names — signal anywhere else is WAIT)
@@ -463,11 +611,32 @@
       });
     }
 
+    // v2.8: recompute expiry with correct strategy for lean adaptive
+    let adaptiveExpiry = bestResult && bestResult.suggestedExpiry;
+    let adaptiveReason = bestResult && bestResult.expiryReason;
+    try {
+      if (bestResult && bestResult.metrics) {
+        const exp = suggestExpiry(
+          bestResult.metrics,
+          regime,
+          bestStrategy,
+          bestResult.confidence,
+          { adaptiveExpiryMin: opts && opts.adaptiveExpiryMin, adaptiveExpiryMax: opts && opts.adaptiveExpiryMax, expiryWinrates: opts && opts.expiryWinrates }
+        );
+        if (exp) {
+          adaptiveExpiry = exp.minutes;
+          adaptiveReason = exp.reason;
+        }
+      }
+    } catch (_) {}
+
     return Object.assign({}, bestResult, {
       adaptive: true,
       selectedStrategy: bestStrategy,
       selectedStrategyLabel: bestLabel,
       strategyScores: scores,
+      suggestedExpiry: adaptiveExpiry,
+      expiryReason: adaptiveReason,
       reason: sitOut
         ? `Adaptive regime filter (choppy/squeeze sit-out; current ${regime})`
         : bestResult.direction === "WAIT"
@@ -842,6 +1011,20 @@
       confidence = 0;
     }
 
+    // v2.8: dynamic expiry suggestion for accuracy
+    let expiryInfo = null;
+    try {
+      const adaptiveMin = opts && opts.adaptiveExpiryMin != null ? Number(opts.adaptiveExpiryMin) : null;
+      const adaptiveMax = opts && opts.adaptiveExpiryMax != null ? Number(opts.adaptiveExpiryMax) : null;
+      expiryInfo = suggestExpiry(
+        { atrPct, adx: adxR.adx[i], emaFast: emaF[i], emaSlow: emaS[i], atr: atr[i], rsi: rsi[i], bbUpper: bb.upper[i], bbLower: bb.lower[i], close: c[i] },
+        regime,
+        namedStrategy,
+        confidence,
+        { adaptiveExpiryMin: adaptiveMin, adaptiveExpiryMax: adaptiveMax, expiryWinrates: opts && opts.expiryWinrates }
+      );
+    } catch (_) { expiryInfo = null; }
+
     return tag({
       ready: true,
       direction,
@@ -854,6 +1037,9 @@
           ? `No confluence (CALL ${call} · PUT ${put} · need ${requiredScore})`
           : votes.filter((v) => v.dir === direction).map((v) => v.name).join(" · "),
       votes,
+      suggestedExpiry: expiryInfo ? expiryInfo.minutes : null,
+      expiryReason: expiryInfo ? expiryInfo.reason : null,
+      expiryBreakdown: expiryInfo ? expiryInfo.breakdown : null,
       metrics: {
         close: c[i],
         rsi: rsi[i],
@@ -1129,7 +1315,33 @@
       score = 0;
       confidence = 0;
     }
-    return { ready: true, direction, confidence, score, regime };
+
+    // v2.8: dynamic expiry for lean path
+    let expiryInfoLean = null;
+    try {
+      const adaptiveMin = arguments[2] && arguments[2].adaptiveExpiryMin != null ? Number(arguments[2].adaptiveExpiryMin) : null;
+      const adaptiveMax = arguments[2] && arguments[2].adaptiveExpiryMax != null ? Number(arguments[2].adaptiveExpiryMax) : null;
+      // cfg is second arg, but we need strategy id — try to get from opts (5th arg in adaptive, but lean has only 4)
+      // For lean, we approximate with generic
+      expiryInfoLean = suggestExpiry(
+        { atrPct, adx: adxVal, emaFast: emaFVal, emaSlow: emaSVal, atr: atrVal, rsi: rsiVal, close: ci },
+        regime,
+        "confluence",
+        confidence,
+        { adaptiveExpiryMin: adaptiveMin, adaptiveExpiryMax: adaptiveMax }
+      );
+    } catch (_) { expiryInfoLean = null; }
+
+    return {
+      ready: true,
+      direction,
+      confidence,
+      score,
+      regime,
+      suggestedExpiry: expiryInfoLean ? expiryInfoLean.minutes : null,
+      expiryReason: expiryInfoLean ? expiryInfoLean.reason : null,
+      metrics: { atrPct, adx: adxVal, close: ci, rsi: rsiVal, emaFast: emaFVal, emaSlow: emaSVal, atr: atrVal }
+    };
   }
 
   function backtest(candles, opts) {
@@ -1332,5 +1544,5 @@
     };
   }
 
-  root.CYBER_ENGINE = { DEFAULTS, DEFAULT_WEIGHTS, CONCRETE_STRATEGIES, analyze, backtest, walkForward, resolveStrategy, liveSignalGate, historyTrustDecision };
+  root.CYBER_ENGINE = { DEFAULTS, DEFAULT_WEIGHTS, CONCRETE_STRATEGIES, STRATEGY_EXPIRY_PROFILES, REGIME_EXPIRY, suggestExpiry, analyze, backtest, walkForward, resolveStrategy, liveSignalGate, historyTrustDecision };
 })(typeof self !== "undefined" ? self : globalThis);

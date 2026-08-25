@@ -891,9 +891,14 @@
     const noiseTxt = sig.noise && sig.noise.ready
       ? " · noise: " + Number(sig.noise.score).toFixed(2)
       : "";
+    // v2.8: show dynamic expiry suggestion
+    const exp = sig.suggestedExpiry != null ? Number(sig.suggestedExpiry) : null;
+    const expTxt = exp != null && Number.isFinite(exp)
+      ? ` · expiry: ${exp}m` + (sig.expiryReason ? ` (${String(sig.expiryReason).slice(0,120)})` : "") + (settings && settings.expiryMode === "adaptive" ? " [adaptive]" : " [fixed]")
+      : "";
     $("regime-row").textContent = "strategy: " + heroStrategy + routed +
       " · regime: " + (sig.regime || "—") + " · session: " + (sig.session || state.session || "—") + noiseTxt +
-      " · engine: 1m · mtf bias: " + ((sig.metrics && sig.metrics.mtfBias) || 0) + "/" + ((sig.metrics && sig.metrics.mtfChecked) || 0);
+      " · engine: 1m · mtf bias: " + ((sig.metrics && sig.metrics.mtfBias) || 0) + "/" + ((sig.metrics && sig.metrics.mtfChecked) || 0) + expTxt;
 
     // Auto-Adaptive Cockpit UI Update
     const adaptiveCard = $("adaptive-card");
@@ -1360,6 +1365,8 @@
     bindNumberSetting("min-confidence", "minConfidence");
     bindNumberSetting("stake", "stake");
     bindNumberSetting("expiry", "expiry");
+    bindNumberSetting("adaptive-expiry-min", "adaptiveExpiryMin");
+    bindNumberSetting("adaptive-expiry-max", "adaptiveExpiryMax");
     bindNumberSetting("max-hour", "maxTradesPerHour");
     bindNumberSetting("max-day", "maxTradesPerDay");
     bindNumberSetting("loss-cap", "dailyLossCap");
@@ -1367,11 +1374,22 @@
     bindNumberSetting("cooldown", "cooldownBars");
     bindNumberSetting("stake-percent", "stakePercent");
     bindNumberSetting("min-balance", "minBalance");
-    for (const pair of [["account-mode", "accountMode"], ["stake-mode", "stakeMode"]]) {
+    for (const pair of [["account-mode", "accountMode"], ["stake-mode", "stakeMode"], ["expiry-mode", "expiryMode"]]) {
       const el = $(pair[0]);
       if (!el) continue;
       el.addEventListener("change", () => {
-        setSettings({ [pair[1]]: el.value }).then((saved) => { el.value = saved[pair[1]]; }).catch(() => {});
+        setSettings({ [pair[1]]: el.value }).then((saved) => {
+          el.value = saved[pair[1]];
+          // toggle fixed expiry input disabled state
+          if (pair[0] === "expiry-mode") {
+            const fixedEl = $("expiry");
+            const minEl = $("adaptive-expiry-min");
+            const maxEl = $("adaptive-expiry-max");
+            if (fixedEl) fixedEl.disabled = saved.expiryMode === "adaptive";
+            if (minEl) minEl.disabled = saved.expiryMode !== "adaptive";
+            if (maxEl) maxEl.disabled = saved.expiryMode !== "adaptive";
+          }
+        }).catch(() => {});
       });
     }
     const bindBooleanSetting = (id, key) => {
@@ -1417,6 +1435,13 @@
       $("min-confidence").value = s.minConfidence != null ? s.minConfidence : 65;
       $("stake").value = s.stake != null ? s.stake : 1;
       $("expiry").value = s.expiry != null ? s.expiry : 3;
+      if ($("expiry-mode")) $("expiry-mode").value = s.expiryMode === "fixed" ? "fixed" : "adaptive";
+      if ($("adaptive-expiry-min")) $("adaptive-expiry-min").value = s.adaptiveExpiryMin != null ? s.adaptiveExpiryMin : 1;
+      if ($("adaptive-expiry-max")) $("adaptive-expiry-max").value = s.adaptiveExpiryMax != null ? s.adaptiveExpiryMax : 5;
+      const isAdaptive = s.expiryMode !== "fixed";
+      if ($("expiry")) $("expiry").disabled = isAdaptive;
+      if ($("adaptive-expiry-min")) $("adaptive-expiry-min").disabled = !isAdaptive;
+      if ($("adaptive-expiry-max")) $("adaptive-expiry-max").disabled = !isAdaptive;
       $("max-hour").value = s.maxTradesPerHour != null ? s.maxTradesPerHour : 12;
       $("max-day").value = s.maxTradesPerDay != null ? s.maxTradesPerDay : 60;
       $("loss-cap").value = s.dailyLossCap != null ? s.dailyLossCap : 30;
