@@ -246,8 +246,16 @@
   const openOrdersQueue = [];                  // order of ids for bounded size
   const pendingWs = Object.create(null);       // page-hook send ack requestId -> resolver
   const pendingHistory = Object.create(null);  // page-hook history-subscription requestId -> resolver
-  const pendingHistoryMeta = Object.create(null); // requestId -> {asset, period} for retry bookkeeping
+  const pendingHistoryMeta = Object.create(null); // requestId -> {asset, period, limit, offset} for retry bookkeeping
   let historyRequestSequence = 0;
+  // --- Enhanced data gathering state ---
+  const historyPagination = Object.create(null); // asset@period -> { totalReceived, lastOffset, hasMore }
+  const dataQuality = Object.create(null); // asset -> { candleCount, tickCount, gaps, lastUpdate, qualityScore }
+  const backgroundScanQueue = []; // assets to scan for high-accuracy ranking
+  let backgroundScanTimer = null;
+  let lastInstrumentsRequestAt = 0;
+  let lastBalanceRequestAt = 0;
+  const MTF_PERIODS = [60, 300, 900, 1800, 3600]; // 1m, 5m, 15m, 30m, 1h
   const pendingOrders = Object.create(null);   // broker order-open requestId -> resolver
   const settledOrderIds = Object.create(null); // de-dupe broker close replays
   const settledOrderQueue = [];
@@ -1078,9 +1086,32 @@
     return byPeriod[p];
   }
 
+  function synthesizeFrom1m(assetId, targetPeriod) {
+    // Synthesize higher timeframe candles from 1m data when broker hasn't sent that TF yet
+    if (!assetId || targetPeriod <= 60) return null;
+    const byPeriod = chartHistory[assetId];
+    if (!byPeriod) return null;
+    const oneM = byPeriod[60];
+    if (!oneM || !Array.isArray(oneM.candles) || oneM.candles.length < targetPeriod/60) return null;
+    if (!self.CYBER_TA || typeof self.CYBER_TA.resample !== "function") return null;
+    try {
+      const minutes = Math.max(1, Math.round(targetPeriod / 60));
+      const resampled = self.CYBER_TA.resample(oneM.candles, minutes);
+      if (resampled && resampled.length) {
+        return { period: targetPeriod, candles: resampled, ts: Date.now(), synthesized: true };
+      }
+    } catch (_) {}
+    return null;
+  }
+
   function chartForActiveAsset() {
     const periods = chartHistory[activeAsset];
-    if (!periods) return null;
+    if (!periods) {
+      // Try synthesize from 1m if we have it
+      const synth = synthesizeFrom1m(activeAsset, lastWsPeriod);
+      if (synth) return synth;
+      return null;
+    }
     let selected = null;
     if (periods[lastWsPeriod] && periods[lastWsPeriod].candles.length) selected = periods[lastWsPeriod];
     // v2.7.1: fall back to the most recent period's data if the requested
@@ -1092,6 +1123,11 @@
         const item = periods[p];
         if (item && item.candles && item.candles.length && (!selected || item.ts > selected.ts)) selected = item;
       }
+    }
+    // v2.8.1: if still no data, try synthesizing from 1m
+    if (!selected) {
+      const synth = synthesizeFrom1m(activeAsset, lastWsPeriod);
+      if (synth) return synth;
     }
     if (!selected) return null;
 
@@ -1283,6 +1319,28 @@
     if (useForEngine && newestRealTime >= brokerNowForCheck - 2 * TF_MS && newestRealTime <= brokerNowForCheck + 86400000) {
       lastAcceptedQuoteAt[id] = Date.now();
     }
+    // Track data quality and pagination
+    try {
+      updateDataQuality(id, feed.series().length, true);
+      const key = historyKey(id, safePeriod);
+      const pag = historyPagination[key] || (historyPagination[key] = { totalReceived: 0, lastOffset: 0, hasMore: true });
+      pag.totalReceived += real.length;
+      // If we received exactly the requested limit, there might be more history
+      // Trigger pagination request for next offset (with small delay to avoid spam)
+      if (real.length >= 900 && pag.hasMore) {
+        const nextOffset = pag.lastOffset + real.length;
+        if (nextOffset < 10000) { // cap total at 10k candles
+          pag.lastOffset = nextOffset;
+          setTimeout(function() {
+            try { requestPeriodHistory(id, safePeriod, true, 5000, nextOffset); } catch (_) {}
+          }, 500 + Math.random()*500);
+        } else {
+          pag.hasMore = false;
+        }
+      } else {
+        pag.hasMore = false;
+      }
+    } catch (_) {}
     // Merge incremental batches instead of replacing the dashboard series
     // with whichever partial history response arrived last. Histories from
     // other open/mini charts are retained per asset+period but NEVER select
@@ -1863,6 +1921,8 @@
         activePeriod: lastWsPeriod,
         lastOrders: lastOrders.slice(0, 10),
         openOrders: Object.values(openOrders).slice(0, 20),
+        dataQuality: dataQuality[activeAsset] || null,
+        allDataQuality: Object.keys(dataQuality).length,
       },
     };
     try { chrome.runtime.sendMessage({ type: "CYBER_STATE", payload }).catch(() => {}); } catch (_) {}
@@ -2040,17 +2100,21 @@
    * timeframe and the dashboard sat on "Waiting for candles…" while Quotex
    * drew candles next to it.
    */
-  function requestPeriodHistory(id, period, force, requestedLimit) {
+  function requestPeriodHistory(id, period, force, requestedLimit, offset) {
     const safePeriod = Number.isFinite(Number(period)) && Number(period) >= 1
       ? Math.min(86400, Math.max(1, Math.floor(Number(period)))) : 60;
     const key = historyKey(id, safePeriod);
     const at = historyRequestedAt[key] || 0;
-    if (!force) {
+    const safeOffset = Number.isFinite(Number(offset)) ? Math.max(0, Math.floor(Number(offset))) : 0;
+    // Pagination requests (offset>0) bypass throttle and seeded check
+    const isPagination = safeOffset > 0;
+    if (!force && !isPagination) {
       if (safePeriod === 60) {
         // Once real history has arrived, live ticks extend the cache; do not
         // pull a 5,000-row batch on every periodic scan. The backtest button
-        // can still force one refresh on demand.
-        if (historySeeded[id]) return null;
+        // can still force one refresh on demand. However, allow pagination to continue.
+        const pag = historyPagination[key];
+        if (historySeeded[id] && (!pag || !pag.hasMore)) return null;
       } else {
         // The platform pushes its own updates for the visible chart, so a
         // cached batch only needs re-pulling when it went stale (idle chart,
@@ -2059,26 +2123,78 @@
         const bars = cached && Array.isArray(cached.candles) ? cached.candles.length : 0;
         if (bars && Date.now() - (Number(cached.ts) || 0) < 600000) return null;
       }
-      if (Date.now() - at < 30000) return null; // retry initial attachment at most every 30s
+      if (Date.now() - at < 15000) return null; // reduced from 30s to 15s for faster data gathering
     }
     const rawLimit = Number(requestedLimit);
-    const wanted = Number.isFinite(rawLimit) ? Math.max(60, Math.min(5000, Math.floor(rawLimit))) : 5000;
+    const wanted = Number.isFinite(rawLimit) ? Math.max(60, Math.min(10000, Math.floor(rawLimit))) : 5000;
     // Higher timeframes need far fewer rows for the same wall-clock window.
-    const limit = safePeriod === 60 ? wanted : Math.max(60, Math.min(wanted, 1000));
+    const limit = safePeriod === 60 ? wanted : Math.max(60, Math.min(wanted, 2000));
     const requestId = "history_" + Date.now() + "_" + (++historyRequestSequence % 1000000);
-    historyRequestedAt[key] = Date.now();
+    if (!isPagination) historyRequestedAt[key] = Date.now();
     try {
       window.postMessage({
         source: _SRC_OUT,
         kind: "subscribe",
-        payload: { requestId, asset: id, period: safePeriod, limit },
+        payload: { requestId, asset: id, period: safePeriod, limit, offset: safeOffset },
       }, "*");
-      pendingHistoryMeta[requestId] = { asset: id, period: safePeriod };
+      pendingHistoryMeta[requestId] = { asset: id, period: safePeriod, limit, offset: safeOffset };
       return requestId;
     } catch (_) {
-      historyRequestedAt[key] = 0;
+      if (!isPagination) historyRequestedAt[key] = 0;
       return null;
     }
+  }
+
+  function requestAllTimeframes(id, force) {
+    // Request multiple timeframes for comprehensive market view
+    // This enables MTF analysis and better chart display
+    if (!id) return;
+    for (let i = 0; i < MTF_PERIODS.length; i++) {
+      const period = MTF_PERIODS[i];
+      // Stagger requests by 100ms to avoid overwhelming broker
+      (function(p, idx) {
+        setTimeout(function() {
+          try { requestPeriodHistory(id, p, force); } catch (_) {}
+        }, idx * 120);
+      })(period, i);
+    }
+  }
+
+  function requestInstrumentsAndBalance(force) {
+    const now = Date.now();
+    if (!force) {
+      if (now - lastInstrumentsRequestAt < 60000 && now - lastBalanceRequestAt < 30000) return;
+    }
+    try {
+      if (now - lastInstrumentsRequestAt >= 60000 || force) {
+        lastInstrumentsRequestAt = now;
+        window.postMessage({ source: _SRC_OUT, kind: "request_instruments", payload: {} }, "*");
+      }
+      if (now - lastBalanceRequestAt >= 30000 || force) {
+        lastBalanceRequestAt = now;
+        window.postMessage({ source: _SRC_OUT, kind: "request_balance", payload: {} }, "*");
+      }
+    } catch (_) {}
+  }
+
+  function updateDataQuality(assetId, candleCount, isNewBatch) {
+    if (!assetId) return;
+    const id = String(assetId).slice(0, 96);
+    if (!dataQuality[id]) {
+      dataQuality[id] = { candleCount: 0, tickCount: 0, gaps: 0, lastUpdate: 0, qualityScore: 0, batches: 0 };
+    }
+    const dq = dataQuality[id];
+    if (isNewBatch) {
+      dq.batches = (dq.batches || 0) + 1;
+      if (Number.isFinite(candleCount)) dq.candleCount = Math.max(dq.candleCount, candleCount);
+    }
+    dq.lastUpdate = Date.now();
+    // Quality score: more candles + recent updates = higher quality
+    const ageMin = (Date.now() - dq.lastUpdate) / 60000;
+    const recencyScore = Math.max(0, 1 - ageMin / 60); // decays over 1h
+    const countScore = Math.min(1, dq.candleCount / 500); // 500 candles = full score
+    const batchScore = Math.min(1, dq.batches / 3); // 3+ batches = full
+    dq.qualityScore = Math.round((recencyScore * 0.3 + countScore * 0.5 + batchScore * 0.2) * 100);
   }
 
   function ensureHistorySubscription(det, force, requestedLimit) {
@@ -2092,7 +2208,57 @@
         Math.floor(visiblePeriod) !== 60) {
       requestPeriodHistory(id, Math.floor(visiblePeriod), force, requestedLimit);
     }
+    // v2.8: On force refresh (e.g., dashboard backtest or asset switch), also fetch MTF
+    if (force) {
+      try { requestAllTimeframes(id, false); } catch (_) {}
+    }
+    // Also ensure instruments/balance are fresh
+    try { requestInstrumentsAndBalance(false); } catch (_) {}
     return engineRequestId;
+  }
+
+  function scheduleBackgroundScan() {
+    if (backgroundScanTimer) return;
+    backgroundScanTimer = setInterval(function() {
+      try {
+        // Only scan when primary and not actively trading
+        if (!isPrimaryContext) return;
+        const now = Date.now();
+        // Build list of assets that need background refresh for high-accuracy ranking
+        const candidates = [];
+        // Prioritize assets from liveCandlesByAsset that have some data but may be stale
+        for (const aid in liveCandlesByAsset) {
+          if (!Object.prototype.hasOwnProperty.call(liveCandlesByAsset, aid)) continue;
+          const dq = dataQuality[aid];
+          const lastUp = dq ? dq.lastUpdate : 0;
+          if (now - lastUp > 120000) { // 2 min stale
+            candidates.push({ id: aid, score: dq ? dq.qualityScore : 0, lastUp });
+          }
+        }
+        // Also add top instruments if we have them
+        if (lastInstruments && lastInstruments.length) {
+          for (let i = 0; i < Math.min(lastInstruments.length, 20); i++) {
+            const it = lastInstruments[i];
+            if (!it || !it.symbol) continue;
+            const det = ASSETS.get(it.symbol);
+            if (!det) continue;
+            if (det.id === activeAsset) continue; // active already handled
+            if (candidates.some(function(c){ return c.id === det.id; })) continue;
+            const dq = dataQuality[det.id];
+            if (!dq || now - dq.lastUpdate > 300000) {
+              candidates.push({ id: det.id, score: dq ? dq.qualityScore : 0, lastUp: dq ? dq.lastUpdate : 0 });
+            }
+          }
+        }
+        // Sort by oldest first
+        candidates.sort(function(a,b){ return a.lastUp - b.lastUp; });
+        // Request history for up to 2 background assets per cycle
+        for (let j = 0; j < Math.min(2, candidates.length); j++) {
+          const c = candidates[j];
+          try { requestPeriodHistory(c.id, 60, false, 1000); } catch (_) {}
+        }
+      } catch (_) {}
+    }, 30000); // every 30s
   }
 
   function requestHistorySubscription(det, requestedLimit) {
@@ -2118,6 +2284,10 @@
     const det = syncActiveAsset();
     const currentTime = Date.now();
     const brokerTime = getBrokerNow();
+    // Periodic instruments/balance refresh (every 60s/30s via requestInstrumentsAndBalance throttling)
+    if (currentTime % 15000 < 1000) {
+      try { requestInstrumentsAndBalance(false); } catch (_) {}
+    }
     // A wall-clock close is valid only while real quote input is fresh. After
     // a disconnect, repeatedly closing bars at an old price fabricates candle
     // outcomes and can settle expiries without a broker quote.
@@ -2393,6 +2563,11 @@
         if (autoController) autoController.setArmed(isPrimaryContext && !!(runtimeSettings && runtimeSettings.armed));
         if (isPrimaryContext) replayClosedOrders();
         queueStatePush(cachedSignal, true);
+        // After primary confirmed, request fresh instruments/balance
+        if (isPrimaryContext) {
+          setTimeout(function(){ try { requestInstrumentsAndBalance(true); } catch (_) {} }, 1000);
+          try { scheduleBackgroundScan(); } catch (_) {}
+        }
       }).catch(() => {});
     } catch (_) {}
     loadStats();
@@ -2405,6 +2580,8 @@
     pollTimer = setInterval(tick, 1000);
     tick();
     setTimeout(requestHookSync, 1200); // hook may still be loading
+    setTimeout(function(){ try { requestInstrumentsAndBalance(true); } catch (_) {} }, 2000);
+    try { scheduleBackgroundScan(); } catch (_) {}
   }
 
   /* -------- confirmed real-platform trade placement -------- */
@@ -2774,6 +2951,10 @@
     }
     if (msg && msg.type === "CYBER_REQUEST_HISTORY") {
       const det = ASSETS.get(activeAsset) || ASSETS.ensureRegistered(lastWsSymbol || activeAsset);
+      // If msg.allTimeframes, request MTF
+      if (msg.allTimeframes) {
+        try { requestAllTimeframes(det.id, true); } catch (_) {}
+      }
       requestHistorySubscription(det, msg.limit).then(sendResponse).catch((e) => {
         sendResponse({ ok: false, requested: false, asset: det && det.id || activeAsset,
           error: String(e && e.message || e || "history request failed").slice(0, 256) });

@@ -374,10 +374,13 @@
 
   function mapEventName(ev) {
     if (!ev) return "unknown";
-    // Direct mappings observed in the wild
+    // Direct mappings observed in the wild — expanded for comprehensive data gathering
     switch (ev) {
       case "s_authorization":      return "authenticated";
       case "instruments/list":      return "instruments";
+      case "instruments/list_v2":   return "instruments";
+      case "instruments/list/v2":   return "instruments";
+      case "assets/list":           return "instruments";
       case "s_balance":            return "balance";
       case "balance":              return "balance";
       case "successupdateBalance": return "balance";
@@ -386,15 +389,21 @@
       case "s_orders/close":       return "order_closed";
       case "successcloseOrder":    return "order_closed";
       case "orders/closed/list":   return "orders_closed_list";
+      case "orders/open":          return "order_opened";
+      case "orders/close":         return "order_closed";
       case "quotes/stream":        return "quote";
+      case "quotes/stream/v2":     return "quote";
       // Older platform builds stream quotes under "tick" / "stream_update"
-      // (payload identical to quotes/stream: [[symbol, ts, price], ...]).
       case "tick":                 return "quote";
       case "stream_update":        return "quote";
       case "quotes":               return "quote";
+      case "history/list":         return "candles";
       case "history/list/v2":      return "candles";
+      case "history/list/v3":      return "candles";
+      case "candles/history":      return "candles";
       case "chart_notification/get": return "candles";
       case "loadHistoryPeriod":    return "candles";
+      case "loadHistory":          return "candles";
       case "authorization/reject": return "auth_error";
       case "error":                return "error";
       default:                     return ev;
@@ -2432,7 +2441,7 @@
      * chart opens, so nothing extra is needed to receive `quotes/stream` and
      * `history/list/v2` frames from the server. Safe to call repeatedly.
      */
-    subscribeHistory: function (ws, asset, period, limit) {
+    subscribeHistory: function (ws, asset, period, limit, offset) {
       if (!ws || typeof ws.send !== "function") return { ok: false, error: "no websocket handle" };
       if (ws.readyState != null && numberValue(ws.readyState) !== 1) return { ok: false, error: "websocket is not open" };
       var sym = normalizeSymbolName(asset || "");
@@ -2440,17 +2449,70 @@
       period = numberValue(period);
       period = period != null && period > 0 ? Math.min(86400, Math.floor(period)) : 60;
       limit = numberValue(limit);
-      limit = limit != null ? Math.max(60, Math.min(5000, Math.floor(limit))) : 5000;
+      limit = limit != null ? Math.max(60, Math.min(10000, Math.floor(limit))) : 5000;
+      offset = numberValue(offset);
+      offset = offset != null ? Math.max(0, Math.min(1000000, Math.floor(offset))) : 0;
       try {
         ws.send('42["tick"]');
         ws.send('42["instruments/follow","' + sym + '"]');
         ws.send('42["instruments/update",{"asset":"' + sym + '","period":' + period + '}]');
-        // chart_notification/get does not return OHLC history on every Quotex
-        // build. Request the actual history endpoint explicitly; otherwise the
-        // cache receives ticks only and can take hours to become backtestable.
-        ws.send('42["history/list/v2",{"asset":"' + sym + '","period":' + period + ',"offset":0,"limit":' + limit + '}]');
+        // Request history from multiple endpoints for compatibility across Quotex builds
+        ws.send('42["history/list/v2",{"asset":"' + sym + '","period":' + period + ',"offset":' + offset + ',"limit":' + limit + '}]');
+        ws.send('42["history/list",{"asset":"' + sym + '","period":' + period + ',"offset":' + offset + ',"limit":' + limit + '}]');
         ws.send('42["chart_notification/get",{"asset":"' + sym + '","version":"1.0.0"}]');
-        return { ok: true, asset: sym, period: period, limit: limit };
+        ws.send('42["loadHistoryPeriod",{"asset":"' + sym + '","period":' + period + ',"offset":' + offset + ',"limit":' + limit + '}]');
+        return { ok: true, asset: sym, period: period, limit: limit, offset: offset };
+      } catch (e) {
+        return { ok: false, error: String(e && e.message || e) };
+      }
+    },
+    subscribeAllTimeframes: function (ws, asset) {
+      if (!ws || typeof ws.send !== "function") return { ok: false, error: "no websocket handle" };
+      var sym = normalizeSymbolName(asset || "");
+      if (!sym) return { ok: false, error: "asset required" };
+      var timeframes = [60, 300, 900, 1800, 3600];
+      var results = [];
+      for (var i = 0; i < timeframes.length; i++) {
+        var r = this.subscribeHistory(ws, sym, timeframes[i], 2000, 0);
+        results.push(r);
+      }
+      return { ok: true, asset: sym, results: results };
+    },
+    subscribeHistoryBatch: function (ws, asset, period, batches, batchSize) {
+      if (!ws || typeof ws.send !== "function") return { ok: false, error: "no websocket handle" };
+      var sym = normalizeSymbolName(asset || "");
+      if (!sym) return { ok: false, error: "asset required" };
+      period = numberValue(period);
+      period = period != null && period > 0 ? Math.min(86400, Math.floor(period)) : 60;
+      batches = numberValue(batches);
+      batches = batches != null ? Math.max(1, Math.min(20, Math.floor(batches))) : 3;
+      batchSize = numberValue(batchSize);
+      batchSize = batchSize != null ? Math.max(60, Math.min(10000, Math.floor(batchSize))) : 5000;
+      var results = [];
+      for (var b = 0; b < batches; b++) {
+        var offset = b * batchSize;
+        var r = this.subscribeHistory(ws, sym, period, batchSize, offset);
+        results.push(r);
+      }
+      return { ok: true, asset: sym, period: period, batches: batches, results: results };
+    },
+    requestInstruments: function (ws) {
+      if (!ws || typeof ws.send !== "function") return { ok: false, error: "no websocket handle" };
+      try {
+        ws.send('42["instruments/list"]');
+        ws.send('42["instruments/list_v2"]');
+        ws.send('42["assets/list"]');
+        return { ok: true };
+      } catch (e) {
+        return { ok: false, error: String(e && e.message || e) };
+      }
+    },
+    requestBalance: function (ws) {
+      if (!ws || typeof ws.send !== "function") return { ok: false, error: "no websocket handle" };
+      try {
+        ws.send('42["s_balance"]');
+        ws.send('42["balance"]');
+        return { ok: true };
       } catch (e) {
         return { ok: false, error: String(e && e.message || e) };
       }

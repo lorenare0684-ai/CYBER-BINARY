@@ -6,7 +6,7 @@
  *   - tools/page-hook.shell.js (MAIN-world WebSocket hook shell)
  *
  * Rebuild after any change to either source file.
- * Generated: 2026-08-25T05:36:40.939Z
+ * Generated: 2026-08-25T06:16:48.786Z
  */
 /* ====================================================================
  * Inlined CYBER_QUOTEX adapter (src/lib/quotex.js).
@@ -388,10 +388,13 @@
 
   function mapEventName(ev) {
     if (!ev) return "unknown";
-    // Direct mappings observed in the wild
+    // Direct mappings observed in the wild — expanded for comprehensive data gathering
     switch (ev) {
       case "s_authorization":      return "authenticated";
       case "instruments/list":      return "instruments";
+      case "instruments/list_v2":   return "instruments";
+      case "instruments/list/v2":   return "instruments";
+      case "assets/list":           return "instruments";
       case "s_balance":            return "balance";
       case "balance":              return "balance";
       case "successupdateBalance": return "balance";
@@ -400,15 +403,21 @@
       case "s_orders/close":       return "order_closed";
       case "successcloseOrder":    return "order_closed";
       case "orders/closed/list":   return "orders_closed_list";
+      case "orders/open":          return "order_opened";
+      case "orders/close":         return "order_closed";
       case "quotes/stream":        return "quote";
+      case "quotes/stream/v2":     return "quote";
       // Older platform builds stream quotes under "tick" / "stream_update"
-      // (payload identical to quotes/stream: [[symbol, ts, price], ...]).
       case "tick":                 return "quote";
       case "stream_update":        return "quote";
       case "quotes":               return "quote";
+      case "history/list":         return "candles";
       case "history/list/v2":      return "candles";
+      case "history/list/v3":      return "candles";
+      case "candles/history":      return "candles";
       case "chart_notification/get": return "candles";
       case "loadHistoryPeriod":    return "candles";
+      case "loadHistory":          return "candles";
       case "authorization/reject": return "auth_error";
       case "error":                return "error";
       default:                     return ev;
@@ -2446,7 +2455,7 @@
      * chart opens, so nothing extra is needed to receive `quotes/stream` and
      * `history/list/v2` frames from the server. Safe to call repeatedly.
      */
-    subscribeHistory: function (ws, asset, period, limit) {
+    subscribeHistory: function (ws, asset, period, limit, offset) {
       if (!ws || typeof ws.send !== "function") return { ok: false, error: "no websocket handle" };
       if (ws.readyState != null && numberValue(ws.readyState) !== 1) return { ok: false, error: "websocket is not open" };
       var sym = normalizeSymbolName(asset || "");
@@ -2454,17 +2463,70 @@
       period = numberValue(period);
       period = period != null && period > 0 ? Math.min(86400, Math.floor(period)) : 60;
       limit = numberValue(limit);
-      limit = limit != null ? Math.max(60, Math.min(5000, Math.floor(limit))) : 5000;
+      limit = limit != null ? Math.max(60, Math.min(10000, Math.floor(limit))) : 5000;
+      offset = numberValue(offset);
+      offset = offset != null ? Math.max(0, Math.min(1000000, Math.floor(offset))) : 0;
       try {
         ws.send('42["tick"]');
         ws.send('42["instruments/follow","' + sym + '"]');
         ws.send('42["instruments/update",{"asset":"' + sym + '","period":' + period + '}]');
-        // chart_notification/get does not return OHLC history on every Quotex
-        // build. Request the actual history endpoint explicitly; otherwise the
-        // cache receives ticks only and can take hours to become backtestable.
-        ws.send('42["history/list/v2",{"asset":"' + sym + '","period":' + period + ',"offset":0,"limit":' + limit + '}]');
+        // Request history from multiple endpoints for compatibility across Quotex builds
+        ws.send('42["history/list/v2",{"asset":"' + sym + '","period":' + period + ',"offset":' + offset + ',"limit":' + limit + '}]');
+        ws.send('42["history/list",{"asset":"' + sym + '","period":' + period + ',"offset":' + offset + ',"limit":' + limit + '}]');
         ws.send('42["chart_notification/get",{"asset":"' + sym + '","version":"1.0.0"}]');
-        return { ok: true, asset: sym, period: period, limit: limit };
+        ws.send('42["loadHistoryPeriod",{"asset":"' + sym + '","period":' + period + ',"offset":' + offset + ',"limit":' + limit + '}]');
+        return { ok: true, asset: sym, period: period, limit: limit, offset: offset };
+      } catch (e) {
+        return { ok: false, error: String(e && e.message || e) };
+      }
+    },
+    subscribeAllTimeframes: function (ws, asset) {
+      if (!ws || typeof ws.send !== "function") return { ok: false, error: "no websocket handle" };
+      var sym = normalizeSymbolName(asset || "");
+      if (!sym) return { ok: false, error: "asset required" };
+      var timeframes = [60, 300, 900, 1800, 3600];
+      var results = [];
+      for (var i = 0; i < timeframes.length; i++) {
+        var r = this.subscribeHistory(ws, sym, timeframes[i], 2000, 0);
+        results.push(r);
+      }
+      return { ok: true, asset: sym, results: results };
+    },
+    subscribeHistoryBatch: function (ws, asset, period, batches, batchSize) {
+      if (!ws || typeof ws.send !== "function") return { ok: false, error: "no websocket handle" };
+      var sym = normalizeSymbolName(asset || "");
+      if (!sym) return { ok: false, error: "asset required" };
+      period = numberValue(period);
+      period = period != null && period > 0 ? Math.min(86400, Math.floor(period)) : 60;
+      batches = numberValue(batches);
+      batches = batches != null ? Math.max(1, Math.min(20, Math.floor(batches))) : 3;
+      batchSize = numberValue(batchSize);
+      batchSize = batchSize != null ? Math.max(60, Math.min(10000, Math.floor(batchSize))) : 5000;
+      var results = [];
+      for (var b = 0; b < batches; b++) {
+        var offset = b * batchSize;
+        var r = this.subscribeHistory(ws, sym, period, batchSize, offset);
+        results.push(r);
+      }
+      return { ok: true, asset: sym, period: period, batches: batches, results: results };
+    },
+    requestInstruments: function (ws) {
+      if (!ws || typeof ws.send !== "function") return { ok: false, error: "no websocket handle" };
+      try {
+        ws.send('42["instruments/list"]');
+        ws.send('42["instruments/list_v2"]');
+        ws.send('42["assets/list"]');
+        return { ok: true };
+      } catch (e) {
+        return { ok: false, error: String(e && e.message || e) };
+      }
+    },
+    requestBalance: function (ws) {
+      if (!ws || typeof ws.send !== "function") return { ok: false, error: "no websocket handle" };
+      try {
+        ws.send('42["s_balance"]');
+        ws.send('42["balance"]');
+        return { ok: true };
       } catch (e) {
         return { ok: false, error: String(e && e.message || e) };
       }
@@ -2570,6 +2632,8 @@
     lastWsSymbol: null, // authoritative main-chart symbol (legacy snapshot field)
     lastWsPeriod: 60,
     activeChart: null,  // {symbol, period, source, at}; never derived from quote fan-out
+    activeAssets: Object.create(null), // assets that have requested history (for prioritized ticks)
+    dataStats: { candlesReceived: 0, ticksReceived: 0, lastCandleAt: 0, lastTickAt: 0 },
   };
 
   var internalSubscriptionSend = false;
@@ -2623,12 +2687,18 @@
       var asset = msg.asset || (live.activeChart && live.activeChart.symbol) || live.lastWsSymbol || "EURUSD";
       var period = msg.period || live.lastWsPeriod || 60;
       var key = asset + "@" + period;
-      live.candles[key] = Array.isArray(msg.candles) ? msg.candles.slice(-5000) : [];
+      live.candles[key] = Array.isArray(msg.candles) ? msg.candles.slice(-10000) : [];
       if (msg.verified != null) live.candlesVerified[key] = !!msg.verified;
+      // Track data gathering stats
+      try {
+        live.dataStats.candlesReceived++;
+        live.dataStats.lastCandleAt = Date.now();
+      } catch (_) {}
       var oldKeyAt = candleKeyOrder.indexOf(key);
       if (oldKeyAt >= 0) candleKeyOrder.splice(oldKeyAt, 1);
       candleKeyOrder.push(key);
-      while (candleKeyOrder.length > 24) {
+      // Increased from 24 to 100 to keep more assets/timeframes for MTF and asset quality
+      while (candleKeyOrder.length > 100) {
         var droppedKey = candleKeyOrder.shift();
         delete live.candles[droppedKey];
         delete live.candlesVerified[droppedKey];
@@ -2641,19 +2711,26 @@
       if (!q || !q.symbol) return;
       if (!Object.prototype.hasOwnProperty.call(live.ticks, q.symbol)) tickKeyOrder.push(q.symbol);
       live.ticks[q.symbol] = q;
-      while (tickKeyOrder.length > 500) {
+      try {
+        live.dataStats.ticksReceived++;
+        live.dataStats.lastTickAt = Date.now();
+      } catch (_) {}
+      // Increased from 500 to 1000 to support more assets for high-accuracy ranking
+      while (tickKeyOrder.length > 1000) {
         var oldSymbol = tickKeyOrder.shift();
         delete live.ticks[oldSymbol];
         delete backgroundTickAt[oldSymbol];
       }
       // Quote streams can contain hundreds of subscribed instruments. Keep
-      // bounded latest values for snapshots, but rate-limit background bridges
-      // globally so they cannot dominate the selected chart's UI updates.
+      // bounded latest values for snapshots, but rate-limit background bridges.
+      // Improved: active assets (recently requested history) get 5s throttle, others 30s.
       var main = !!(live.activeChart &&
         Q.normalizeSymbol(live.activeChart.symbol) === Q.normalizeSymbol(q.symbol));
       var now = Date.now();
-      var allowBackground = !main && now - lastBackgroundEmitAt >= 1000 &&
-        now - (backgroundTickAt[q.symbol] || 0) >= 30000;
+      var isActiveAsset = !!(live.activeAssets && live.activeAssets[Q.normalizeSymbol(q.symbol)]);
+      var throttleMs = isActiveAsset ? 5000 : 30000;
+      var allowBackground = !main && now - lastBackgroundEmitAt >= 500 &&
+        now - (backgroundTickAt[q.symbol] || 0) >= throttleMs;
       if (main || allowBackground) {
         if (allowBackground) { backgroundTickAt[q.symbol] = now; lastBackgroundEmitAt = now; }
         emit("tick", {
@@ -3520,7 +3597,7 @@
       status: live.status,
       instruments: live.instruments,
       balance: live.balance,
-      orders: live.orders.slice(0, 20),
+      orders: live.orders.slice(0, 50),
       ticks: live.ticks,
       candles: live.candles,
       candlesVerified: live.candlesVerified,
@@ -3530,7 +3607,10 @@
       markersChart: MARKERS.hasChart(),
       lastWsPeriod: live.lastWsPeriod,
       activeChart: live.activeChart,
+      activeAssets: Object.keys(live.activeAssets || {}),
+      dataStats: live.dataStats,
       socket: !!handle.lastWs,
+      socketCount: brokerSockets.length,
       frames: _cyberFrames.slice(0, 12),
     };
   }
@@ -3546,6 +3626,7 @@
   // Install the WebSocket wrapper *synchronously*. Handles text, Blob and
   // binary frames; all decoding happens inside the router. Also wraps
   // `send()` so OUTGOING frames reveal the active asset (see onAsset above).
+  var brokerSockets = [];
   var Native = window.WebSocket;
   if (typeof Native === "function") {
     handle.native = Native;
@@ -3556,7 +3637,20 @@
       // WebSocket prevents interleaved sockets from stealing each other's
       // pending header/event context.
       var socketRouter = Q.createRouter(routerHandlers);
-      if (brokerSocket) { handle.lastWs = ws; handle.router = socketRouter; }
+      if (brokerSocket) {
+        handle.lastWs = ws;
+        handle.router = socketRouter;
+        // Track all broker sockets for comprehensive data gathering
+        try {
+          if (brokerSockets.indexOf(ws) === -1) brokerSockets.push(ws);
+          // Cleanup closed sockets
+          var now = Date.now();
+          for (var si = brokerSockets.length - 1; si >= 0; si--) {
+            var s = brokerSockets[si];
+            if (!s || s.readyState === 3) brokerSockets.splice(si, 1);
+          }
+        } catch (_) {}
+      }
       if (brokerSocket) try { emit("open", { url: url || "" }); } catch (_) {}
       // --- outgoing-frame sniffing: the client's own requests tell us the
       // active asset. This is what makes auto-detection work even when the
@@ -3579,11 +3673,22 @@
             handle.lastWs = ws;
             handle.router = socketRouter;
           }
-          if (hit && hit.symbol && !internalSubscriptionSend) {
+          if (hit && hit.symbol) {
+        // Track active assets for prioritized tick gathering
+        try { live.activeAssets[Q.normalizeSymbol(hit.symbol)] = Date.now(); } catch (_) {}
+        // Cleanup old active assets (>10 min)
+        try {
+          var cutoff = Date.now() - 600000;
+          for (var aa in live.activeAssets) {
+            if (live.activeAssets[aa] < cutoff) delete live.activeAssets[aa];
+          }
+        } catch (_) {}
+      }
+      if (hit && hit.symbol && !internalSubscriptionSend) {
             if (hit.main) selectActiveChart(hit, "ws_out");
             else if (hit.candidate && !live.activeChart) selectActiveChart(hit, "ws_candidate");
             else if (live.activeChart && hit.symbol === live.activeChart.symbol && hit.period &&
-                /history\/list\/v2|chart_notification\/get|loadHistoryPeriod/.test(hit.event || "")) {
+                /history\/list\/v2|chart_notification\/get|loadHistoryPeriod|history\/list/.test(hit.event || "")) {
               // Same selected symbol: learn the visible chart timeframe without
               // allowing another asset's background history to become main.
               selectActiveChart(hit, "ws_period");
@@ -3667,18 +3772,88 @@
     if (ev.source !== window || !ev.data || ev.data.source !== _SRC_IN) return;
     if (ev.data.kind === "sync_request") {
       emit("snapshot", snapshot());
+      // Opportunistically refresh instruments/balance if missing
+      try {
+        if ((!live.instruments || !live.instruments.length) && Q.requestInstruments) Q.requestInstruments(handle.lastWs);
+        if (!live.balance && Q.requestBalance) Q.requestBalance(handle.lastWs);
+      } catch (_) {}
     } else if (ev.data.kind === "subscribe") {
       var sub = ev.data.payload || {};
       internalSubscriptionSend = true;
-      var r;
-      try { r = Q.subscribeHistory(handle.lastWs, sub.asset, sub.period, sub.limit); }
-      finally { internalSubscriptionSend = false; }
+      var r = null;
+      try {
+        r = Q.subscribeHistory(handle.lastWs, sub.asset, sub.period, sub.limit, sub.offset);
+        // Fallback to other broker sockets if primary failed
+        if ((!r || !r.ok) && brokerSockets && brokerSockets.length) {
+          for (var bi = 0; bi < brokerSockets.length; bi++) {
+            var altWs = brokerSockets[bi];
+            if (altWs && altWs !== handle.lastWs && altWs.readyState === 1) {
+              try {
+                var r2 = Q.subscribeHistory(altWs, sub.asset, sub.period, sub.limit, sub.offset);
+                if (r2 && r2.ok) { r = r2; handle.lastWs = altWs; break; }
+              } catch (_) {}
+            }
+          }
+        }
+      } finally { internalSubscriptionSend = false; }
       emit("subscribe_result", {
         requestId: sub.requestId != null ? String(sub.requestId).slice(0, 128) : "",
         asset: sub.asset != null ? String(sub.asset).slice(0, 96) : "",
         ok: !!(r && r.ok),
         payload: r || {},
       });
+    } else if (ev.data.kind === "request_instruments") {
+      try {
+        var ri = Q.requestInstruments ? Q.requestInstruments(handle.lastWs) : null;
+        if ((!ri || !ri.ok) && brokerSockets && brokerSockets.length) {
+          for (var bi2 = 0; bi2 < brokerSockets.length; bi2++) {
+            var altWs2 = brokerSockets[bi2];
+            if (altWs2 && altWs2 !== handle.lastWs && altWs2.readyState === 1) {
+              try {
+                var ri2 = Q.requestInstruments(altWs2);
+                if (ri2 && ri2.ok) { ri = ri2; break; }
+              } catch (_) {}
+            }
+          }
+        }
+        emit("subscribe_result", {
+          requestId: "instruments_"+Date.now(),
+          asset: "",
+          ok: !!(ri && ri.ok),
+          payload: ri || {},
+        });
+      } catch (_) {}
+    } else if (ev.data.kind === "request_balance") {
+      try {
+        var rb = Q.requestBalance ? Q.requestBalance(handle.lastWs) : null;
+        if ((!rb || !rb.ok) && brokerSockets && brokerSockets.length) {
+          for (var bi3 = 0; bi3 < brokerSockets.length; bi3++) {
+            var altWs3 = brokerSockets[bi3];
+            if (altWs3 && altWs3 !== handle.lastWs && altWs3.readyState === 1) {
+              try {
+                var rb2 = Q.requestBalance(altWs3);
+                if (rb2 && rb2.ok) { rb = rb2; break; }
+              } catch (_) {}
+            }
+          }
+        }
+        emit("subscribe_result", {
+          requestId: "balance_"+Date.now(),
+          asset: "",
+          ok: !!(rb && rb.ok),
+          payload: rb || {},
+        });
+      } catch (_) {}
+    } else if (ev.data.kind === "request_mtf") {
+      try {
+        var rm = Q.subscribeAllTimeframes ? Q.subscribeAllTimeframes(handle.lastWs, ev.data.payload && ev.data.payload.asset) : null;
+        emit("subscribe_result", {
+          requestId: "mtf_"+Date.now(),
+          asset: ev.data.payload && ev.data.payload.asset ? String(ev.data.payload.asset).slice(0,96) : "",
+          ok: !!(rm && rm.ok),
+          payload: rm || {},
+        });
+      } catch (_) {}
     } else if (ev.data.kind === "place_ws") {
       var args = ev.data.payload && typeof ev.data.payload === "object" ? ev.data.payload : {};
       var reqId = args.requestId != null ? String(args.requestId).slice(0, 128) : "";
