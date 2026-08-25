@@ -6,7 +6,7 @@
  *   - tools/page-hook.shell.js (MAIN-world WebSocket hook shell)
  *
  * Rebuild after any change to either source file.
- * Generated: 2026-08-24T19:02:12.394Z
+ * Generated: 2026-08-25T07:22:14.713Z
  */
 /* ====================================================================
  * Inlined CYBER_QUOTEX adapter (src/lib/quotex.js).
@@ -135,13 +135,52 @@
    * numeric tick rows (`[id, ts, price]`) resolve to a symbol.
    */
   function rememberIds(list) {
-    if (!Array.isArray(list)) return 0;
+    if (!list) return 0;
+    var arr = list;
+    if (!Array.isArray(arr)) {
+      if (arr && typeof arr === "object") {
+        if (Array.isArray(arr.instruments)) arr = arr.instruments;
+        else if (Array.isArray(arr.instrument)) arr = arr.instrument;
+        else if (Array.isArray(arr.data)) arr = arr.data;
+        else if (Array.isArray(arr.result)) arr = arr.result;
+        else {
+          var tmp = [];
+          for (var kk in arr) {
+            if (Object.prototype.hasOwnProperty.call(arr, kk)) {
+              var vv = arr[kk];
+              if (vv && typeof vv === "object") {
+                if (!vv.symbol) vv.symbol = kk;
+                tmp.push(vv);
+              }
+            }
+          }
+          arr = tmp;
+        }
+      }
+    }
+    if (!Array.isArray(arr)) return 0;
     var added = 0;
-    for (var i = 0; i < list.length && i < 5000; i++) {
-      var it = list[i];
-      if (!it || typeof it !== "object" || !it.symbol) continue;
-      var sym = normalizeSymbolName(it.symbol);
-      var id = positiveId(it.id);
+    for (var i = 0; i < arr.length && i < 5000; i++) {
+      var it = arr[i];
+      if (!it) continue;
+      var symRaw = null;
+      var idRaw = null;
+      if (typeof it === "object" && !Array.isArray(it)) {
+        symRaw = it.symbol || it.asset || it.code || it.name || null;
+        idRaw = it.id != null ? it.id : (it.assetId != null ? it.assetId : null);
+      } else if (Array.isArray(it) && it.length >= 2) {
+        if (typeof it[0] === "number" || /^\d+$/.test(String(it[0]).trim())) {
+          idRaw = it[0];
+          symRaw = it[1];
+        } else {
+          symRaw = it[0];
+          idRaw = it[2] != null ? it[2] : it[1];
+        }
+      } else if (typeof it === "string") {
+        symRaw = it;
+      }
+      var sym = normalizeSymbolName(symRaw);
+      var id = positiveId(idRaw);
       if (!sym) continue;
       var known = Object.prototype.hasOwnProperty.call(ASSET_IDS, sym);
       if (!known && runtimeSymbolCount >= MAX_RUNTIME_SYMBOLS) continue;
@@ -155,7 +194,6 @@
           added++;
         }
       } else if (!known) {
-        // Known symbol, id not (yet) present in the row — keep it listed.
         ASSET_IDS[sym] = 0;
         added++;
       }
@@ -176,6 +214,8 @@
       return false;
     }
   }
+
+  var ENGINE_IO_SEPARATOR = "\x1e";
 
   /* ============================================================
    * 2. Frame decoder. Accepts either a string or a Uint8Array/ArrayBuffer.
@@ -222,9 +262,24 @@
     if (typeof Uint8Array !== "undefined" && raw instanceof Uint8Array) {
       try { return bytesToStr(raw); } catch (_) { return ""; }
     }
+    if (typeof DataView !== "undefined" && raw instanceof DataView) {
+      try { return bytesToStr(new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength)); } catch (_) { return ""; }
+    }
+    if (typeof Buffer !== "undefined" && typeof Buffer.isBuffer === "function" && Buffer.isBuffer(raw)) {
+      try { return raw.toString("utf-8"); } catch (_) { return ""; }
+    }
     if (typeof Blob !== "undefined" && raw && typeof raw.text === "function") {
-      // async path — return a sentinel; caller will await `raw.text()`
       return "";
+    }
+    if (raw && typeof raw === "object" && raw.data != null) {
+      var inner = raw.data;
+      if (typeof inner === "string") return inner;
+      if (typeof ArrayBuffer !== "undefined" && inner instanceof ArrayBuffer) {
+        try { return bytesToStr(new Uint8Array(inner)); } catch (_) { return ""; }
+      }
+      if (typeof Uint8Array !== "undefined" && inner instanceof Uint8Array) {
+        try { return bytesToStr(inner); } catch (_) { return ""; }
+      }
     }
     try { return String(raw); } catch (_) { return ""; }
   }
@@ -334,12 +389,44 @@
       }
       return { type: "unknown", raw: s.length > 240 ? s.slice(0, 240) + "…" : s };
     }
-    // Binary body: byte 0x04 followed by JSON
-    if (s.charCodeAt(0) === 4 && s.length > 1) {
-      var j = safeJSON(s.slice(1));
-      return { type: "bin", event: null, payload: j, raw: s };
+    // Binary body: byte 0x04 followed by JSON (may also be 0x00+0x04 in some transports)
+    var firstCode = s.charCodeAt(0);
+    if ((firstCode === 4 || firstCode === 0) && s.length > 1) {
+      var startIdx = firstCode === 0 && s.charCodeAt(1) === 4 ? 2 : 1;
+      if (startIdx < s.length) {
+        var j = safeJSON(s.slice(startIdx));
+        return { type: "bin", event: null, payload: j, raw: s };
+      }
+    }
+    // Bare JSON array without 42 prefix (some builds)
+    if (s.charAt(0) === "[" && s.length > 2) {
+      var maybeArr = safeJSON(s);
+      if (Array.isArray(maybeArr) && maybeArr.length >= 1 && typeof maybeArr[0] === "string") {
+        return { type: "sio", event: String(maybeArr[0] || ""), payload: maybeArr.length > 1 ? maybeArr[1] : null, raw: s, bare: true };
+      }
     }
     return { type: "unknown", raw: s.length > 240 ? s.slice(0, 240) + "…" : s };
+  }
+
+  function decodeFrames(raw) {
+    var s = asString(raw);
+    if (!s) {
+      if (typeof Blob !== "undefined" && raw && typeof raw.text === "function") return [];
+      return [];
+    }
+    if (s.indexOf(ENGINE_IO_SEPARATOR) === -1) {
+      var single = decodeFrame(s);
+      return single ? [single] : [];
+    }
+    var parts = s.split(ENGINE_IO_SEPARATOR);
+    var out = [];
+    for (var i = 0; i < parts.length; i++) {
+      var part = parts[i];
+      if (!part) continue;
+      var f = decodeFrame(part);
+      if (f) out.push(f);
+    }
+    return out;
   }
 
   /* ============================================================
@@ -388,27 +475,37 @@
 
   function mapEventName(ev) {
     if (!ev) return "unknown";
-    // Direct mappings observed in the wild
     switch (ev) {
       case "s_authorization":      return "authenticated";
       case "instruments/list":      return "instruments";
+      case "instruments/list_v2":   return "instruments";
+      case "instruments/list/v2":   return "instruments";
+      case "instruments/update_list": return "instruments";
+      case "instruments/update":   return "instruments_update";
+      case "assets/list":           return "instruments";
       case "s_balance":            return "balance";
       case "balance":              return "balance";
       case "successupdateBalance": return "balance";
+      case "getBalance":           return "balance";
       case "s_orders/open":        return "order_opened";
       case "successopenOrder":     return "order_opened";
       case "s_orders/close":       return "order_closed";
       case "successcloseOrder":    return "order_closed";
       case "orders/closed/list":   return "orders_closed_list";
+      case "orders/open":          return "order_opened";
+      case "orders/close":         return "order_closed";
       case "quotes/stream":        return "quote";
-      // Older platform builds stream quotes under "tick" / "stream_update"
-      // (payload identical to quotes/stream: [[symbol, ts, price], ...]).
+      case "quotes/stream/v2":     return "quote";
       case "tick":                 return "quote";
       case "stream_update":        return "quote";
       case "quotes":               return "quote";
+      case "history/list":         return "candles";
       case "history/list/v2":      return "candles";
+      case "history/list/v3":      return "candles";
+      case "candles/history":      return "candles";
       case "chart_notification/get": return "candles";
       case "loadHistoryPeriod":    return "candles";
+      case "loadHistory":          return "candles";
       case "authorization/reject": return "auth_error";
       case "error":                return "error";
       default:                     return ev;
@@ -626,9 +723,18 @@
     if (!payload) return null;
     var body = payload;
     if (typeof payload === "object" && !Array.isArray(payload)) {
-      body = payload.data && !Array.isArray(payload.data) && typeof payload.data === "object"
-        ? payload.data
-        : (payload.result && !Array.isArray(payload.result) && typeof payload.result === "object" ? payload.result : payload);
+      if (payload.data && typeof payload.data === "object" && !Array.isArray(payload.data)) {
+        body = payload.data;
+      } else if (payload.result && typeof payload.result === "object" && !Array.isArray(payload.result)) {
+        body = payload.result;
+      }
+      if (body && typeof body === "object" && !Array.isArray(body)) {
+        if (body.data && typeof body.data === "object" && !Array.isArray(body.data) && (body.data.history || body.data.candles || body.data.data || body.data.bars)) {
+          body = body.data;
+        } else if (body.result && typeof body.result === "object" && !Array.isArray(body.result) && (body.result.history || body.result.candles)) {
+          body = body.result;
+        }
+      }
     }
     var asset = null;
     if (typeof body === "object" && !Array.isArray(body)) {
@@ -665,23 +771,25 @@
       else if (Array.isArray(body.data)) rows = body.data;
       else if (Array.isArray(body.result)) rows = body.result;
       else if (Array.isArray(body.quotes)) rows = body.quotes;
+      else if (Array.isArray(body.bars)) rows = body.bars;
       else if (Array.isArray(payload.history)) rows = payload.history;
       else if (Array.isArray(payload.candles)) rows = payload.candles;
       else if (Array.isArray(payload.data)) rows = payload.data;
       else if (Array.isArray(payload.result)) rows = payload.result;
       else if (Array.isArray(payload.quotes)) rows = payload.quotes;
+      else if (Array.isArray(payload.bars)) rows = payload.bars;
     }
 
     if (!Array.isArray(rows) || !rows.length) return null;
 
     if (typeof period === "object" && period != null) {
-      period = period.time != null ? period.time : (period.value != null ? period.value : 60);
+      period = period.time != null ? period.time : (period.value != null ? period.value : (period.sec != null ? period.sec : 60));
     }
     period = numberValue(period);
     if (period == null || period <= 0) {
       if (rows.length >= 2) {
-        var t0 = numberValue(Array.isArray(rows[0]) ? rows[0][0] : (rows[0] && rows[0].time));
-        var t1 = numberValue(Array.isArray(rows[1]) ? rows[1][0] : (rows[1] && rows[1].time));
+        var t0 = numberValue(Array.isArray(rows[0]) ? rows[0][0] : (rows[0] && (rows[0].time || rows[0].t)));
+        var t1 = numberValue(Array.isArray(rows[1]) ? rows[1][0] : (rows[1] && (rows[1].time || rows[1].t)));
         if (t0 != null && t1 != null) {
           while (t0 >= 1e14) t0 /= 1000;
           while (t1 >= 1e14) t1 /= 1000;
@@ -702,7 +810,7 @@
     var raw = Array.isArray(parsed.raw) ? parsed.raw : (Array.isArray(parsed) ? parsed : []);
     if (!raw.length) return [];
     var byTime = Object.create(null);
-    var start = Math.max(0, raw.length - 5000);
+    var start = Math.max(0, raw.length - 10000);
     // Vote on the array-row layout across the whole batch instead of guessing
     // per row. Layout A is Quotex's [ts, open, close, high, low]; layout B is
     // [ts, open, high, low, close]. A row only votes when its unique max/min
@@ -734,12 +842,12 @@
       if (!row) continue;
       var ts = null, o = null, c = null, hi = null, lo = null, vol = 0;
       if (typeof row === "object" && !Array.isArray(row)) {
-        ts = row.time != null ? row.time : (row.ts != null ? row.ts : row.timestamp);
-        o = row.open != null ? row.open : row.o;
-        c = row.close != null ? row.close : (row.c != null ? row.c : row.price);
-        var rH = row.high != null ? row.high : row.h;
-        var rL = row.low != null ? row.low : row.l;
-        var rV = row.volume != null ? row.volume : (row.vol != null ? row.vol : row.v);
+        ts = row.time != null ? row.time : (row.ts != null ? row.ts : (row.t != null ? row.t : row.timestamp));
+        o = row.open != null ? row.open : (row.o != null ? row.o : null);
+        c = row.close != null ? row.close : (row.c != null ? row.c : (row.price != null ? row.price : null));
+        var rH = row.high != null ? row.high : (row.h != null ? row.h : null);
+        var rL = row.low != null ? row.low : (row.l != null ? row.l : null);
+        var rV = row.volume != null ? row.volume : (row.vol != null ? row.vol : (row.v != null ? row.v : null));
         o = numberValue(o);
         c = numberValue(c);
         rH = numberValue(rH);
@@ -748,9 +856,13 @@
         if (o != null && c != null) {
           hi = Math.max(o, c);
           lo = Math.min(o, c);
-          if (rH != null && rH > 0 && rH <= 1e100) { hi = Math.max(hi, rH); lo = Math.min(lo, rH); }
-          if (rL != null && rL > 0 && rL <= 1e100) { hi = Math.max(hi, rL); lo = Math.min(lo, rL); }
+          if (rH != null && rH > 0 && rH <= 1e12) { hi = Math.max(hi, rH); lo = Math.min(lo, rH); }
+          if (rL != null && rL > 0 && rL <= 1e12) { hi = Math.max(hi, rL); lo = Math.min(lo, rL); }
         }
+      } else if (Array.isArray(row) && row.length === 2) {
+        ts = row[0];
+        var pr = numberValue(row[1]);
+        if (pr != null && pr > 0) { o = pr; c = pr; hi = pr; lo = pr; }
       } else if (Array.isArray(row) && row.length >= 5) {
         ts = row[0];
         o = numberValue(row[1]);
@@ -759,8 +871,6 @@
         var p4 = numberValue(row[4]);
         if (o != null && p2 != null && p3 != null && p4 != null &&
             o > 0 && p2 > 0 && p3 > 0 && p4 > 0) {
-          // Honour the batch-level layout vote; clamp into a valid OHLC range
-          // afterwards so one glitched row can never poison it.
           if (layoutB) { c = p4; hi = p2; lo = p3; }
           else { c = p2; hi = p3; lo = p4; }
           hi = Math.max(o, c, hi, lo);
@@ -770,22 +880,84 @@
       }
       if (ts == null || o == null || c == null || hi == null || lo == null ||
           o <= 0 || c <= 0 || hi <= 0 || lo <= 0 ||
-          o > 1e100 || c > 1e100 || hi > 1e100 || lo > 1e100) continue;
+          o > 1e12 || c > 1e12 || hi > 1e12 || lo > 1e12) continue;
       var tMs = toMs(ts);
-      // Tolerate up to 24h of broker-server-vs-local clock skew. The old
-      // +5min bound silently dropped EVERY candle whenever the user's PC
-      // clock ran behind Quotex's server, keeping feeds on synthetic seeds.
-      if (tMs == null || tMs < 946684800000 || tMs > Date.now() + 86400000) continue;
-      byTime[tMs] = {
+      if (tMs == null || tMs < 946684800000 || tMs > Date.now() + 2 * 86400000) continue;
+      var candle = {
         time: tMs,
         open: o, high: hi, low: lo, close: c,
-        volume: Number.isFinite(vol) && vol >= 0 ? Math.min(vol, 1e100) : 0,
+        volume: Number.isFinite(vol) && vol >= 0 ? Math.min(vol, 1e12) : 0,
       };
+      if (!isValidCandle(candle)) continue;
+      byTime[tMs] = candle;
     }
     var times = Object.keys(byTime).map(Number).sort(function (x, y) { return x - y; });
     var out = [];
     for (var j = 0; j < times.length; j++) out.push(byTime[times[j]]);
     return out;
+  }
+
+  function isValidCandle(c) {
+    if (!c || typeof c !== "object") return false;
+    var t = numberValue(c.time), o = numberValue(c.open), h = numberValue(c.high), l = numberValue(c.low), cc = numberValue(c.close);
+    if (t == null || o == null || h == null || l == null || cc == null) return false;
+    if (o <= 0 || h <= 0 || l <= 0 || cc <= 0) return false;
+    if (o > 1e12 || h > 1e12 || l > 1e12 || cc > 1e12) return false;
+    if (h < Math.max(o, cc) - 1e-9) return false;
+    if (l > Math.min(o, cc) + 1e-9) return false;
+    if (h < l) return false;
+    return true;
+  }
+
+  function detectGaps(candles, periodSec) {
+    if (!Array.isArray(candles) || candles.length < 2) return [];
+    var period = numberValue(periodSec);
+    period = period != null && period > 0 ? Math.floor(period) : 60;
+    var periodMs = period * 1000;
+    var gaps = [];
+    for (var i = 1; i < candles.length; i++) {
+      var prev = candles[i-1], cur = candles[i];
+      if (!prev || !cur) continue;
+      var pt = numberValue(prev.time), ct = numberValue(cur.time);
+      if (pt == null || ct == null) continue;
+      var diff = ct - pt;
+      if (diff > periodMs * 1.5) {
+        var missing = Math.round(diff / periodMs) - 1;
+        if (missing > 0 && missing <= 1000) {
+          gaps.push({ from: pt + periodMs, to: ct - periodMs, missing: missing, after: pt, before: ct });
+        }
+      }
+    }
+    return gaps;
+  }
+
+  function mergeCandleArrays(existing, incoming) {
+    if (!Array.isArray(existing) || !existing.length) return Array.isArray(incoming) ? incoming.slice() : [];
+    if (!Array.isArray(incoming) || !incoming.length) return existing.slice();
+    var map = Object.create(null);
+    for (var i = 0; i < existing.length; i++) {
+      var e = existing[i];
+      if (e && e.time != null) map[e.time] = e;
+    }
+    for (var j = 0; j < incoming.length; j++) {
+      var inc = incoming[j];
+      if (inc && inc.time != null) map[inc.time] = inc;
+    }
+    var times = Object.keys(map).map(Number).sort(function(a,b){ return a-b; });
+    var out = [];
+    for (var k = 0; k < times.length; k++) out.push(map[times[k]]);
+    return out;
+  }
+
+  function getTimeframeLabel(periodSec) {
+    var p = numberValue(periodSec);
+    if (p == null) return "unknown";
+    p = Math.floor(p);
+    if (KNOWN_TIMEFRAMES[p]) return KNOWN_TIMEFRAMES[p];
+    if (p < 60) return p + "s";
+    if (p < 3600) return Math.round(p/60) + "m";
+    if (p < 86400) return Math.round(p/3600) + "h";
+    return Math.round(p/86400) + "d";
   }
 
   function toMs(ts) {
@@ -808,13 +980,11 @@
   function parseQuote(payload, depth) {
     if (!payload) return null;
     depth = Number.isInteger(depth) ? depth : 0;
-    // Object wrappers seen on broker builds. Unwrap objects as well as arrays;
-    // transports may emit {data:{symbol,time,price}} rather than a bare row.
     if (!Array.isArray(payload) && typeof payload === "object") {
       var wrapped = payload.tick != null ? payload.tick
         : (payload.quotes != null ? payload.quotes
         : (payload.quote != null ? payload.quote
-        : (payload.data != null ? payload.data : payload.result)));
+        : (payload.data != null ? payload.data : (payload.result != null ? payload.result : null))));
       if (wrapped != null && wrapped !== payload) {
         if (depth >= 8) return null;
         return parseQuote(wrapped, depth + 1);
@@ -824,20 +994,17 @@
     if (Array.isArray(payload)) {
       if (!payload.length) return null;
       var first = Array.isArray(payload[0]) ? payload[0] : payload;
-      // [symbol, ts, price, ...]
       if (typeof first[0] === "string" && !/^\d+$/.test(first[0].trim())) {
         symbol = String(first[0]);
         ts = first[1];
         price = numberValue(first[2]);
+        if (price == null && first.length >= 4) price = numberValue(first[3]);
       }
-      // [ts, symbol, price]
       if (price == null && typeof first[1] === "string") {
         ts = first[0];
         symbol = String(first[1]);
         price = numberValue(first[2]);
       }
-      // [assetId, ts, price] — resolve the numeric broker id to a symbol.
-      // Some broker regions serialize every tuple field as a string.
       var numericId = numberValue(first[0]);
       var numericTs = numberValue(first[1]);
       if (price == null && numericId != null && numericTs != null && first.length >= 3) {
@@ -846,27 +1013,32 @@
           symbol = byId;
           ts = numericTs;
           price = numberValue(first[2]);
+          if (price == null && first.length >= 4) price = numberValue(first[3]);
+        } else if (first.length === 3) {
+          symbol = String(first[0]);
+          ts = numericTs;
+          price = numberValue(first[2]);
         }
       }
-      // [ts, price] — two-element rows on some streams. Headerless quotes
-      // cannot identify an asset here and are therefore rejected below.
       if (price == null && numericTs != null && first.length === 2) {
         ts = first[0];
         price = numericTs;
       }
     } else if (typeof payload === "object") {
-      symbol = payload.symbol || payload.asset || payload.pair || null;
-      ts = payload.time != null ? payload.time : (payload.ts != null ? payload.ts : null);
+      symbol = payload.symbol || payload.asset || payload.pair || payload.code || null;
+      ts = payload.time != null ? payload.time : (payload.ts != null ? payload.ts : (payload.timestamp != null ? payload.timestamp : null));
       price = payload.price != null ? numberValue(payload.price)
             : payload.value != null ? numberValue(payload.value)
-            : payload.close != null ? numberValue(payload.close) : null;
+            : payload.close != null ? numberValue(payload.close)
+            : payload.bid != null ? numberValue(payload.bid) : null;
+      if (price == null && payload.ask != null) price = numberValue(payload.ask);
     }
     var symbolId = numberValue(symbol);
     if (symbolId != null && /^\d+$/.test(String(symbol).trim()) && ID_TO_SYMBOL[symbolId]) {
       symbol = ID_TO_SYMBOL[symbolId];
     }
     symbol = normalizeSymbolName(symbol);
-    if (!symbol || price == null || !Number.isFinite(price) || price <= 0 || price > 1e100) return null;
+    if (!symbol || price == null || !Number.isFinite(price) || price <= 0 || price > 1e12) return null;
     return {
       symbol: symbol,
       time: toMs(ts),
@@ -890,7 +1062,7 @@
     var out = [];
     if (Array.isArray(payload) && payload.length &&
         (Array.isArray(payload[0]) || (payload[0] && typeof payload[0] === "object"))) {
-      var quoteStart = Math.max(0, payload.length - 5000);
+      var quoteStart = Math.max(0, payload.length - 10000);
       for (var i = quoteStart; i < payload.length; i++) {
         var nested = parseQuote(payload[i]);
         if (nested) out.push(nested);
@@ -1297,12 +1469,12 @@
     var wanted = Math.round(requested);
     var el = findExpirySelect();
     if (!el) {
-      // If no explicit expiry input is located on the DOM (e.g. fixed 1m chart timeframe),
-      // allow default 60s without failing/disarming.
-      if (wanted === 60) {
-        return { ok: true, expiry: 60, fallback: true };
-      }
-      return { ok: false, error: "expiry control not found" };
+      // If no explicit expiry input is located on the DOM (e.g. fixed timeframe
+      // or new Quotex layout), don't block the trade. WS path doesn't need DOM
+      // expiry at all, and DOM path will still click CALL/PUT with broker's
+      // current expiry. Returning fallback allows any configured expiry (0.5-1440m)
+      // to proceed instead of only 60s.
+      return { ok: true, expiry: wanted, fallback: true };
     }
     try {
       var currentVal = (el.value != null ? String(el.value) : "") + " " + visibleText(el);
@@ -1742,14 +1914,16 @@
     // Quotex's regular-market binary contract expects an ABSOLUTE unix
     // expiry, rounded to the minute. Epoch arithmetic avoids local-time DST
     // jumps that Date#setMinutes can introduce.
+    // Correct logic: floor(now/60)+minutes gives the next N minute boundaries.
+    // e.g. 10:00:01 + 1m => 10:01, 10:00:01 + 3m => 10:03.
+    // If expiry would be <30s away, push one more minute to avoid broker
+    // rejection (broker requires minimum time to expiry). This prevents 1m
+    // trades placed at :50 from being rejected and appearing as \"only 3m works\".
     var nowSec = Math.floor(baseNow / 1000);
-    // v2.7.1: round up to the next minute boundary if not exactly on one.
-    // The old logic added an extra minute when past the 30-second mark, which
-    // caused a 1-minute expiry at 10:00:31 to become 10:02 instead of 10:01.
     var currentMinute = Math.floor(nowSec / 60);
-    var secondsIntoMinute = nowSec % 60;
-    var baseMinute = secondsIntoMinute > 0 ? currentMinute + 1 : currentMinute;
-    return (baseMinute + minutes) * 60;
+    var expiry = (currentMinute + minutes) * 60;
+    if (expiry - nowSec < 30) expiry += 60;
+    return expiry;
   }
 
   /* ------------------------------------------------------------------
@@ -1910,7 +2084,7 @@
         asset: payload.asset,
         amount: payload.amount,
         expiry: parseInt(args.expirySec != null ? args.expirySec : args.expiry, 10) || 60,
-        expiryTime: payload.optionType === 1 ? payload.time * 1000 : Date.now() + payload.time * 1000,
+        expiryTime: payload.optionType === 1 ? payload.time * 1000 : (function(){ var bn = numberValue(args.nowMs); return (bn != null && bn > 0 ? bn : Date.now()) + payload.time * 1000; })(),
         optionType: payload.optionType,
         message: msg,
       };
@@ -2132,27 +2306,27 @@
         var ev = frame.event || pendingHeader;
         if (pendingCount > 0) pendingCount -= 1;
         if (pendingCount <= 0) pendingHeader = null;
-        if (ev === "instruments/list" || ev === "instruments/update" || ev === "assets/list") {
+        if (ev === "instruments/list" || ev === "instruments/list_v2" || ev === "instruments/list/v2" || ev === "instruments/update" || ev === "assets/list" || ev === "instruments/update_list") {
           emitInstruments(frame.payload);
           return;
         }
-        if (ev === "quotes/stream") {
+        if (ev === "quotes/stream" || ev === "quotes/stream/v2" || ev === "tick" || ev === "quotes") {
           emitTick(frame.payload);
           return;
         }
-        if (ev === "s_balance" || ev === "balance" || ev === "successupdateBalance") {
+        if (ev === "s_balance" || ev === "balance" || ev === "successupdateBalance" || ev === "getBalance") {
           emitBalance(frame.payload);
           return;
         }
-        if (ev === "s_orders/open" || ev === "successopenOrder") {
+        if (ev === "s_orders/open" || ev === "successopenOrder" || ev === "orders/open") {
           emitOrderOpen(frame.payload);
           return;
         }
-        if (ev === "s_orders/close" || ev === "successcloseOrder" || ev === "orders/closed/list") {
+        if (ev === "s_orders/close" || ev === "successcloseOrder" || ev === "orders/closed/list" || ev === "s_orders/close" || ev === "orders/close") {
           emitOrderClosed(frame.payload);
           return;
         }
-        if (ev === "history/list/v2" || ev === "chart_notification/get" || ev === "loadHistoryPeriod") {
+        if (ev === "history/list" || ev === "history/list/v2" || ev === "history/list/v3" || ev === "chart_notification/get" || ev === "loadHistoryPeriod" || ev === "loadHistory" || ev === "candles/history") {
           emitCandles(frame.payload);
           return;
         }
@@ -2198,6 +2372,16 @@
           emitTick(frame.payload);
         } else if (ev3 === "candles") {
           emitCandles(frame.payload);
+        } else if (ev3 === "instruments_update") {
+          if (frame.payload && typeof frame.payload === "object") {
+            var updSym = frame.payload.asset || frame.payload.symbol;
+            if (updSym) emitAsset(updSym, frame.payload);
+            if (Array.isArray(frame.payload.instruments) || Array.isArray(frame.payload.instrument) || Array.isArray(frame.payload.data)) {
+              emitInstruments(frame.payload);
+            }
+          } else if (typeof frame.payload === "string") {
+            emitAsset(frame.payload, null);
+          }
         } else if (ev3 === "asset" || frame.event === "instruments/follow" || frame.event === "instruments/update") {
           var assetSymbol = frame.payload && typeof frame.payload === "object"
             ? (frame.payload.asset || frame.payload.symbol) : frame.payload;
@@ -2218,14 +2402,56 @@
     var rawQueue = null;
     function feedRaw(raw) {
       var asyncRaw = raw && typeof raw === "object" && typeof raw.text === "function";
-      if (!rawQueue && !asyncRaw) {
-        try { dispatch(decodeFrame(raw)); } catch (_) {}
+      var isBlob = typeof Blob !== "undefined" && raw instanceof Blob;
+      var isArrayBuf = typeof ArrayBuffer !== "undefined" && raw instanceof ArrayBuffer;
+      var isTypedArr = typeof Uint8Array !== "undefined" && raw instanceof Uint8Array;
+      var isDataView = typeof DataView !== "undefined" && raw instanceof DataView;
+      if (!rawQueue && !asyncRaw && !isBlob) {
+        try {
+          var str = isArrayBuf || isTypedArr || isDataView ? asString(raw) : (typeof raw === "string" ? raw : "");
+          if (str && str.indexOf(ENGINE_IO_SEPARATOR) !== -1) {
+            var frames = decodeFrames(str);
+            for (var fi = 0; fi < frames.length; fi++) dispatch(frames[fi]);
+          } else {
+            dispatch(decodeFrame(raw));
+          }
+        } catch (_) {}
         return;
       }
       var prior = rawQueue || Promise.resolve();
       var task = prior.then(function () {
-        if (asyncRaw) return raw.text().then(function (s) { dispatch(decodeFrame(s)); });
-        dispatch(decodeFrame(raw));
+        if (asyncRaw || isBlob) {
+          var textPromise;
+          if (isBlob) {
+            textPromise = raw.text ? raw.text() : new Promise(function(res){
+              var fr = new FileReader();
+              fr.onload = function(){ res(fr.result); };
+              fr.onerror = function(){ res(""); };
+              fr.readAsText(raw);
+            });
+          } else {
+            textPromise = raw.text();
+          }
+          return textPromise.then(function (s) {
+            try {
+              if (s && s.indexOf(ENGINE_IO_SEPARATOR) !== -1) {
+                var fs = decodeFrames(s);
+                for (var i = 0; i < fs.length; i++) dispatch(fs[i]);
+              } else {
+                dispatch(decodeFrame(s));
+              }
+            } catch (_) {}
+          });
+        }
+        try {
+          var s2 = asString(raw);
+          if (s2 && s2.indexOf(ENGINE_IO_SEPARATOR) !== -1) {
+            var frames2 = decodeFrames(s2);
+            for (var fj = 0; fj < frames2.length; fj++) dispatch(frames2[fj]);
+          } else {
+            dispatch(decodeFrame(raw));
+          }
+        } catch (_) {}
         return null;
       });
       var settled = task.catch(function () {});
@@ -2255,16 +2481,15 @@
     if (!s) return null;
     var idx = s.indexOf('["');
     if (idx < 0) return null;
-    // Only Socket.IO payload frames (42… / 43… / 451-… / 46…).
     var prefix = s.charAt(0);
     if (!(prefix === "4" || prefix === "5")) return null;
-    if (s.indexOf("42") !== 0 && s.indexOf("43") !== 0 && s.indexOf("451-") !== 0 && s.indexOf("46") !== 0) return null;
+    var hasValidPrefix = s.indexOf("42") === 0 || s.indexOf("43") === 0 || s.indexOf("45") === 0 || s.indexOf("46") === 0;
+    if (!hasValidPrefix) return null;
     var arr = safeJSON(s.slice(s.indexOf("[")));
     if (!Array.isArray(arr) || arr.length < 1) return null;
     var ev = String(arr[0] || "");
     var body = arr.length > 1 ? arr[1] : null;
-    // Only events that carry an asset/symbol reference.
-    if (!/^(instruments\/follow|instruments\/update|history\/list\/v2|chart_notification\/get|loadHistoryPeriod|quotes\/stream|orders\/open|instruments\/update_list|tick)$/.test(ev)) return null;
+    if (!/^(instruments\/follow|instruments\/update|history\/list|history\/list\/v2|history\/list\/v3|chart_notification\/get|loadHistoryPeriod|loadHistory|candles\/history|quotes\/stream|orders\/open|instruments\/update_list|tick|instruments\/unfollow)$/.test(ev)) return null;
     var asset = null;
     var period = null;
     if (body && typeof body === "object") {
@@ -2405,11 +2630,16 @@
     attachPageSocket: attachPageSocket,
     createRouter: createRouter,
     decodeFrame: decodeFrame,
+    decodeFrames: decodeFrames,
     decodeMessage: decodeMessage,
     normalizeEvent: normalizeEvent,
     parseInstruments: parseInstruments,
     parseCandles: parseCandles,
     normalizeCandles: normalizeCandles,
+    detectGaps: detectGaps,
+    mergeCandleArrays: mergeCandleArrays,
+    isValidCandle: isValidCandle,
+    getTimeframeLabel: getTimeframeLabel,
     parseQuote: parseQuote,
     parseQuotes: parseQuotes,
     parseBalance: parseBalance,
@@ -2443,7 +2673,7 @@
      * chart opens, so nothing extra is needed to receive `quotes/stream` and
      * `history/list/v2` frames from the server. Safe to call repeatedly.
      */
-    subscribeHistory: function (ws, asset, period, limit) {
+    subscribeHistory: function (ws, asset, period, limit, offset) {
       if (!ws || typeof ws.send !== "function") return { ok: false, error: "no websocket handle" };
       if (ws.readyState != null && numberValue(ws.readyState) !== 1) return { ok: false, error: "websocket is not open" };
       var sym = normalizeSymbolName(asset || "");
@@ -2451,17 +2681,93 @@
       period = numberValue(period);
       period = period != null && period > 0 ? Math.min(86400, Math.floor(period)) : 60;
       limit = numberValue(limit);
-      limit = limit != null ? Math.max(60, Math.min(5000, Math.floor(limit))) : 5000;
+      limit = limit != null ? Math.max(60, Math.min(10000, Math.floor(limit))) : 5000;
+      offset = numberValue(offset);
+      offset = offset != null ? Math.max(0, Math.min(1000000, Math.floor(offset))) : 0;
       try {
         ws.send('42["tick"]');
         ws.send('42["instruments/follow","' + sym + '"]');
         ws.send('42["instruments/update",{"asset":"' + sym + '","period":' + period + '}]');
-        // chart_notification/get does not return OHLC history on every Quotex
-        // build. Request the actual history endpoint explicitly; otherwise the
-        // cache receives ticks only and can take hours to become backtestable.
-        ws.send('42["history/list/v2",{"asset":"' + sym + '","period":' + period + ',"offset":0,"limit":' + limit + '}]');
+        ws.send('42["history/list/v2",{"asset":"' + sym + '","period":' + period + ',"offset":' + offset + ',"limit":' + limit + '}]');
+        ws.send('42["history/list",{"asset":"' + sym + '","period":' + period + ',"offset":' + offset + ',"limit":' + limit + '}]');
+        ws.send('42["history/list/v3",{"asset":"' + sym + '","period":' + period + ',"offset":' + offset + ',"limit":' + limit + '}]');
         ws.send('42["chart_notification/get",{"asset":"' + sym + '","version":"1.0.0"}]');
-        return { ok: true, asset: sym, period: period, limit: limit };
+        ws.send('42["loadHistoryPeriod",{"asset":"' + sym + '","period":' + period + ',"offset":' + offset + ',"limit":' + limit + '}]');
+        ws.send('42["loadHistory",{"asset":"' + sym + '","period":' + period + ',"offset":' + offset + ',"limit":' + limit + '}]');
+        ws.send('42["candles/history",{"asset":"' + sym + '","period":' + period + ',"offset":' + offset + ',"limit":' + limit + '}]');
+        ws.send('42["history/list/v2",{"asset":"' + sym + '","period":' + period + ',"offset":' + offset + ',"count":' + limit + '}]');
+        return { ok: true, asset: sym, period: period, limit: limit, offset: offset };
+      } catch (e) {
+        return { ok: false, error: String(e && e.message || e) };
+      }
+    },
+    subscribeAllTimeframes: function (ws, asset) {
+      if (!ws || typeof ws.send !== "function") return { ok: false, error: "no websocket handle" };
+      var sym = normalizeSymbolName(asset || "");
+      if (!sym) return { ok: false, error: "asset required" };
+      var timeframes = [60, 300, 900, 1800, 3600];
+      var results = [];
+      for (var i = 0; i < timeframes.length; i++) {
+        var r = this.subscribeHistory(ws, sym, timeframes[i], timeframes[i] === 60 ? 5000 : 2000, 0);
+        results.push(r);
+      }
+      return { ok: true, asset: sym, results: results };
+    },
+    subscribeHistoryBatch: function (ws, asset, period, batches, batchSize) {
+      if (!ws || typeof ws.send !== "function") return { ok: false, error: "no websocket handle" };
+      var sym = normalizeSymbolName(asset || "");
+      if (!sym) return { ok: false, error: "asset required" };
+      period = numberValue(period);
+      period = period != null && period > 0 ? Math.min(86400, Math.floor(period)) : 60;
+      batches = numberValue(batches);
+      batches = batches != null ? Math.max(1, Math.min(20, Math.floor(batches))) : 3;
+      batchSize = numberValue(batchSize);
+      batchSize = batchSize != null ? Math.max(60, Math.min(10000, Math.floor(batchSize))) : 5000;
+      var results = [];
+      for (var b = 0; b < batches; b++) {
+        var offset = b * batchSize;
+        var r = this.subscribeHistory(ws, sym, period, batchSize, offset);
+        results.push(r);
+      }
+      return { ok: true, asset: sym, period: period, batches: batches, results: results };
+    },
+    requestMissingHistory: function (ws, asset, period, gaps) {
+      if (!ws || typeof ws.send !== "function") return { ok: false, error: "no websocket handle" };
+      if (!Array.isArray(gaps) || !gaps.length) return { ok: false, error: "no gaps" };
+      var sym = normalizeSymbolName(asset || "");
+      if (!sym) return { ok: false, error: "asset required" };
+      period = numberValue(period);
+      period = period != null && period > 0 ? Math.min(86400, Math.floor(period)) : 60;
+      var results = [];
+      for (var i = 0; i < Math.min(gaps.length, 5); i++) {
+        var gap = gaps[i];
+        if (!gap) continue;
+        var needed = Math.min(5000, Math.max(60, (gap.missing || 10) + 10));
+        var r = this.subscribeHistory(ws, sym, period, needed, 0);
+        results.push({ gap: gap, result: r });
+      }
+      return { ok: true, asset: sym, period: period, results: results };
+    },
+    requestInstruments: function (ws) {
+      if (!ws || typeof ws.send !== "function") return { ok: false, error: "no websocket handle" };
+      try {
+        ws.send('42["instruments/list"]');
+        ws.send('42["instruments/list_v2"]');
+        ws.send('42["instruments/list/v2"]');
+        ws.send('42["assets/list"]');
+        ws.send('42["instruments/update_list"]');
+        return { ok: true };
+      } catch (e) {
+        return { ok: false, error: String(e && e.message || e) };
+      }
+    },
+    requestBalance: function (ws) {
+      if (!ws || typeof ws.send !== "function") return { ok: false, error: "no websocket handle" };
+      try {
+        ws.send('42["s_balance"]');
+        ws.send('42["balance"]');
+        ws.send('42["getBalance"]');
+        return { ok: true };
       } catch (e) {
         return { ok: false, error: String(e && e.message || e) };
       }
@@ -2495,6 +2801,7 @@
     EXTRA_SYMBOLS: EXTRA_SYMBOLS,
     ID_TO_SYMBOL: ID_TO_SYMBOL,
     KNOWN_TIMEFRAMES: KNOWN_TIMEFRAMES,
+    ENGINE_IO_SEPARATOR: ENGINE_IO_SEPARATOR,
   }, enumerable: false, writable: true, configurable: true });
 })(typeof self !== "undefined" ? self : this);
 
@@ -2556,17 +2863,32 @@
   }
 
   var live = {
-    candles: Object.create(null), // asset@period -> latest candles array
-    candlesVerified: Object.create(null), // asset@period -> batch was symbol-verified
-    ticks: Object.create(null),   // asset -> last tick { price, time }
-    instruments: [],  // broker-discovered instruments
+    candles: Object.create(null),
+    candlesVerified: Object.create(null),
+    ticks: Object.create(null),
+    instruments: [],
     balance: null,
-    orders: [],       // rolling list of recent orders (last 50)
+    orders: [],
     status: { state: "idle", url: null },
-    assetIdMap: {},   // broker numeric id -> symbol
-    lastWsSymbol: null, // authoritative main-chart symbol (legacy snapshot field)
+    assetIdMap: {},
+    lastWsSymbol: null,
     lastWsPeriod: 60,
-    activeChart: null,  // {symbol, period, source, at}; never derived from quote fan-out
+    activeChart: null,
+    activeAssets: Object.create(null),
+    dataStats: {
+      candlesReceived: 0,
+      ticksReceived: 0,
+      lastCandleAt: 0,
+      lastTickAt: 0,
+      socketsSeen: 0,
+      reconnections: 0,
+      gapsDetected: 0,
+      instrumentsUpdates: 0,
+      balanceUpdates: 0
+    },
+    socketMeta: Object.create(null), // wsId -> {url, createdAt, lastMsgAt, msgCount, isOpen}
+    lastInstrumentsAt: 0,
+    lastBalanceAt: 0,
   };
 
   var internalSubscriptionSend = false;
@@ -2620,37 +2942,79 @@
       var asset = msg.asset || (live.activeChart && live.activeChart.symbol) || live.lastWsSymbol || "EURUSD";
       var period = msg.period || live.lastWsPeriod || 60;
       var key = asset + "@" + period;
-      live.candles[key] = Array.isArray(msg.candles) ? msg.candles.slice(-5000) : [];
+      var incoming = Array.isArray(msg.candles) ? msg.candles.slice(-10000) : [];
+      // v2.8: merge instead of replace when we already have data for this key
+      // This prevents newer small batches from wiping larger history, and handles
+      // pagination correctly. Use Q.mergeCandleArrays if available.
+      if (live.candles[key] && live.candles[key].length && incoming.length) {
+        try {
+          if (Q.mergeCandleArrays) {
+            live.candles[key] = Q.mergeCandleArrays(live.candles[key], incoming);
+            if (live.candles[key].length > 10000) live.candles[key] = live.candles[key].slice(-10000);
+          } else {
+            // Fallback merge
+            var map = Object.create(null);
+            var existing = live.candles[key];
+            for (var ei = 0; ei < existing.length; ei++) {
+              if (existing[ei] && existing[ei].time != null) map[existing[ei].time] = existing[ei];
+            }
+            for (var ii = 0; ii < incoming.length; ii++) {
+              if (incoming[ii] && incoming[ii].time != null) map[incoming[ii].time] = incoming[ii];
+            }
+            var times = Object.keys(map).map(Number).sort(function(a,b){return a-b;}).slice(-10000);
+            var merged = [];
+            for (var mi = 0; mi < times.length; mi++) merged.push(map[times[mi]]);
+            live.candles[key] = merged;
+          }
+        } catch (_) {
+          live.candles[key] = incoming;
+        }
+      } else {
+        live.candles[key] = incoming;
+      }
       if (msg.verified != null) live.candlesVerified[key] = !!msg.verified;
+      try {
+        live.dataStats.candlesReceived++;
+        live.dataStats.lastCandleAt = Date.now();
+        // Gap detection for quality tracking
+        if (Q.detectGaps && live.candles[key].length >= 2) {
+          var gaps = Q.detectGaps(live.candles[key], period);
+          if (gaps.length) live.dataStats.gapsDetected += gaps.length;
+        }
+      } catch (_) {}
       var oldKeyAt = candleKeyOrder.indexOf(key);
       if (oldKeyAt >= 0) candleKeyOrder.splice(oldKeyAt, 1);
       candleKeyOrder.push(key);
-      while (candleKeyOrder.length > 24) {
+      while (candleKeyOrder.length > 150) {
         var droppedKey = candleKeyOrder.shift();
         delete live.candles[droppedKey];
         delete live.candlesVerified[droppedKey];
       }
-      // History is low-frequency and remains available per asset/timeframe;
-      // it never changes activeChart.
       emit("candle", { asset: asset, period: period, candles: live.candles[key], verified: live.candlesVerified[key] === true });
     },
     onTick: function (q) {
       if (!q || !q.symbol) return;
       if (!Object.prototype.hasOwnProperty.call(live.ticks, q.symbol)) tickKeyOrder.push(q.symbol);
+      // Always update tick storage — this is cheap and ensures snapshot has latest
       live.ticks[q.symbol] = q;
-      while (tickKeyOrder.length > 500) {
+      try {
+        live.dataStats.ticksReceived++;
+        live.dataStats.lastTickAt = Date.now();
+      } catch (_) {}
+      while (tickKeyOrder.length > 1200) {
         var oldSymbol = tickKeyOrder.shift();
         delete live.ticks[oldSymbol];
         delete backgroundTickAt[oldSymbol];
       }
-      // Quote streams can contain hundreds of subscribed instruments. Keep
-      // bounded latest values for snapshots, but rate-limit background bridges
-      // globally so they cannot dominate the selected chart's UI updates.
       var main = !!(live.activeChart &&
         Q.normalizeSymbol(live.activeChart.symbol) === Q.normalizeSymbol(q.symbol));
       var now = Date.now();
-      var allowBackground = !main && now - lastBackgroundEmitAt >= 1000 &&
-        now - (backgroundTickAt[q.symbol] || 0) >= 30000;
+      var normSym = Q.normalizeSymbol(q.symbol);
+      var isActiveAsset = !!(live.activeAssets && live.activeAssets[normSym]);
+      // v2.8: more responsive throttling — active assets get 2s, main gets instant, background 15s
+      var throttleMs = main ? 0 : (isActiveAsset ? 2000 : 15000);
+      var allowBackground = !main && now - lastBackgroundEmitAt >= 200 &&
+        now - (backgroundTickAt[q.symbol] || 0) >= throttleMs;
       if (main || allowBackground) {
         if (allowBackground) { backgroundTickAt[q.symbol] = now; lastBackgroundEmitAt = now; }
         emit("tick", {
@@ -2665,8 +3029,11 @@
         var it = live.instruments[i];
         if (it && it.symbol && it.id) live.assetIdMap[it.id] = it.symbol;
       }
-      // Learn broker ids so numeric tick rows ([id, ts, price]) resolve.
-      try { if (Q.rememberIds) Q.rememberIds(live.instruments); } catch (_) {}
+      try {
+        if (Q.rememberIds) Q.rememberIds(live.instruments);
+        live.dataStats.instrumentsUpdates++;
+        live.lastInstrumentsAt = Date.now();
+      } catch (_) {}
       emit("instruments", live.instruments);
     },
     onAsset: function (symbol, hit) {
@@ -2677,6 +3044,10 @@
     },
     onBalance: function (b) {
       live.balance = b;
+      try {
+        live.dataStats.balanceUpdates++;
+        live.lastBalanceAt = Date.now();
+      } catch (_) {}
       emit("balance", b);
     },
     onOrderError: function (e) {
@@ -3512,12 +3883,20 @@
   })();
 
   function snapshot() {
+    var sockMetaArr = [];
+    try {
+      for (var mk in live.socketMeta) {
+        if (Object.prototype.hasOwnProperty.call(live.socketMeta, mk)) {
+          sockMetaArr.push(live.socketMeta[mk]);
+        }
+      }
+    } catch (_) {}
     return {
       enabled: true,
       status: live.status,
       instruments: live.instruments,
       balance: live.balance,
-      orders: live.orders.slice(0, 20),
+      orders: live.orders.slice(0, 50),
       ticks: live.ticks,
       candles: live.candles,
       candlesVerified: live.candlesVerified,
@@ -3527,7 +3906,12 @@
       markersChart: MARKERS.hasChart(),
       lastWsPeriod: live.lastWsPeriod,
       activeChart: live.activeChart,
+      activeAssets: Object.keys(live.activeAssets || {}),
+      dataStats: live.dataStats,
+      socketMeta: sockMetaArr.slice(-10),
       socket: !!handle.lastWs,
+      socketCount: brokerSockets.length,
+      openSockets: (function(){ var c=0; for(var i=0;i<brokerSockets.length;i++){ if(brokerSockets[i]&&brokerSockets[i].readyState===1) c++; } return c; })(),
       frames: _cyberFrames.slice(0, 12),
     };
   }
@@ -3542,22 +3926,74 @@
 
   // Install the WebSocket wrapper *synchronously*. Handles text, Blob and
   // binary frames; all decoding happens inside the router. Also wraps
-  // `send()` so OUTGOING frames reveal the active asset (see onAsset above).
+  // `send()` so OUTGOING frames reveal the active asset.
+  var brokerSockets = [];
+  var socketIdCounter = 1;
   var Native = window.WebSocket;
   if (typeof Native === "function") {
     handle.native = Native;
+    function getSocketMeta(ws) {
+      try {
+        var id = ws && ws.__cyberId;
+        if (!id) return null;
+        return live.socketMeta[id] || null;
+      } catch (_) { return null; }
+    }
+    function trackSocket(ws, url) {
+      try {
+        if (!ws.__cyberId) ws.__cyberId = socketIdCounter++;
+        var id = ws.__cyberId;
+        if (brokerSockets.indexOf(ws) === -1) brokerSockets.push(ws);
+        live.socketMeta[id] = {
+          id: id,
+          url: String(url || "").slice(0, 256),
+          createdAt: Date.now(),
+          lastMsgAt: Date.now(),
+          msgCount: 0,
+          isOpen: ws.readyState === 1,
+          readyState: ws.readyState
+        };
+        live.dataStats.socketsSeen++;
+        // Cleanup closed sockets
+        for (var si = brokerSockets.length - 1; si >= 0; si--) {
+          var s = brokerSockets[si];
+          if (!s || s.readyState === 3) {
+            try {
+              var sid = s && s.__cyberId;
+              if (sid && live.socketMeta[sid]) live.socketMeta[sid].isOpen = false;
+            } catch (_) {}
+            brokerSockets.splice(si, 1);
+          }
+        }
+      } catch (_) {}
+    }
+    function getBestSocket(excludeWs) {
+      try {
+        var best = null;
+        var bestScore = -1;
+        for (var i = 0; i < brokerSockets.length; i++) {
+          var s = brokerSockets[i];
+          if (!s || s === excludeWs) continue;
+          if (s.readyState !== 1) continue;
+          var meta = getSocketMeta(s);
+          var score = meta ? (meta.msgCount + (Date.now() - meta.createdAt)/1000) : 0;
+          // Prefer most recently active socket
+          if (meta && meta.lastMsgAt) score += (meta.lastMsgAt / 100000);
+          if (score > bestScore) { best = s; bestScore = score; }
+        }
+        return best;
+      } catch (_) { return null; }
+    }
     function Wrapped(url, protocols) {
       var ws = protocols !== undefined ? new Native(url, protocols) : new Native(url);
       var brokerSocket = isBrokerSocketUrl(url);
-      // Binary attachment headers are socket-local. A dedicated router per
-      // WebSocket prevents interleaved sockets from stealing each other's
-      // pending header/event context.
       var socketRouter = Q.createRouter(routerHandlers);
-      if (brokerSocket) { handle.lastWs = ws; handle.router = socketRouter; }
+      if (brokerSocket) {
+        handle.lastWs = ws;
+        handle.router = socketRouter;
+        trackSocket(ws, url);
+      }
       if (brokerSocket) try { emit("open", { url: url || "" }); } catch (_) {}
-      // --- outgoing-frame sniffing: the client's own requests tell us the
-      // active asset. This is what makes auto-detection work even when the
-      // DOM uses hashed class names or ticks arrive with numeric ids. ---
       var nativeSend = ws.send.bind(ws);
       ws.send = function (data) {
         try {
@@ -3570,26 +4006,55 @@
             }
             s = buf;
           }
+          if (!s && typeof Uint8Array !== "undefined" && data instanceof Uint8Array) {
+            try { s = new TextDecoder("utf-8").decode(data); } catch (_) {}
+          }
           var hit = s ? Q.sniffOutgoing(s) : null;
           if (hit && hit.symbol) {
             brokerSocket = true;
             handle.lastWs = ws;
             handle.router = socketRouter;
+            trackSocket(ws, url);
+          }
+          if (hit && hit.symbol) {
+            try { live.activeAssets[Q.normalizeSymbol(hit.symbol)] = Date.now(); } catch (_) {}
+            try {
+              var cutoff = Date.now() - 600000;
+              for (var aa in live.activeAssets) {
+                if (live.activeAssets[aa] < cutoff) delete live.activeAssets[aa];
+              }
+            } catch (_) {}
           }
           if (hit && hit.symbol && !internalSubscriptionSend) {
             if (hit.main) selectActiveChart(hit, "ws_out");
             else if (hit.candidate && !live.activeChart) selectActiveChart(hit, "ws_candidate");
             else if (live.activeChart && hit.symbol === live.activeChart.symbol && hit.period &&
-                /history\/list\/v2|chart_notification\/get|loadHistoryPeriod/.test(hit.event || "")) {
-              // Same selected symbol: learn the visible chart timeframe without
-              // allowing another asset's background history to become main.
+                /history\/list|chart_notification\/get|loadHistoryPeriod|loadHistory|candles\/history/.test(hit.event || "")) {
               selectActiveChart(hit, "ws_period");
             }
           }
         } catch (_) {}
-        return nativeSend(data);
+        try {
+          var result = nativeSend(data);
+          // Update meta on successful send
+          try {
+            var m = getSocketMeta(ws);
+            if (m) { m.msgCount = (m.msgCount||0)+1; m.lastMsgAt = Date.now(); m.isOpen = ws.readyState===1; m.readyState = ws.readyState; }
+          } catch (_) {}
+          return result;
+        } catch (e) {
+          // If send fails, try fallback socket
+          try {
+            if (brokerSocket) {
+              var fallback = getBestSocket(ws);
+              if (fallback && fallback !== ws) {
+                return fallback.send(data);
+              }
+            }
+          } catch (_) {}
+          throw e;
+        }
       };
-      // Stealth: make the wrapped send look native to toString() probes.
       try {
         Object.defineProperty(ws.send, "toString", {
           value: function () { return "function send() { [native code] }"; },
@@ -3597,15 +4062,77 @@
         });
       } catch (_) {}
       ws.addEventListener("open", function () {
-        if (brokerSocket && handle.lastWs === ws) try { emit("quotex_status", { state: "open", url: url || "" }); } catch (_) {}
+        try {
+          var meta = getSocketMeta(ws);
+          if (meta) { meta.isOpen = true; meta.readyState = 1; meta.lastMsgAt = Date.now(); }
+        } catch (_) {}
+        if (brokerSocket) {
+          trackSocket(ws, url);
+          if (handle.lastWs === ws || !handle.lastWs || handle.lastWs.readyState !== 1) {
+            handle.lastWs = ws;
+            handle.router = socketRouter;
+          }
+          try { emit("quotex_status", { state: "open", url: url || "" }); } catch (_) {}
+        }
       });
       ws.addEventListener("close", function () {
+        try {
+          var meta = getSocketMeta(ws);
+          if (meta) { meta.isOpen = false; meta.readyState = 3; }
+          live.dataStats.reconnections++;
+        } catch (_) {}
         var wasCurrent = handle.lastWs === ws;
-        if (wasCurrent) handle.lastWs = null;
-        if (brokerSocket && wasCurrent) try { emit("quotex_status", { state: "closed", url: url || "" }); } catch (_) {}
+        if (wasCurrent) {
+          // Try to promote best remaining socket
+          var next = getBestSocket(ws);
+          if (next) {
+            handle.lastWs = next;
+            // Need to find its router — we store per-socket router in closure, so we need to search
+            // For simplicity, create new router for promoted socket and re-request subscriptions
+            try {
+              // Re-request active chart subscriptions on new socket after short delay
+              setTimeout(function(){
+                try {
+                  if (live.activeChart && live.activeChart.symbol) {
+                    Q.subscribeHistory(next, live.activeChart.symbol, live.activeChart.period || 60, 5000, 0);
+                  }
+                  if (live.instruments && !live.instruments.length && Q.requestInstruments) Q.requestInstruments(next);
+                  if (!live.balance && Q.requestBalance) Q.requestBalance(next);
+                } catch (_) {}
+              }, 800);
+            } catch (_) {}
+          } else {
+            handle.lastWs = null;
+          }
+        }
+        if (brokerSocket) {
+          try {
+            if (brokerSockets.indexOf(ws) !== -1) brokerSockets.splice(brokerSockets.indexOf(ws), 1);
+          } catch (_) {}
+          if (wasCurrent) try { emit("quotex_status", { state: "closed", url: url || "" }); } catch (_) {}
+        }
+      });
+      ws.addEventListener("error", function () {
+        try {
+          var meta = getSocketMeta(ws);
+          if (meta) meta.lastErrorAt = Date.now();
+        } catch (_) {}
       });
       ws.addEventListener("message", function (ev) {
-        if (brokerSocket && handle.lastWs === ws) try { socketRouter.feedRaw(ev.data); } catch (_) {}
+        try {
+          var meta = getSocketMeta(ws);
+          if (meta) { meta.lastMsgAt = Date.now(); meta.msgCount = (meta.msgCount||0)+1; meta.isOpen = ws.readyState===1; }
+        } catch (_) {}
+        // v2.8: accept messages from ANY broker socket, not just current lastWs
+        // This ensures we don't miss data when multiple sockets are active
+        if (brokerSocket) {
+          try { socketRouter.feedRaw(ev.data); } catch (_) {}
+          // Also ensure this socket is tracked as best if it's receiving data
+          if (!handle.lastWs || handle.lastWs.readyState !== 1) {
+            handle.lastWs = ws;
+            handle.router = socketRouter;
+          }
+        }
       });
       return ws;
     }
@@ -3664,18 +4191,145 @@
     if (ev.source !== window || !ev.data || ev.data.source !== _SRC_IN) return;
     if (ev.data.kind === "sync_request") {
       emit("snapshot", snapshot());
+      // Opportunistically refresh instruments/balance if missing
+      try {
+        if ((!live.instruments || !live.instruments.length) && Q.requestInstruments) Q.requestInstruments(handle.lastWs);
+        if (!live.balance && Q.requestBalance) Q.requestBalance(handle.lastWs);
+      } catch (_) {}
     } else if (ev.data.kind === "subscribe") {
       var sub = ev.data.payload || {};
       internalSubscriptionSend = true;
-      var r;
-      try { r = Q.subscribeHistory(handle.lastWs, sub.asset, sub.period, sub.limit); }
-      finally { internalSubscriptionSend = false; }
+      var r = null;
+      var triedSockets = 0;
+      try {
+        // Try primary socket first
+        r = Q.subscribeHistory(handle.lastWs, sub.asset, sub.period, sub.limit, sub.offset);
+        triedSockets++;
+        // Fallback to all other broker sockets
+        if (brokerSockets && brokerSockets.length) {
+          for (var bi = 0; bi < brokerSockets.length; bi++) {
+            var altWs = brokerSockets[bi];
+            if (!altWs || altWs.readyState !== 1) continue;
+            // If primary succeeded, also send to other sockets for redundancy (first 2)
+            if (r && r.ok) {
+              if (triedSockets >= 3) break; // limit redundant sends
+              try { Q.subscribeHistory(altWs, sub.asset, sub.period, sub.limit, sub.offset); } catch (_) {}
+              triedSockets++;
+            } else {
+              // Primary failed, try fallback
+              try {
+                var r2 = Q.subscribeHistory(altWs, sub.asset, sub.period, sub.limit, sub.offset);
+                if (r2 && r2.ok) { r = r2; handle.lastWs = altWs; handle.router = altWs.__cyberRouter || handle.router; break; }
+              } catch (_) {}
+              triedSockets++;
+            }
+          }
+        }
+        // If still failed, try router's lastWs if different
+        if ((!r || !r.ok) && handle.lastWs && handle.lastWs.readyState !== 1) {
+          var bestSock = null;
+          try {
+            for (var bj = 0; bj < brokerSockets.length; bj++) {
+              var s = brokerSockets[bj];
+              if (s && s.readyState === 1) { bestSock = s; break; }
+            }
+          } catch (_) {}
+          if (bestSock) {
+            try {
+              var r3 = Q.subscribeHistory(bestSock, sub.asset, sub.period, sub.limit, sub.offset);
+              if (r3 && r3.ok) { r = r3; handle.lastWs = bestSock; }
+            } catch (_) {}
+          }
+        }
+      } finally { internalSubscriptionSend = false; }
       emit("subscribe_result", {
         requestId: sub.requestId != null ? String(sub.requestId).slice(0, 128) : "",
         asset: sub.asset != null ? String(sub.asset).slice(0, 96) : "",
         ok: !!(r && r.ok),
         payload: r || {},
+        triedSockets: triedSockets,
+        socketCount: brokerSockets.length
       });
+    } else if (ev.data.kind === "request_instruments") {
+      try {
+        var ri = null;
+        var allSockets = [handle.lastWs].concat(brokerSockets);
+        var seen = [];
+        for (var bi2 = 0; bi2 < allSockets.length; bi2++) {
+          var altWs2 = allSockets[bi2];
+          if (!altWs2 || seen.indexOf(altWs2) !== -1 || altWs2.readyState !== 1) continue;
+          seen.push(altWs2);
+          try {
+            var ri2 = Q.requestInstruments ? Q.requestInstruments(altWs2) : null;
+            if (ri2 && ri2.ok && !ri) ri = ri2;
+          } catch (_) {}
+        }
+        emit("subscribe_result", {
+          requestId: "instruments_"+Date.now(),
+          asset: "",
+          ok: !!(ri && ri.ok),
+          payload: ri || {},
+        });
+      } catch (_) {}
+    } else if (ev.data.kind === "request_balance") {
+      try {
+        var rb = null;
+        var allSocketsB = [handle.lastWs].concat(brokerSockets);
+        var seenB = [];
+        for (var bi3 = 0; bi3 < allSocketsB.length; bi3++) {
+          var altWs3 = allSocketsB[bi3];
+          if (!altWs3 || seenB.indexOf(altWs3) !== -1 || altWs3.readyState !== 1) continue;
+          seenB.push(altWs3);
+          try {
+            var rb2 = Q.requestBalance ? Q.requestBalance(altWs3) : null;
+            if (rb2 && rb2.ok && !rb) rb = rb2;
+          } catch (_) {}
+        }
+        emit("subscribe_result", {
+          requestId: "balance_"+Date.now(),
+          asset: "",
+          ok: !!(rb && rb.ok),
+          payload: rb || {},
+        });
+      } catch (_) {}
+    } else if (ev.data.kind === "request_gaps") {
+      try {
+        var gapPayload = ev.data.payload || {};
+        var gapAsset = gapPayload.asset;
+        var gapPeriod = gapPayload.period || 60;
+        var gaps = gapPayload.gaps || [];
+        var rg = null;
+        if (Q.requestMissingHistory) {
+          rg = Q.requestMissingHistory(handle.lastWs, gapAsset, gapPeriod, gaps);
+          if ((!rg || !rg.ok) && brokerSockets.length) {
+            for (var bg = 0; bg < brokerSockets.length; bg++) {
+              var gws = brokerSockets[bg];
+              if (gws && gws.readyState === 1) {
+                try {
+                  var rg2 = Q.requestMissingHistory(gws, gapAsset, gapPeriod, gaps);
+                  if (rg2 && rg2.ok) { rg = rg2; break; }
+                } catch (_) {}
+              }
+            }
+          }
+        }
+        emit("subscribe_result", {
+          requestId: "gaps_"+Date.now(),
+          asset: gapAsset || "",
+          ok: !!(rg && rg.ok),
+          payload: rg || {},
+        });
+      } catch (_) {}
+    } else if (ev.data.kind === "request_mtf") {
+      try {
+        var rm = Q.subscribeAllTimeframes ? Q.subscribeAllTimeframes(handle.lastWs, ev.data.payload && ev.data.payload.asset) : null;
+        emit("subscribe_result", {
+          requestId: "mtf_"+Date.now(),
+          asset: ev.data.payload && ev.data.payload.asset ? String(ev.data.payload.asset).slice(0,96) : "",
+          ok: !!(rm && rm.ok),
+          payload: rm || {},
+        });
+      } catch (_) {}
     } else if (ev.data.kind === "place_ws") {
       var args = ev.data.payload && typeof ev.data.payload === "object" ? ev.data.payload : {};
       var reqId = args.requestId != null ? String(args.requestId).slice(0, 128) : "";

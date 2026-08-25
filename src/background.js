@@ -386,11 +386,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     let stateSize = Infinity;
     try { stateSize = JSON.stringify(msg.payload).length; } catch (_) {}
     if (!Number.isFinite(stateTs) || stateTs < Date.now() - 86400000 || stateTs > Date.now() + 300000 ||
-        wrongArrayShape || !Number.isFinite(stateSize) || stateSize > 4 * 1024 * 1024 ||
-        (Array.isArray(msg.payload.candles) && msg.payload.candles.length > 500) ||
-        (Array.isArray(msg.payload.chartCandles) && msg.payload.chartCandles.length > 500) ||
-        (Array.isArray(msg.payload.history) && msg.payload.history.length > 500) ||
-        (Array.isArray(msg.payload.markers) && msg.payload.markers.length > 1000)) {
+        wrongArrayShape || !Number.isFinite(stateSize) || stateSize > 8 * 1024 * 1024 ||
+        (Array.isArray(msg.payload.candles) && msg.payload.candles.length > 10000) ||
+        (Array.isArray(msg.payload.chartCandles) && msg.payload.chartCandles.length > 10000) ||
+        (Array.isArray(msg.payload.history) && msg.payload.history.length > 1000) ||
+        (Array.isArray(msg.payload.markers) && msg.payload.markers.length > 2000)) {
       sendResponse({ ok: false, error: "invalid or oversized Quotex state" });
       return;
     }

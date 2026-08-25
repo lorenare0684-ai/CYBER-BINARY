@@ -54,6 +54,154 @@
   // 85% payout. Only strong-trend (94%+ WR) trades under auto-adaptive.
   const ADAPTIVE_SIT_OUT_REGIMES = ["choppy", "squeeze", "trending", "ranging"];
 
+  // ============================================================
+  // Dynamic expiry engine (v2.8): chooses expiry to improve accuracy
+  // based on regime, volatility, trend strength, strategy and confidence.
+  // ============================================================
+  const STRATEGY_EXPIRY_PROFILES = {
+    scalp:              { base: 1,   min: 1,   max: 2   },
+    turbo_trend:        { base: 2,   min: 1,   max: 3   },
+    sniper:             { base: 2,   min: 1.5, max: 3   },
+    confluence:         { base: 2,   min: 1.5, max: 3.5 },
+    institutional_flow: { base: 2.5, min: 2,   max: 4   },
+    breakout:           { base: 2.5, min: 2,   max: 4   },
+    otc:                { base: 2,   min: 1,   max: 3   },
+    momentum_pulse:     { base: 2,   min: 1.5, max: 3   },
+    high_accuracy:      { base: 2,   min: 1.5, max: 3   },
+    trend:              { base: 3,   min: 2,   max: 5   },
+    ribbon:             { base: 3,   min: 2,   max: 4   },
+    squeeze:            { base: 3,   min: 2,   max: 5   },
+  };
+
+  const REGIME_EXPIRY = {
+    "strong-trend":   { base: 3,   min: 2,   max: 5,   reason: "strong trend needs time to ride" },
+    "trending":       { base: 2.5, min: 2,   max: 4,   reason: "trending, allow continuation" },
+    "ranging":        { base: 1.5, min: 1,   max: 3,   reason: "ranging, quick mean reversion" },
+    "mean-reverting": { base: 1.5, min: 1,   max: 2.5, reason: "mean-reverting, short expiry" },
+    "squeeze":        { base: 3,   min: 2,   max: 5,   reason: "squeeze breakout needs expansion time" },
+    "choppy":         { base: 1,   min: 1,   max: 2,   reason: "choppy, minimal exposure" },
+    "unknown":        { base: 2,   min: 1,   max: 3.5, reason: "unknown regime" },
+  };
+
+  function clampExpiry(value, min, max) {
+    let v = Number(value);
+    if (!Number.isFinite(v)) v = 2;
+    v = Math.max(0.5, Math.min(1440, v));
+    if (min != null) v = Math.max(min, v);
+    if (max != null) v = Math.min(max, v);
+    // Round to nearest 0.5 for OTC (duration) but keep integer for regular if >1
+    // Quotex supports 1,2,3,4,5 etc. 0.5 steps are useful for 30s OTC.
+    return Math.round(v * 2) / 2;
+  }
+
+  function suggestExpiry(metrics, regime, strategyId, confidence, opts) {
+    opts = opts || {};
+    const stratProfile = STRATEGY_EXPIRY_PROFILES[strategyId] || STRATEGY_EXPIRY_PROFILES.confluence;
+    const regimeProfile = REGIME_EXPIRY[regime] || REGIME_EXPIRY.unknown;
+
+    // Start from strategy base, then blend with regime base (60% strategy, 40% regime)
+    let expiry = stratProfile.base * 0.6 + regimeProfile.base * 0.4;
+    let reasons = [];
+    reasons.push(`base ${stratProfile.base}m(${strategyId}) + ${regimeProfile.base}m(${regime})`);
+
+    // Volatility adjustment via atrPct
+    const atrPct = metrics && Number.isFinite(metrics.atrPct) ? metrics.atrPct : null;
+    if (atrPct != null) {
+      if (atrPct < 0.0002) { expiry += 1; reasons.push(`low vol ATR% ${(atrPct*100).toFixed(3)}% +1m`); }
+      else if (atrPct < 0.0004) { expiry += 0.5; reasons.push(`low-med vol +0.5m`); }
+      else if (atrPct > 0.0015) { expiry -= 0.5; reasons.push(`very high vol -0.5m`); }
+      else if (atrPct > 0.0009) { expiry -= 0.25; reasons.push(`high vol -0.25m`); }
+    }
+
+    // Trend strength via ADX
+    const adx = metrics && Number.isFinite(metrics.adx) ? metrics.adx : null;
+    if (adx != null) {
+      if (adx >= 35) { expiry += 1; reasons.push(`strong ADX ${adx.toFixed(0)} +1m`); }
+      else if (adx >= 28) { expiry += 0.5; reasons.push(`ADX ${adx.toFixed(0)} +0.5m`); }
+      else if (adx < 15) { expiry -= 0.5; reasons.push(`weak ADX ${adx.toFixed(0)} -0.5m`); }
+    }
+
+    // EMA separation as trend confirmation
+    const emaFast = metrics && Number.isFinite(metrics.emaFast) ? metrics.emaFast : null;
+    const emaSlow = metrics && Number.isFinite(metrics.emaSlow) ? metrics.emaSlow : null;
+    const atr = metrics && Number.isFinite(metrics.atr) ? metrics.atr : null;
+    if (emaFast != null && emaSlow != null && atr != null && atr > 0) {
+      const sep = Math.abs(emaFast - emaSlow) / atr;
+      if (sep > 2.5) { expiry += 0.5; reasons.push(`wide EMA sep ${sep.toFixed(1)}xATR +0.5m`); }
+      else if (sep < 0.5) { expiry -= 0.25; reasons.push(`narrow EMA sep -0.25m`); }
+    }
+
+    // RSI extremes = possible reversal, shorten expiry for quick reversion
+    const rsi = metrics && Number.isFinite(metrics.rsi) ? metrics.rsi : null;
+    if (rsi != null) {
+      if (rsi < 25 || rsi > 75) { expiry -= 0.5; reasons.push(`RSI extreme ${rsi.toFixed(0)} -0.5m`); }
+      else if (rsi < 35 || rsi > 65) { expiry -= 0.25; reasons.push(`RSI ${rsi.toFixed(0)} -0.25m`); }
+    }
+
+    // Confidence: high confidence allows longer hold, low confidence shortens
+    const conf = Number(confidence);
+    if (Number.isFinite(conf)) {
+      if (conf >= 92) { expiry += 0.5; reasons.push(`high conf ${conf}% +0.5m`); }
+      else if (conf < 70) { expiry -= 0.5; reasons.push(`low conf ${conf}% -0.5m`); }
+    }
+
+    // Bollinger width: squeeze = low width, breakout needs longer; wide = volatile
+    const bbUpper = metrics && Number.isFinite(metrics.bbUpper) ? metrics.bbUpper : null;
+    const bbLower = metrics && Number.isFinite(metrics.bbLower) ? metrics.bbLower : null;
+    const close = metrics && Number.isFinite(metrics.close) ? metrics.close : null;
+    if (bbUpper != null && bbLower != null && close != null && close > 0) {
+      const bw = (bbUpper - bbLower) / close;
+      if (bw < 0.001) { expiry += 0.5; reasons.push(`BB squeeze +0.5m`); }
+      else if (bw > 0.01) { expiry -= 0.25; reasons.push(`BB wide -0.25m`); }
+    }
+
+    // User bounds
+    const userMin = Number(opts.adaptiveExpiryMin);
+    const userMax = Number(opts.adaptiveExpiryMax);
+    const minBound = Number.isFinite(userMin) ? Math.max(0.5, Math.min(1440, userMin)) : Math.max(stratProfile.min, regimeProfile.min);
+    const maxBound = Number.isFinite(userMax) ? Math.max(0.5, Math.min(1440, userMax)) : Math.min(stratProfile.max, regimeProfile.max);
+    // Ensure min <= max
+    const finalMin = Math.min(minBound, maxBound);
+    const finalMax = Math.max(minBound, maxBound);
+
+    expiry = clampExpiry(expiry, finalMin, finalMax);
+
+    // Historical learning: if expiry winrates provided, bias toward best
+    if (opts.expiryWinrates && typeof opts.expiryWinrates === 'object') {
+      let bestExpiry = null, bestWR = -1;
+      for (const k of Object.keys(opts.expiryWinrates)) {
+        const wr = Number(opts.expiryWinrates[k]);
+        if (!Number.isFinite(wr)) continue;
+        if (wr > bestWR) { bestWR = wr; bestExpiry = Number(k); }
+      }
+      if (bestExpiry != null && bestWR >= 55 && Math.abs(bestExpiry - expiry) <= 2) {
+        // Nudge 25% toward historically best expiry if it's profitable
+        const nudge = (bestExpiry - expiry) * 0.25;
+        const nudged = clampExpiry(expiry + nudge, finalMin, finalMax);
+        if (nudged !== expiry) {
+          reasons.push(`history best ${bestExpiry}m WR ${bestWR.toFixed(0)}% nudge ${nudge>0?'+':''}${nudge.toFixed(1)}m`);
+          expiry = nudged;
+        }
+      }
+    }
+
+    return {
+      minutes: expiry,
+      reason: reasons.join(' · '),
+      breakdown: {
+        strategy: strategyId,
+        regime,
+        base: stratProfile.base,
+        regimeBase: regimeProfile.base,
+        atrPct,
+        adx,
+        confidence: conf,
+        min: finalMin,
+        max: finalMax,
+      }
+    };
+  }
+
   /**
    * High-accuracy signal gates. A preset (or explicit opts.params) may set
    * `regimeFilter` (array of regime names — signal anywhere else is WAIT)
@@ -463,11 +611,32 @@
       });
     }
 
+    // v2.8: recompute expiry with correct strategy for lean adaptive
+    let adaptiveExpiry = bestResult && bestResult.suggestedExpiry;
+    let adaptiveReason = bestResult && bestResult.expiryReason;
+    try {
+      if (bestResult && bestResult.metrics) {
+        const exp = suggestExpiry(
+          bestResult.metrics,
+          regime,
+          bestStrategy,
+          bestResult.confidence,
+          { adaptiveExpiryMin: opts && opts.adaptiveExpiryMin, adaptiveExpiryMax: opts && opts.adaptiveExpiryMax, expiryWinrates: opts && opts.expiryWinrates }
+        );
+        if (exp) {
+          adaptiveExpiry = exp.minutes;
+          adaptiveReason = exp.reason;
+        }
+      }
+    } catch (_) {}
+
     return Object.assign({}, bestResult, {
       adaptive: true,
       selectedStrategy: bestStrategy,
       selectedStrategyLabel: bestLabel,
       strategyScores: scores,
+      suggestedExpiry: adaptiveExpiry,
+      expiryReason: adaptiveReason,
       reason: sitOut
         ? `Adaptive regime filter (choppy/squeeze sit-out; current ${regime})`
         : bestResult.direction === "WAIT"
@@ -842,6 +1011,20 @@
       confidence = 0;
     }
 
+    // v2.8: dynamic expiry suggestion for accuracy
+    let expiryInfo = null;
+    try {
+      const adaptiveMin = opts && opts.adaptiveExpiryMin != null ? Number(opts.adaptiveExpiryMin) : null;
+      const adaptiveMax = opts && opts.adaptiveExpiryMax != null ? Number(opts.adaptiveExpiryMax) : null;
+      expiryInfo = suggestExpiry(
+        { atrPct, adx: adxR.adx[i], emaFast: emaF[i], emaSlow: emaS[i], atr: atr[i], rsi: rsi[i], bbUpper: bb.upper[i], bbLower: bb.lower[i], close: c[i] },
+        regime,
+        namedStrategy,
+        confidence,
+        { adaptiveExpiryMin: adaptiveMin, adaptiveExpiryMax: adaptiveMax, expiryWinrates: opts && opts.expiryWinrates }
+      );
+    } catch (_) { expiryInfo = null; }
+
     return tag({
       ready: true,
       direction,
@@ -854,6 +1037,9 @@
           ? `No confluence (CALL ${call} · PUT ${put} · need ${requiredScore})`
           : votes.filter((v) => v.dir === direction).map((v) => v.name).join(" · "),
       votes,
+      suggestedExpiry: expiryInfo ? expiryInfo.minutes : null,
+      expiryReason: expiryInfo ? expiryInfo.reason : null,
+      expiryBreakdown: expiryInfo ? expiryInfo.breakdown : null,
       metrics: {
         close: c[i],
         rsi: rsi[i],
@@ -1129,14 +1315,46 @@
       score = 0;
       confidence = 0;
     }
-    return { ready: true, direction, confidence, score, regime };
+
+    // v2.8: dynamic expiry for lean path
+    let expiryInfoLean = null;
+    try {
+      const adaptiveMin = arguments[2] && arguments[2].adaptiveExpiryMin != null ? Number(arguments[2].adaptiveExpiryMin) : null;
+      const adaptiveMax = arguments[2] && arguments[2].adaptiveExpiryMax != null ? Number(arguments[2].adaptiveExpiryMax) : null;
+      // cfg is second arg, but we need strategy id — try to get from opts (5th arg in adaptive, but lean has only 4)
+      // For lean, we approximate with generic
+      expiryInfoLean = suggestExpiry(
+        { atrPct, adx: adxVal, emaFast: emaFVal, emaSlow: emaSVal, atr: atrVal, rsi: rsiVal, close: ci },
+        regime,
+        "confluence",
+        confidence,
+        { adaptiveExpiryMin: adaptiveMin, adaptiveExpiryMax: adaptiveMax }
+      );
+    } catch (_) { expiryInfoLean = null; }
+
+    return {
+      ready: true,
+      direction,
+      confidence,
+      score,
+      regime,
+      suggestedExpiry: expiryInfoLean ? expiryInfoLean.minutes : null,
+      expiryReason: expiryInfoLean ? expiryInfoLean.reason : null,
+      metrics: { atrPct, adx: adxVal, close: ci, rsi: rsiVal, emaFast: emaFVal, emaSlow: emaSVal, atr: atrVal }
+    };
   }
 
   function backtest(candles, opts) {
     const empty = {
       wins: 0, losses: 0, draws: 0, total: 0, decisions: 0, winrate: 0, payoff: 0,
-      pnl: 0, maxDrawdown: 0, maxWinStreak: 0, maxLossStreak: 0,
-      byRegime: {}, calibration: [], equity: [], trades: [],
+      pnl: 0, pnlWithPayout: 0, expectedValue: 0, profitFactor: 0, expectancy: 0,
+      avgWin: 0, avgLoss: 0, avgTrade: 0, grossProfit: 0, grossLoss: 0,
+      maxDrawdown: 0, maxWinStreak: 0, maxLossStreak: 0, sharpe: 0, sortino: 0,
+      recoveryFactor: 0, exposure: 0, bestTrade: 0, worstTrade: 0,
+      avgHolding: 0, winLossRatio: 0, kelly: 0,
+      byRegime: {}, byConfidence: {}, byHour: {}, byStrategy: {}, byExpiry: {},
+      calibration: [], equity: [], trades: [],
+      monteCarlo: null, walkForward: null,
     };
     if (!Array.isArray(candles) || candles.length < 40) return empty;
     for (let i = 0; i < candles.length; i++) {
@@ -1149,13 +1367,22 @@
     const resolved = resolveStrategy(opts);
     const cfg = Object.assign({}, resolved.params);
     const rawHorizon = hasOwn(opts, "horizon") ? numberValue(opts.horizon) : null;
-    const horizon = rawHorizon != null ? Math.max(1, Math.min(1440, Math.floor(rawHorizon))) : 3;
+    // Support fractional horizon (e.g., 0.5, 1.5, 2.5)
+    const horizonFloat = rawHorizon != null ? Math.max(0.5, Math.min(1440, rawHorizon)) : 3;
+    const horizon = Math.max(1, Math.min(1440, Math.floor(horizonFloat)));
+    const horizonFrac = horizonFloat - Math.floor(horizonFloat);
     const rawMinConf = hasOwn(opts, "minConf") ? numberValue(opts.minConf) : null;
     const minConf = rawMinConf != null ? Math.max(0, Math.min(100, rawMinConf)) : 0;
     const rawWarmup = hasOwn(opts, "warmup") ? numberValue(opts.warmup) : null;
     const warmup = rawWarmup != null ? Math.max(40, Math.min(candles.length - 1, Math.floor(rawWarmup))) : 50;
     const lean = !(opts && opts.lean === false);
     const isAdaptive = opts && opts.strategy === "auto_adaptive";
+    // Payout: e.g., 0.85 = 85% return on win, -1 on loss
+    const rawPayout = hasOwn(opts, "payout") ? numberValue(opts.payout) : null;
+    const payout = rawPayout != null ? Math.max(0, Math.min(5, rawPayout)) : 0.85;
+    const useAdaptiveExpiry = !!(opts && opts.useAdaptiveExpiry);
+    const rawSlippage = hasOwn(opts, "slippage") ? numberValue(opts.slippage) : null;
+    const slippage = rawSlippage != null ? Math.max(0, Math.min(0.01, rawSlippage)) : 0;
 
     let prepared = null;
     let adaptivePrepared = null;
@@ -1205,8 +1432,29 @@
     const trades = [];
     const equity = [];
     let pnl = 0;
+    let pnlWithPayout = 0;
+    let grossProfit = 0, grossLoss = 0;
+    let totalHolding = 0;
+    let bestTrade = -Infinity, worstTrade = Infinity;
+    const returns = [];
 
-    for (let i = warmup; i < candles.length - horizon; i++) {
+    // Helper to get expiry price with fractional support
+    function getExpiryPrice(entryIdx, effectiveHorizon) {
+      const eff = Number(effectiveHorizon);
+      const h = Number.isFinite(eff) && eff >= 0.5 ? eff : horizonFloat;
+      const fullBars = Math.floor(h);
+      const frac = h - fullBars;
+      const exitIdx = entryIdx + fullBars;
+      if (exitIdx >= candles.length) return null;
+      const baseClose = numberValue(candles[exitIdx].close);
+      if (frac <= 0 || exitIdx + 1 >= candles.length) return baseClose;
+      // Interpolate for fractional part: price between close[exitIdx] and close[exitIdx+1]
+      const nextClose = numberValue(candles[exitIdx + 1].close);
+      if (baseClose == null || nextClose == null) return baseClose;
+      return baseClose + (nextClose - baseClose) * frac;
+    }
+
+    for (let i = warmup; i < candles.length - horizon - 1; i++) {
       const sig = adaptivePrepared
         ? evaluateAdaptiveLeanAt(adaptivePrepared, i, opts, resolvedMap)
         : (prepared
@@ -1215,43 +1463,159 @@
       if (!sig.ready || sig.direction === "WAIT") continue;
       if (sig.confidence < minConf) continue;
 
-      const entry = numberValue(candles[i].close);
-      const exit = numberValue(candles[i + horizon].close);
-      const draw = exit === entry;
+      // Determine effective horizon: adaptive expiry if enabled and signal provides it
+      let effectiveHorizon = horizonFloat;
+      if (useAdaptiveExpiry && sig.suggestedExpiry != null) {
+        const sug = Number(sig.suggestedExpiry);
+        if (Number.isFinite(sug) && sug >= 0.5 && sug <= 60) {
+          effectiveHorizon = sug;
+        }
+      }
+
+      let entry = numberValue(candles[i].close);
+      let exit = getExpiryPrice(i, effectiveHorizon);
+      if (entry == null || exit == null) continue;
+
+      // Apply slippage if configured (simulates broker spread)
+      if (slippage > 0) {
+        const slip = entry * slippage * (Math.random() * 2 - 1);
+        entry += slip;
+      }
+
+      const draw = Math.abs(exit - entry) < entry * 0.000001;
       const won = !draw &&
         ((sig.direction === "CALL" && exit > entry) ||
         (sig.direction === "PUT" && exit < entry));
       if (draw) draws++; else if (won) wins++; else losses++;
-      const tradePnl = draw ? 0 : (won ? 1 : -1);
-      pnl += tradePnl;
+
+      // PnL calculations
+      const tradePnlUnits = draw ? 0 : (won ? 1 : -1);
+      const tradePnlPayout = draw ? 0 : (won ? payout : -1);
+      pnl += tradePnlUnits;
+      pnlWithPayout += tradePnlPayout;
+      if (tradePnlPayout > 0) grossProfit += tradePnlPayout;
+      else if (tradePnlPayout < 0) grossLoss += tradePnlPayout;
+
+      if (tradePnlPayout > bestTrade) bestTrade = tradePnlPayout;
+      if (tradePnlPayout < worstTrade) worstTrade = tradePnlPayout;
+      returns.push(tradePnlPayout);
+      totalHolding += effectiveHorizon;
+
+      const entryTime = candleTimeMs(candles[i].time) != null ? candleTimeMs(candles[i].time) + tfMs : null;
+      const exitTimeMs = entryTime != null ? entryTime + effectiveHorizon * 60000 : null;
+
       trades.push({
         i, dir: sig.direction, score: sig.score, confidence: sig.confidence,
         regime: sig.regime, won, draw, entry, exit,
+        entryPrice: entry, exitPrice: exit,
+        priceChange: exit - entry,
+        priceChangePct: entry ? ((exit - entry) / entry * 100) : 0,
         selectedStrategy: sig.selectedStrategy || opts.strategy || "confluence",
-        entryTime: candleTimeMs(candles[i].time) != null ? candleTimeMs(candles[i].time) + tfMs : null,
-        expiryTime: candleTimeMs(candles[i + horizon].time) != null ? candleTimeMs(candles[i + horizon].time) + tfMs : null,
-        exitTime: candleTimeMs(candles[i + horizon].time) != null ? candleTimeMs(candles[i + horizon].time) + tfMs : null,
-        pnl: tradePnl,
+        strategyLabel: sig.selectedStrategyLabel || sig.selectedStrategy || "confluence",
+        expiryMinutes: effectiveHorizon,
+        suggestedExpiry: sig.suggestedExpiry || null,
+        entryTime: entryTime,
+        expiryTime: exitTimeMs,
+        exitTime: exitTimeMs,
+        pnl: tradePnlUnits,
+        pnlPayout: tradePnlPayout,
+        payout: payout,
+        votes: sig.votes ? sig.votes.slice(0, 8) : [],
+        metrics: sig.metrics ? {
+          rsi: sig.metrics.rsi,
+          adx: sig.metrics.adx,
+          atrPct: sig.metrics.atrPct,
+          emaFast: sig.metrics.emaFast,
+          emaSlow: sig.metrics.emaSlow,
+        } : null,
       });
-      equity.push({ i, pnl, equity: pnl });
+      equity.push({ i, pnl: pnlWithPayout, equity: pnlWithPayout, time: entryTime, drawdown: 0 });
     }
 
     const total = wins + losses;
     const winrate = total ? (wins / total) * 100 : 0;
     const payoff = wins && losses ? wins / losses : wins ? Infinity : 0;
+    const grossProfitAbs = grossProfit;
+    const grossLossAbs = Math.abs(grossLoss);
+    const profitFactor = grossLossAbs > 0 ? grossProfitAbs / grossLossAbs : (grossProfitAbs > 0 ? Infinity : 0);
+    const avgWin = wins ? grossProfitAbs / wins : 0;
+    const avgLoss = losses ? grossLossAbs / losses : 0;
+    const avgTrade = total ? pnlWithPayout / total : 0;
+    const winLossRatio = avgLoss > 0 ? avgWin / avgLoss : (avgWin > 0 ? Infinity : 0);
+    const expectancy = total ? (winrate/100 * avgWin - (1-winrate/100) * avgLoss) : 0;
+    const expectedValue = total ? (winrate/100 * payout - (1-winrate/100)) * 100 : 0;
+    const exposure = candles.length ? (trades.length / candles.length * 100) : 0;
+    const avgHolding = trades.length ? totalHolding / trades.length : 0;
+    if (!Number.isFinite(bestTrade) || bestTrade === -Infinity) bestTrade = 0;
+    if (!Number.isFinite(worstTrade) || worstTrade === Infinity) worstTrade = 0;
+
+    // Sharpe & Sortino (based on per-trade returns)
+    let sharpe = 0, sortino = 0;
+    if (returns.length > 1) {
+      const mean = returns.reduce((a,b)=>a+b,0) / returns.length;
+      const variance = returns.reduce((a,b)=>a + Math.pow(b-mean,2),0) / returns.length;
+      const std = Math.sqrt(variance);
+      sharpe = std > 0 ? mean / std * Math.sqrt(252*24*60 / avgHolding) : 0;
+      const downside = returns.filter(r=>r<0);
+      if (downside.length) {
+        const downVar = downside.reduce((a,b)=>a + b*b,0) / downside.length;
+        const downStd = Math.sqrt(downVar);
+        sortino = downStd > 0 ? mean / downStd * Math.sqrt(252*24*60 / avgHolding) : 0;
+      }
+    }
+
+    // Kelly criterion: f* = p - q/b where p=winrate, q=lossrate, b=payout
+    const p = winrate/100;
+    const q = 1 - p;
+    const b = payout;
+    const kelly = b > 0 ? p - q / b : 0;
 
     const byRegime = {};
+    const byConfidence = {};
+    const byHour = {};
+    const byStrategy = {};
+    const byExpiry = {};
     for (const t of trades) {
       const r = t.regime || "unknown";
-      if (!byRegime[r]) byRegime[r] = { wins: 0, losses: 0, draws: 0 };
+      if (!byRegime[r]) byRegime[r] = { wins: 0, losses: 0, draws: 0, pnl: 0 };
       if (t.draw) byRegime[r].draws++;
-      else if (t.won) byRegime[r].wins++;
-      else byRegime[r].losses++;
+      else if (t.won) { byRegime[r].wins++; byRegime[r].pnl += t.pnlPayout; }
+      else { byRegime[r].losses++; byRegime[r].pnl += t.pnlPayout; }
+
+      const confBucket = Math.min(90, Math.floor(t.confidence/10)*10);
+      if (!byConfidence[confBucket]) byConfidence[confBucket] = { wins: 0, losses: 0, draws: 0, pnl: 0 };
+      if (t.draw) byConfidence[confBucket].draws++;
+      else if (t.won) { byConfidence[confBucket].wins++; byConfidence[confBucket].pnl += t.pnlPayout; }
+      else { byConfidence[confBucket].losses++; byConfidence[confBucket].pnl += t.pnlPayout; }
+
+      if (t.entryTime) {
+        const h = new Date(t.entryTime).getUTCHours();
+        if (!byHour[h]) byHour[h] = { wins: 0, losses: 0, draws: 0, pnl: 0 };
+        if (t.draw) byHour[h].draws++;
+        else if (t.won) { byHour[h].wins++; byHour[h].pnl += t.pnlPayout; }
+        else { byHour[h].losses++; byHour[h].pnl += t.pnlPayout; }
+      }
+
+      const strat = t.selectedStrategy || "confluence";
+      if (!byStrategy[strat]) byStrategy[strat] = { wins: 0, losses: 0, draws: 0, pnl: 0 };
+      if (t.draw) byStrategy[strat].draws++;
+      else if (t.won) { byStrategy[strat].wins++; byStrategy[strat].pnl += t.pnlPayout; }
+      else { byStrategy[strat].losses++; byStrategy[strat].pnl += t.pnlPayout; }
+
+      const expKey = String(Math.round(t.expiryMinutes*2)/2);
+      if (!byExpiry[expKey]) byExpiry[expKey] = { wins: 0, losses: 0, draws: 0, pnl: 0 };
+      if (t.draw) byExpiry[expKey].draws++;
+      else if (t.won) { byExpiry[expKey].wins++; byExpiry[expKey].pnl += t.pnlPayout; }
+      else { byExpiry[expKey].losses++; byExpiry[expKey].pnl += t.pnlPayout; }
     }
-    for (const r of Object.keys(byRegime)) {
-      const resolvedR = byRegime[r].wins + byRegime[r].losses;
-      byRegime[r].total = resolvedR + byRegime[r].draws;
-      byRegime[r].winrate = resolvedR ? (byRegime[r].wins / resolvedR) * 100 : 0;
+    for (const map of [byRegime, byConfidence, byHour, byStrategy, byExpiry]) {
+      for (const k of Object.keys(map)) {
+        const v = map[k];
+        const resolvedR = v.wins + v.losses;
+        v.total = resolvedR + v.draws;
+        v.winrate = resolvedR ? (v.wins / resolvedR) * 100 : 0;
+        v.expectedValue = resolvedR ? (v.winrate/100 * payout - (1-v.winrate/100)) * 100 : 0;
+      }
     }
 
     let maxWinStreak = 0, maxLossStreak = 0, curW = 0, curL = 0;
@@ -1264,11 +1628,14 @@
     }
 
     let peak = -Infinity, maxDD = 0;
-    for (const e of equity) {
+    for (let ei = 0; ei < equity.length; ei++) {
+      const e = equity[ei];
       if (e.equity > peak) peak = e.equity;
       const dd = peak - e.equity;
+      e.drawdown = dd;
       if (dd > maxDD) maxDD = dd;
     }
+    const recoveryFactor = maxDD > 0 ? pnlWithPayout / maxDD : (pnlWithPayout > 0 ? Infinity : 0);
 
     const calibBuckets = {};
     for (const t of trades) {
@@ -1289,13 +1656,19 @@
         losses: v.losses,
         total: t,
         winrate: t ? (v.wins / t) * 100 : 0,
+        expectedValue: t ? ((v.wins / t) * payout - (1 - v.wins / t)) * 100 : 0,
       });
     }
 
     return {
       wins, losses, draws, total, decisions: total + draws, winrate, payoff,
-      pnl, maxDrawdown: maxDD, maxWinStreak, maxLossStreak,
-      byRegime, calibration, equity, trades,
+      pnl, pnlWithPayout, expectedValue, profitFactor, expectancy,
+      avgWin, avgLoss, avgTrade, grossProfit: grossProfitAbs, grossLoss: grossLossAbs,
+      maxDrawdown: maxDD, maxWinStreak, maxLossStreak, sharpe, sortino,
+      recoveryFactor, exposure, bestTrade, worstTrade, avgHolding, winLossRatio, kelly,
+      payout,
+      byRegime, byConfidence, byHour, byStrategy, byExpiry,
+      calibration, equity, trades,
     };
   }
 
@@ -1309,6 +1682,7 @@
       : Math.min(5, maxUsefulFolds);
     const foldSize = Math.floor(total / folds);
     const out = [];
+    let totalW = 0, totalL = 0, totalPnl = 0;
     for (let f = 0; f < folds; f++) {
       const start = f * foldSize;
       const end = f === folds - 1 ? total : (f + 1) * foldSize;
@@ -1318,19 +1692,85 @@
       const test = slice.slice(split);
       const trainR = backtest(train, opts);
       const testR = backtest(test, opts);
+      totalW += testR.wins;
+      totalL += testR.losses;
+      totalPnl += testR.pnlWithPayout || testR.pnl || 0;
       out.push({
         fold: f,
-        train: { wins: trainR.wins, losses: trainR.losses, winrate: trainR.winrate },
-        test: { wins: testR.wins, losses: testR.losses, winrate: testR.winrate },
+        train: {
+          wins: trainR.wins, losses: trainR.losses, winrate: trainR.winrate,
+          pnl: trainR.pnlWithPayout || trainR.pnl, profitFactor: trainR.profitFactor, expectedValue: trainR.expectedValue
+        },
+        test: {
+          wins: testR.wins, losses: testR.losses, winrate: testR.winrate,
+          pnl: testR.pnlWithPayout || testR.pnl, profitFactor: testR.profitFactor, expectedValue: testR.expectedValue,
+          sharpe: testR.sharpe, maxDrawdown: testR.maxDrawdown
+        },
       });
     }
-    let totalW = 0, totalL = 0;
-    for (const f of out) { totalW += f.test.wins; totalL += f.test.losses; }
+    const combinedWR = totalW + totalL ? (totalW / (totalW + totalL)) * 100 : 0;
+    const payout = opts && opts.payout ? Number(opts.payout) : 0.85;
+    const combinedEV = totalW + totalL ? (combinedWR/100 * payout - (1-combinedWR/100)) * 100 : 0;
     return {
       folds: out,
-      combined: { wins: totalW, losses: totalL, winrate: totalW + totalL ? (totalW / (totalW + totalL)) * 100 : 0 },
+      combined: {
+        wins: totalW, losses: totalL, winrate: combinedWR,
+        pnl: totalPnl, expectedValue: combinedEV,
+        avgWinrate: out.length ? out.reduce((a,f)=>a+f.test.winrate,0)/out.length : 0,
+        consistency: out.length ? out.filter(f=>f.test.winrate>=50).length / out.length * 100 : 0,
+      },
     };
   }
 
-  root.CYBER_ENGINE = { DEFAULTS, DEFAULT_WEIGHTS, CONCRETE_STRATEGIES, analyze, backtest, walkForward, resolveStrategy, liveSignalGate, historyTrustDecision };
+  function monteCarlo(trades, opts) {
+    // Monte Carlo simulation: shuffle trade order N times to estimate risk
+    opts = opts || {};
+    const sims = Math.max(100, Math.min(10000, Math.floor(Number(opts.sims) || 1000)));
+    if (!Array.isArray(trades) || trades.length < 10) return { error: "need at least 10 trades" };
+    const returns = trades.map(t => t.pnlPayout != null ? t.pnlPayout : t.pnl).filter(r => Number.isFinite(r));
+    if (returns.length < 10) return { error: "insufficient returns" };
+
+    const results = [];
+    for (let s = 0; s < sims; s++) {
+      // Fisher-Yates shuffle copy
+      const shuffled = returns.slice();
+      for (let i = shuffled.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        const tmp = shuffled[i]; shuffled[i] = shuffled[j]; shuffled[j] = tmp;
+      }
+      let eq = 0, peak = -Infinity, maxDD = 0, maxLossStreak = 0, curLoss = 0;
+      for (const r of shuffled) {
+        eq += r;
+        if (eq > peak) peak = eq;
+        const dd = peak - eq;
+        if (dd > maxDD) maxDD = dd;
+        if (r < 0) { curLoss++; if (curLoss > maxLossStreak) maxLossStreak = curLoss; }
+        else curLoss = 0;
+      }
+      results.push({ finalPnL: eq, maxDD, maxLossStreak });
+    }
+    results.sort((a,b)=>a.finalPnL - b.finalPnL);
+    const percentile = (p) => {
+      const idx = Math.floor(results.length * p / 100);
+      return results[Math.max(0, Math.min(results.length-1, idx))];
+    };
+    const avgPnL = results.reduce((a,r)=>a+r.finalPnL,0)/results.length;
+    const avgDD = results.reduce((a,r)=>a+r.maxDD,0)/results.length;
+    const positive = results.filter(r=>r.finalPnL>0).length / results.length * 100;
+    return {
+      simulations: sims,
+      avgPnL, avgDD,
+      median: percentile(50),
+      p5: percentile(5),
+      p10: percentile(10),
+      p90: percentile(90),
+      p95: percentile(95),
+      positiveRate: positive,
+      best: results[results.length-1],
+      worst: results[0],
+      results: results.slice(0, 100), // sample for charting
+    };
+  }
+
+  root.CYBER_ENGINE = { DEFAULTS, DEFAULT_WEIGHTS, CONCRETE_STRATEGIES, STRATEGY_EXPIRY_PROFILES, REGIME_EXPIRY, suggestExpiry, analyze, backtest, walkForward, monteCarlo, resolveStrategy, liveSignalGate, historyTrustDecision };
 })(typeof self !== "undefined" ? self : globalThis);

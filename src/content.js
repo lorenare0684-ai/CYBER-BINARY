@@ -48,6 +48,107 @@
   // never silently change the signal clock or expiry math.
   const ENGINE_TIMEFRAME_SEC = 60;
 
+  // ---- broker clock v2.8 ----
+  // Enhanced with median filtering, offset history, and robust skew handling.
+  // Quotex server time is the source of truth for candle boundaries and
+  // expiry math. Local Date.now() can drift by seconds to minutes.
+  let brokerNow = null;
+  let brokerLocalAt = 0;
+  let brokerOffset = 0;
+  const brokerOffsetHistory = []; // last 20 offsets for median filtering
+  const brokerTimeHistory = [];   // last 20 broker timestamps for jump detection
+  let lastBrokerClockLog = 0;
+
+  function updateBrokerClock(brokerMs) {
+    const ms = Number(brokerMs);
+    if (!Number.isSafeInteger(ms) || ms < 946684800000) return;
+    if (ms > Date.now() + 2 * 86400000) return; // far-future garbage
+    if (ms < Date.now() - 7 * 86400000) return; // too far in past (7 days)
+
+    const nowLocal = Date.now();
+    const newOffset = ms - nowLocal;
+
+    // Track time history for jump detection
+    brokerTimeHistory.push({ broker: ms, local: nowLocal, at: nowLocal });
+    while (brokerTimeHistory.length > 20) brokerTimeHistory.shift();
+
+    // Detect large backward jumps (>10 min) — likely stale replay or clock reset
+    if (brokerNow != null) {
+      const backwardJump = brokerNow - ms;
+      if (backwardJump > 10 * 60000) {
+        // Allow only if we have evidence of broker clock moving backward legitimately
+        // (e.g., multiple recent samples showing backward trend)
+        let recentBackward = 0;
+        for (let i = Math.max(0, brokerTimeHistory.length - 5); i < brokerTimeHistory.length - 1; i++) {
+          if (brokerTimeHistory[i] && brokerTimeHistory[i+1] && brokerTimeHistory[i].broker > brokerTimeHistory[i+1].broker) recentBackward++;
+        }
+        if (recentBackward < 3) return; // reject isolated large backward jump
+      }
+    }
+
+    // Track offset history for median filtering
+    brokerOffsetHistory.push(newOffset);
+    while (brokerOffsetHistory.length > 20) brokerOffsetHistory.shift();
+
+    // Use median of recent offsets for stability, but allow forward movement
+    if (brokerNow == null || ms > brokerNow) {
+      brokerNow = ms;
+      brokerLocalAt = nowLocal;
+      // Median offset for stable estimate
+      if (brokerOffsetHistory.length >= 3) {
+        const sorted = brokerOffsetHistory.slice().sort((a,b)=>a-b);
+        const median = sorted[Math.floor(sorted.length/2)];
+        // Blend: 70% median, 30% latest for responsiveness
+        brokerOffset = Math.round(median * 0.7 + newOffset * 0.3);
+      } else {
+        brokerOffset = newOffset;
+      }
+    } else if (ms === brokerNow) {
+      brokerLocalAt = nowLocal;
+      brokerOffset = newOffset;
+    } else if (ms > brokerNow - 5 * 60000) {
+      // Small backward (out-of-order batch) — update local reference but not brokerNow
+      brokerLocalAt = nowLocal;
+    }
+
+    // Log significant clock skew for debugging (throttled)
+    if (Math.abs(newOffset) > 60000 && Date.now() - lastBrokerClockLog > 60000) {
+      lastBrokerClockLog = Date.now();
+      try { console.warn("broker clock skew: " + Math.round(newOffset/1000) + "s (broker " + (newOffset>0?"ahead":"behind") + ")"); } catch (_) {}
+    }
+  }
+
+  function getBrokerNow() {
+    const nowLocal = Date.now();
+    if (brokerNow != null) {
+      const elapsed = nowLocal - brokerLocalAt;
+      if (elapsed >= 0 && elapsed <= 120000) { // increased from 60s to 120s
+        return brokerNow + elapsed;
+      }
+      return nowLocal + brokerOffset;
+    }
+    return nowLocal;
+  }
+
+  function getBrokerClockStats() {
+    if (!brokerOffsetHistory.length) return null;
+    const sorted = brokerOffsetHistory.slice().sort((a,b)=>a-b);
+    return {
+      offset: brokerOffset,
+      median: sorted[Math.floor(sorted.length/2)],
+      min: sorted[0],
+      max: sorted[sorted.length-1],
+      samples: brokerOffsetHistory.length,
+      lastBroker: brokerNow,
+      skewSec: Math.round(brokerOffset/1000)
+    };
+  }
+
+  function brokerBucket(ms, periodMs) {
+    const p = Number(periodMs) || TF_MS;
+    return Math.floor(ms / p) * p;
+  }
+
   function marketSession(ts, assetId) {
     const id = String(assetId || "").toUpperCase();
     if (/_OTC$/.test(id) || /CRYPTO|BTC|ETH|XRP|SOL|DOGE/.test(id)) return "otc-24h";
@@ -196,11 +297,25 @@
   let lastInstruments = [];
   let lastBalance = null;
   let lastOrders = [];
+  const openOrders = Object.create(null);      // ongoing broker trades: id/requestId -> order data
+  const openOrdersQueue = [];                  // order of ids for bounded size
   const pendingWs = Object.create(null);       // page-hook send ack requestId -> resolver
   const pendingHistory = Object.create(null);  // page-hook history-subscription requestId -> resolver
-  const pendingHistoryMeta = Object.create(null); // requestId -> {asset, period} for retry bookkeeping
+  const pendingHistoryMeta = Object.create(null); // requestId -> {asset, period, limit, offset} for retry bookkeeping
   let historyRequestSequence = 0;
-  const pendingOrders = Object.create(null);   // broker order-open requestId -> resolver
+  // --- Enhanced data gathering state v2.8 ---
+  const historyPagination = Object.create(null); // asset@period -> { totalReceived, lastOffset, hasMore, attempts, lastError, gaps }
+  const dataQuality = Object.create(null); // asset -> { candleCount, tickCount, gaps, lastUpdate, qualityScore, continuity, freshness }
+  const backgroundScanQueue = [];
+  let backgroundScanTimer = null;
+  let lastInstrumentsRequestAt = 0;
+  let lastBalanceRequestAt = 0;
+  let lastMtfRequestAt = 0;
+  let lastGapCheckAt = 0;
+  const MTF_PERIODS = [60, 300, 900, 1800, 3600];
+  const GAP_CHECK_INTERVAL = 120000; // 2 min
+  const MTF_PREFETCH_INTERVAL = 300000; // 5 min
+  const pendingOrders = Object.create(null);
   const settledOrderIds = Object.create(null); // de-dupe broker close replays
   const settledOrderQueue = [];
   let pendingOrderEvent = null;                // single broker-order-event fallback waiter
@@ -241,8 +356,11 @@
     const lastChartBar = chart && Array.isArray(chart.candles) && chart.candles.length ? chart.candles[chart.candles.length - 1] : null;
     const basePrice = (assetId === activeAsset && lastWsPrice) || (lastChartBar && lastChartBar.close) || lastDomPriceByAsset[assetId] || a.basePrice || 1.0;
     const profile = Object.assign({}, a, { basePrice });
+    // Use broker clock for synthetic seed alignment when available, so the
+    // warm-up series lands on the same minute boundaries as broker history.
+    const seedBase = getBrokerNow();
     f.setSeries(self.CYBER_FEED.syntheticSeries(profile, 120, {
-      startTime: Math.floor(Date.now() / TF_MS) * TF_MS - 120 * TF_MS,
+      startTime: Math.floor(seedBase / TF_MS) * TF_MS - 120 * TF_MS,
     }));
     return f;
   }
@@ -854,6 +972,33 @@
     return out;
   }
 
+  /** v2.8: expiry winrates per minute bucket for dynamic expiry learning */
+  function expiryWinrates(minSettled) {
+    const out = Object.create(null);
+    const history = stats.history;
+    if (!Array.isArray(history) || !history.length) return out;
+    const floor = Number.isFinite(Number(minSettled)) && Number(minSettled) > 0 ? Math.floor(Number(minSettled)) : 8;
+    const buckets = Object.create(null);
+    for (const h of history) {
+      if (!h || h.draw) continue;
+      const exp = Number(h.expiryMinutes);
+      if (!Number.isFinite(exp) || exp < 0.5 || exp > 1440) continue;
+      const key = String(Math.round(exp * 2) / 2); // 0.5 steps
+      if (!buckets[key]) buckets[key] = { w: 0, l: 0 };
+      if (h.won === true) buckets[key].w++;
+      else if (h.won === false) buckets[key].l++;
+    }
+    const PRIOR = 6;
+    for (const k of Object.keys(buckets)) {
+      const row = buckets[k];
+      const settled = row.w + row.l;
+      if (settled < floor) continue;
+      const wr = ((row.w + PRIOR * 0.5) / (settled + PRIOR)) * 100;
+      if (Number.isFinite(wr)) out[k] = Math.round(wr * 10) / 10;
+    }
+    return out;
+  }
+
   /** Push the active asset's markers plus bars from the SAME timeframe shown
    *  by Quotex. Sending 1m bars while the platform displayed 5m/15m made the
    *  overlay project arrows into the wrong horizontal slots. */
@@ -980,20 +1125,52 @@
   function mergeChartCandles(assetId, period, incoming) {
     const rawPeriod = Number(period);
     const p = Number.isFinite(rawPeriod) && rawPeriod > 0 ? Math.min(86400, Math.floor(rawPeriod)) : 60;
+    const periodMs = p * 1000;
     const byPeriod = chartHistory[assetId] || (chartHistory[assetId] = Object.create(null));
     const prev = byPeriod[p] && Array.isArray(byPeriod[p].candles) ? byPeriod[p].candles : [];
     const map = Object.create(null);
-    for (const c of prev) if (c && Number.isFinite(Number(c.time))) map[Number(c.time)] = c;
-    for (const c of incoming || []) if (c && Number.isFinite(Number(c.time))) map[Number(c.time)] = c;
+    for (const c of prev) {
+      if (!c || !Number.isFinite(Number(c.time))) continue;
+      const t = brokerBucket(Number(c.time), periodMs);
+      map[t] = Object.assign({}, c, { time: t });
+    }
+    for (const c of incoming || []) {
+      if (!c || !Number.isFinite(Number(c.time))) continue;
+      const t = brokerBucket(Number(c.time), periodMs);
+      map[t] = Object.assign({}, c, { time: t });
+    }
     const times = Object.keys(map).map(Number).sort((a, b) => a - b).slice(-400);
     const merged = times.map((t) => map[t]);
     byPeriod[p] = { period: p, candles: merged, ts: Date.now() };
     return byPeriod[p];
   }
 
+  function synthesizeFrom1m(assetId, targetPeriod) {
+    // Synthesize higher timeframe candles from 1m data when broker hasn't sent that TF yet
+    if (!assetId || targetPeriod <= 60) return null;
+    const byPeriod = chartHistory[assetId];
+    if (!byPeriod) return null;
+    const oneM = byPeriod[60];
+    if (!oneM || !Array.isArray(oneM.candles) || oneM.candles.length < targetPeriod/60) return null;
+    if (!self.CYBER_TA || typeof self.CYBER_TA.resample !== "function") return null;
+    try {
+      const minutes = Math.max(1, Math.round(targetPeriod / 60));
+      const resampled = self.CYBER_TA.resample(oneM.candles, minutes);
+      if (resampled && resampled.length) {
+        return { period: targetPeriod, candles: resampled, ts: Date.now(), synthesized: true };
+      }
+    } catch (_) {}
+    return null;
+  }
+
   function chartForActiveAsset() {
     const periods = chartHistory[activeAsset];
-    if (!periods) return null;
+    if (!periods) {
+      // Try synthesize from 1m if we have it
+      const synth = synthesizeFrom1m(activeAsset, lastWsPeriod);
+      if (synth) return synth;
+      return null;
+    }
     let selected = null;
     if (periods[lastWsPeriod] && periods[lastWsPeriod].candles.length) selected = periods[lastWsPeriod];
     // v2.7.1: fall back to the most recent period's data if the requested
@@ -1005,6 +1182,11 @@
         const item = periods[p];
         if (item && item.candles && item.candles.length && (!selected || item.ts > selected.ts)) selected = item;
       }
+    }
+    // v2.8.1: if still no data, try synthesizing from 1m
+    if (!selected) {
+      const synth = synthesizeFrom1m(activeAsset, lastWsPeriod);
+      if (synth) return synth;
     }
     if (!selected) return null;
 
@@ -1044,11 +1226,26 @@
     if (!Number.isSafeInteger(liveTime) || liveTime <= 0) return bars;
     const lastIdx = bars.length - 1;
     const lastTime = Number(bars[lastIdx] && bars[lastIdx].time);
-    if (!Number.isSafeInteger(lastTime) || liveTime <= lastTime) return bars;
-    // v2.7.1: only append if the live bar is strictly newer. Never modify
-    // the broker's existing candles — they are the source of truth for the
-    // dashboard chart. Modifying them caused the "dashboard doesn't match
-    // Quotex" issue.
+    if (!Number.isSafeInteger(lastTime)) return bars;
+    if (liveTime < lastTime) return bars;
+    if (liveTime === lastTime) {
+      // Same bucket: merge live aggregation into broker's forming candle.
+      // The broker history for the forming bar is stale between WS updates;
+      // our resampled 1m live bar has fresher high/low/close from ticks.
+      const last = bars[lastIdx];
+      if (!last || typeof last !== "object") return bars;
+      const merged = Object.assign({}, last, {
+        high: Math.max(Number(last.high) || 0, Number(liveBar.high) || 0),
+        low: Math.min(Number(last.low) || Number.MAX_VALUE, Number(liveBar.low) || Number.MAX_VALUE),
+        close: Number.isFinite(Number(liveBar.close)) ? Number(liveBar.close) : last.close,
+        volume: Math.max(Number(last.volume) || 0, Number(liveBar.volume) || 0),
+      });
+      // Guard low against NaN when both are 0
+      if (!Number.isFinite(merged.low) || merged.low <= 0) merged.low = Math.min(last.low, liveBar.low);
+      const out = bars.slice();
+      out[lastIdx] = merged;
+      return out;
+    }
     return bars.concat([liveBar]);
   }
 
@@ -1094,6 +1291,7 @@
     const feed = createFeedFor(id);
     const rawPeriod = Number(period);
     const safePeriod = Number.isFinite(rawPeriod) && rawPeriod > 0 ? Math.min(86400, Math.floor(rawPeriod)) : 60;
+    const periodMs = safePeriod * 1000;
     const real = [];
     const limit = Math.min(candles.length, 6000);
     const firstTime = Number(candles[0] && candles[0].time);
@@ -1105,10 +1303,16 @@
       if (!c || typeof c !== "object" || Array.isArray(c)) continue;
       const rawTime = Number(c.time), open = Number(c.open), close = Number(c.close);
       const rawHigh = Number(c.high), rawLow = Number(c.low);
-      const time = Math.abs(rawTime) >= 1e14 ? Math.floor(rawTime / 1000)
+      let time = Math.abs(rawTime) >= 1e14 ? Math.floor(rawTime / 1000)
         : Math.abs(rawTime) >= 1e11 ? Math.floor(rawTime) : Math.floor(rawTime * 1000);
+      // Bucket to period boundary to match Quotex UTC alignment.
+      // Broker candles are already aligned, but flooring ensures ticks and
+      // history share the same slot even if ms offsets appear.
+      time = brokerBucket(time, periodMs);
+      const brokerNowEst = getBrokerNow();
       if (![time, open, close, rawHigh, rawLow].every(Number.isFinite) ||
-          time < 946684800000 || time > Date.now() + 86400000 ||
+          time < 946684800000 || time > brokerNowEst + 86400000 ||
+          time > Date.now() + 2 * 86400000 ||
           open <= 0 || close <= 0 || rawHigh <= 0 || rawLow <= 0 ||
           Math.max(open, close, rawHigh, rawLow) > 1e12) continue;
       const rawVolume = Number(c.volume);
@@ -1121,6 +1325,9 @@
     }
     if (!real.length) return;
     real.sort((a, b) => a.time - b.time);
+    // Update broker clock from newest candle (open + period = approx now)
+    const newestTime = real[real.length - 1].time;
+    updateBrokerClock(newestTime + periodMs);
 
     // The engine runs on 1m bars; accept 60s history directly and build 1m
     // from ticks for everything else (the chart shows the broker timeframe).
@@ -1166,12 +1373,73 @@
     // minutes after an asset switch.
     if (useForEngine && feed.series().length >= 20) realHistoryReady[id] = true;
     const newestRealTime = real[real.length - 1].time;
-    // v2.6.5: the upper bound tolerates broker-server clock skew (old bound
-    // was +1 minute, which made "live" detection fail whenever the server
-    // clock ran ahead of the user's PC).
-    if (useForEngine && newestRealTime >= Date.now() - 2 * TF_MS && newestRealTime <= Date.now() + 86400000) {
+    // Use broker clock for freshness check — Date.now() may be off by minutes.
+    const brokerNowForCheck = getBrokerNow();
+    if (useForEngine && newestRealTime >= brokerNowForCheck - 2 * TF_MS && newestRealTime <= brokerNowForCheck + 86400000) {
       lastAcceptedQuoteAt[id] = Date.now();
     }
+    // Track data quality and pagination with enhanced logic
+    try {
+      // Detect gaps in incoming batch
+      let gapsInBatch = [];
+      let continuity = 1;
+      try {
+        if (QUOTEX && QUOTEX.detectGaps && real.length >= 2) {
+          gapsInBatch = QUOTEX.detectGaps(real, safePeriod);
+          if (gapsInBatch.length) {
+            const totalMissing = gapsInBatch.reduce((s,g)=>s+(g.missing||0),0);
+            continuity = Math.max(0, 1 - totalMissing / real.length);
+          }
+        }
+      } catch (_) {}
+
+      updateDataQuality(id, feed.series().length, true, {
+        gaps: gapsInBatch.length,
+        gapList: gapsInBatch,
+        continuity: continuity
+      });
+
+      const key = historyKey(id, safePeriod);
+      if (!historyPagination[key]) {
+        historyPagination[key] = { totalReceived: 0, lastOffset: 0, hasMore: true, attempts: 0, lastError: 0, gaps: [] };
+      }
+      const pag = historyPagination[key];
+      pag.totalReceived += real.length;
+      pag.attempts = 0; // reset on success
+      if (gapsInBatch.length) pag.gaps = gapsInBatch.slice(0, 5);
+
+      // Smart pagination: continue if we got a full batch or close to limit
+      const receivedFullBatch = real.length >= 900;
+      const isPaginated = safePeriod === 60 && pag.hasMore;
+      if (receivedFullBatch && isPaginated) {
+        const nextOffset = pag.lastOffset + real.length;
+        if (nextOffset < 15000) {
+          pag.lastOffset = nextOffset;
+          // Use small jitter to avoid thundering herd
+          const delay = 400 + Math.random() * 600;
+          setTimeout(function() {
+            try {
+              // For active asset, continue pagination aggressively; for background, slower
+              const isActive = id === activeAsset;
+              const limit = isActive ? 5000 : 2000;
+              requestPeriodHistory(id, safePeriod, true, limit, nextOffset);
+            } catch (_) {}
+          }, delay);
+        } else {
+          pag.hasMore = false;
+        }
+      } else {
+        // If we got less than full batch, likely no more history
+        if (real.length < 900) pag.hasMore = false;
+      }
+
+      // If gaps detected in active asset, trigger gap fill
+      if (id === activeAsset && gapsInBatch.length > 0 && gapsInBatch.length <= 5) {
+        setTimeout(function(){
+          try { requestGapFill(id, safePeriod); } catch (_) {}
+        }, 1000);
+      }
+    } catch (_) {}
     // Merge incremental batches instead of replacing the dashboard series
     // with whichever partial history response arrived last. Histories from
     // other open/mini charts are retained per asset+period but NEVER select
@@ -1234,7 +1502,7 @@
   }
 
   function confirmationLifecycle(data) {
-    const receivedAt = Date.now();
+    const receivedAt = getBrokerNow();
     const rawOpen = Number(data && data.openTime);
     const openTime = Number.isSafeInteger(rawOpen) && rawOpen >= receivedAt - 86400000 && rawOpen <= receivedAt + 86400000
       ? rawOpen : receivedAt;
@@ -1251,7 +1519,7 @@
     // close is counted once per open tab and races whole automation snapshots.
     if (!isPrimaryContext || !autoController || !order || order.kind !== "closed" || !order.data) return false;
     const data = order.data;
-    const now = Date.now();
+    const now = getBrokerNow();
     const closeTime = Number(data.closeTime);
     const currentDate = new Date(now);
     const dayStart = Date.UTC(currentDate.getUTCFullYear(), currentDate.getUTCMonth(), currentDate.getUTCDate());
@@ -1281,6 +1549,81 @@
     for (let i = lastOrders.length - 1; i >= 0; i--) processClosedOrder(lastOrders[i], true);
   }
 
+  function addOpenOrder(data) {
+    if (!data) return;
+    const id = String(data.id || data.requestId || "").trim().slice(0, 128);
+    if (!id) return;
+    // Don't add if already closed
+    if (settledOrderIds[id]) return;
+    const key = id;
+    const now = getBrokerNow();
+    const openTime = Number(data.openTime) || now;
+    let expiryTime = Number(data.expiryTime || data.closeTime);
+    if (!Number.isSafeInteger(expiryTime) || expiryTime <= openTime) {
+      const dur = Number(data.duration);
+      if (Number.isFinite(dur) && dur > 0) expiryTime = openTime + dur * 1000;
+      else expiryTime = openTime + 180000; // fallback 3m
+    }
+    openOrders[key] = {
+      id,
+      requestId: data.requestId ? String(data.requestId).slice(0,128) : null,
+      asset: data.asset || "",
+      dir: data.direction || data.dir || "",
+      direction: data.direction || data.dir || "",
+      amount: Number(data.amount) || 0,
+      openPrice: Number(data.openPrice) || 0,
+      openTime,
+      expiryTime,
+      closeTime: expiryTime,
+      duration: Math.max(0, Math.round((expiryTime - openTime)/1000)),
+      status: "OPEN",
+      raw: data,
+    };
+    if (openOrdersQueue.indexOf(key) === -1) openOrdersQueue.push(key);
+    while (openOrdersQueue.length > 50) {
+      const oldKey = openOrdersQueue.shift();
+      if (oldKey && openOrders[oldKey]) delete openOrders[oldKey];
+    }
+  }
+
+  function removeOpenOrder(data) {
+    if (!data) return;
+    const id = String(data.id || data.requestId || "").trim().slice(0, 128);
+    if (id && openOrders[id]) {
+      delete openOrders[id];
+      const idx = openOrdersQueue.indexOf(id);
+      if (idx >= 0) openOrdersQueue.splice(idx, 1);
+      return;
+    }
+    // Try to match by asset+times if id missing
+    const asset = data.asset ? String(data.asset) : "";
+    const openT = Number(data.openTime);
+    for (const k of Object.keys(openOrders)) {
+      const o = openOrders[k];
+      if (!o) continue;
+      if (asset && o.asset && o.asset !== asset) continue;
+      if (Number.isSafeInteger(openT) && Math.abs(o.openTime - openT) > 5000) continue;
+      delete openOrders[k];
+      const idx = openOrdersQueue.indexOf(k);
+      if (idx >= 0) openOrdersQueue.splice(idx, 1);
+      break;
+    }
+  }
+
+  function cleanupExpiredOpenOrders() {
+    const now = getBrokerNow();
+    for (const k of Object.keys(openOrders)) {
+      const o = openOrders[k];
+      if (!o) continue;
+      // If expiry passed + 2min grace, remove (broker should have sent close)
+      if (o.expiryTime && now > o.expiryTime + 120000) {
+        delete openOrders[k];
+        const idx = openOrdersQueue.indexOf(k);
+        if (idx >= 0) openOrdersQueue.splice(idx, 1);
+      }
+    }
+  }
+
   function applyHookSnapshot(snap) {
     if (!snap || typeof snap !== "object" || Array.isArray(snap)) return;
     const status = normalizeStatus(snap.status);
@@ -1300,6 +1643,25 @@
     }
     if (Array.isArray(snap.orders)) {
       lastOrders = snap.orders.map(normalizeOrderEvent).filter(Boolean).slice(0, 50);
+      // Rebuild open orders from snapshot: opened without matching closed
+      try {
+        // Clear and rebuild
+        for (const k of Object.keys(openOrders)) delete openOrders[k];
+        openOrdersQueue.length = 0;
+        const closedIds = new Set();
+        for (const o of lastOrders) {
+          if (o.kind === "closed" && o.data) {
+            const cid = String(o.data.id || o.data.requestId || "").trim();
+            if (cid) closedIds.add(cid);
+          }
+        }
+        for (const o of lastOrders) {
+          if (o.kind === "opened" && o.data) {
+            const oid = String(o.data.id || o.data.requestId || "").trim();
+            if (oid && !closedIds.has(oid)) addOpenOrder(o.data);
+          }
+        }
+      } catch (_) {}
       if (lastOrders[0]) {
         try { chrome.runtime.sendMessage({ type: "CYBER_QUOTEX_TRADE_RESULT", payload: lastOrders[0] }).catch(() => {}); } catch (_) {}
       }
@@ -1376,6 +1738,9 @@
         // supplied it — so historical/live accuracy never influenced which
         // strategy got picked. Only the router consumes it.
         strategyWinrates: currentStrategy === "auto_adaptive" ? strategyWinrates() : null,
+        expiryWinrates: expiryWinrates(),
+        adaptiveExpiryMin: runtimeSettings && runtimeSettings.adaptiveExpiryMin,
+        adaptiveExpiryMax: runtimeSettings && runtimeSettings.adaptiveExpiryMax,
       });
       sig.asset = asset ? asset.id : activeAsset;
       sig.assetName = asset ? asset.name : activeAsset;
@@ -1463,8 +1828,9 @@
     const authoritativeMain = !!lastWsSymbol && !!QUOTEX &&
       QUOTEX.normalizeSymbol(activeAsset) === QUOTEX.normalizeSymbol(lastWsSymbol);
     const closedAt = closed && Number(closed.time) + TF_MS;
-    const liveClosedBar = Number.isFinite(closedAt) && closedAt <= Date.now() + TF_MS &&
-      Date.now() - closedAt <= 10 * TF_MS;
+    const brokerNowCheck = getBrokerNow();
+    const liveClosedBar = Number.isFinite(closedAt) && closedAt <= brokerNowCheck + TF_MS &&
+      brokerNowCheck - closedAt <= 10 * TF_MS;
     if (isPrimaryContext && authoritativeMain && realHistoryReady[activeAsset] && liveClosedBar &&
         sig && sig.ready && sig.direction !== "WAIT" && closed && a.length >= 2 && !pendingByAsset[activeAsset]) {
       const key = String(closed.time);
@@ -1472,7 +1838,22 @@
         // One virtual lifecycle per asset/bar even if strategy changes or the
         // user switches away and back before the next candle closes.
         lastVirtualBarByAsset[activeAsset] = key;
-        const expiryMinutes = Math.max(0.5, Math.min(1440, Number(runtimeSettings && runtimeSettings.expiry) || 3));
+        // v2.8: dynamic expiry for accuracy
+        let expiryMinutes;
+        if (runtimeSettings && runtimeSettings.expiryMode === "adaptive" && sig && sig.suggestedExpiry) {
+          const dyn = Number(sig.suggestedExpiry);
+          if (Number.isFinite(dyn) && dyn >= 0.5 && dyn <= 1440) {
+            const minB = Number(runtimeSettings.adaptiveExpiryMin);
+            const maxB = Number(runtimeSettings.adaptiveExpiryMax);
+            const clampedMin = Number.isFinite(minB) ? Math.max(0.5, minB) : 0.5;
+            const clampedMax = Number.isFinite(maxB) ? Math.min(1440, maxB) : 1440;
+            expiryMinutes = Math.max(Math.min(clampedMin, clampedMax), Math.min(Math.max(clampedMin, clampedMax), dyn));
+          } else {
+            expiryMinutes = Math.max(0.5, Math.min(1440, Number(runtimeSettings && runtimeSettings.expiry) || 3));
+          }
+        } else {
+          expiryMinutes = Math.max(0.5, Math.min(1440, Number(runtimeSettings && runtimeSettings.expiry) || 3));
+        }
         const assetPayout = Number(asset && asset.payout);
         const payout = Number.isFinite(assetPayout) && assetPayout > 0
           ? Math.min(10, assetPayout > 1 ? assetPayout / 100 : assetPayout) : 0.85;
@@ -1546,6 +1927,12 @@
     const chart = chartForActiveAsset();
     const pending = pendingByAsset[activeAsset];
     const latestOrder = lastOrders[0] && lastOrders[0].data || {};
+    const openCount = Object.keys(openOrders).length;
+    const openFingerprint = openOrdersQueue.slice(-5).join(",");
+    const dq = dataQuality[activeAsset];
+    const dqFp = dq ? [dq.candleCount, dq.qualityScore, dq.gaps, dq.lastUpdate].join(",") : "";
+    const clockStats = getBrokerClockStats ? getBrokerClockStats() : null;
+    const clockFp = clockStats ? clockStats.skewSec : "";
     return [
       activeAsset, activeFeed.lastPrice(), cachedAnalysisKey,
       sig && sig.direction, sig && sig.confidence,
@@ -1555,6 +1942,7 @@
       lastQuotexStatus && lastQuotexStatus.state,
       lastBalance && lastBalance.balance, lastInstruments.length,
       lastOrders.length, latestOrder.id || latestOrder.requestId || "",
+      openCount, openFingerprint, dqFp, clockFp
     ].join("|");
   }
 
@@ -1584,6 +1972,7 @@
 
   function pushState(sig) {
     if (!sig) return;
+    try { cleanupExpiredOpenOrders(); } catch (_) {}
     const total = stats.wins + stats.losses;
     const chart = chartForActiveAsset();
     const feedSeries = activeFeed.series().slice(-220);
@@ -1633,7 +2022,52 @@
         instrumentsCount: lastInstruments.length,
         activeSymbol: lastWsSymbol || activeAsset,
         activePeriod: lastWsPeriod,
-        lastOrders: lastOrders.slice(0, 5),
+        lastOrders: lastOrders.slice(0, 10),
+        openOrders: Object.values(openOrders).slice(0, 20),
+        dataQuality: dataQuality[activeAsset] || null,
+        allDataQuality: Object.keys(dataQuality).length,
+        dataQualityMap: (function(){
+          try {
+            const out = {};
+            let count = 0;
+            for (const k in dataQuality) {
+              if (Object.prototype.hasOwnProperty.call(dataQuality, k) && count < 30) {
+                out[k] = dataQuality[k];
+                count++;
+              }
+            }
+            return out;
+          } catch (_) { return {}; }
+        })(),
+        pagination: (function(){
+          try {
+            const out = {};
+            let count = 0;
+            for (const k in historyPagination) {
+              if (Object.prototype.hasOwnProperty.call(historyPagination, k) && count < 20) {
+                out[k] = historyPagination[k];
+                count++;
+              }
+            }
+            return out;
+          } catch (_) { return {}; }
+        })(),
+        clockStats: getBrokerClockStats ? getBrokerClockStats() : null,
+        liveCandlesCount: Object.keys(liveCandlesByAsset).length,
+        chartHistoryKeys: (function(){
+          try {
+            const keys = [];
+            for (const aid in chartHistory) {
+              if (!Object.prototype.hasOwnProperty.call(chartHistory, aid)) continue;
+              for (const per in chartHistory[aid]) {
+                if (Object.prototype.hasOwnProperty.call(chartHistory[aid], per)) {
+                  keys.push(aid + "@" + per);
+                }
+              }
+            }
+            return keys.slice(0, 50);
+          } catch (_) { return []; }
+        })(),
       },
     };
     try { chrome.runtime.sendMessage({ type: "CYBER_STATE", payload }).catch(() => {}); } catch (_) {}
@@ -1729,24 +2163,56 @@
     const relativeMove = Number.isFinite(priorPrice) && priorPrice > 0
       ? Math.abs(safePrice / priorPrice - 1) : 0;
 
-    // The DOM is only a fallback and can briefly point at a balance, payout,
-    // strike, or another chart while the broker SPA is remounting. Once real
-    // history anchors the feed, reject a single DOM value more than 2% away;
-    // WebSocket quotes and broker OHLC remain authoritative.
-    if (source === "dom" && historySeeded[targetAsset] && relativeMove > 0.02) return false;
+    // v2.8: Enhanced DOM+WS reconciliation
+    // - DOM is fallback only, reject if >2% away from feed (existing)
+    // - Additionally, if we have fresh WS price, validate DOM against WS (not just feed)
+    // - For active asset, if WS price exists and DOM deviates >1% (FX) or >5% (crypto), reject DOM
+    if (source === "dom") {
+      if (historySeeded[targetAsset] && relativeMove > 0.02) return false;
+      // Cross-check with WS price if available and fresh
+      if (lastWsPrice && lastWsSymbol && QUOTEX) {
+        try {
+          const wsNorm = QUOTEX.normalizeSymbol(lastWsSymbol);
+          const targetNorm = QUOTEX.normalizeSymbol(targetAsset);
+          if (wsNorm === targetNorm && Date.now() - lastWsTickAt < 10000) {
+            const wsPrice = Number(lastWsPrice);
+            if (Number.isFinite(wsPrice) && wsPrice > 0) {
+              const wsMove = Math.abs(safePrice / wsPrice - 1);
+              const isCrypto = /BTC|ETH|XRP|SOL|DOGE|_otc/i.test(targetAsset) && /USD/i.test(targetAsset);
+              const threshold = isCrypto ? 0.05 : 0.01;
+              if (wsMove > threshold) return false;
+            }
+          }
+        } catch (_) {}
+      }
+    }
 
-    let ts = tickTime == null ? Date.now() : Number(tickTime);
-    if (!Number.isFinite(ts)) return false;
-    while (Math.abs(ts) >= 1e14) ts /= 1000;
-    if (Math.abs(ts) < 1e11) ts *= 1000;
-    ts = Math.floor(ts);
-    // v2.6.10: history batches tolerate 24h of server clock skew, but a LIVE
-    // quote running ahead by more than 10 minutes is a glitch: accepting it
-    // would open a far-future bucket that swallows every subsequent real
-    // tick (canIngest rejects t < current.time forever). 10 minutes covers
-    // any realistic broker-vs-client drift on a real-time stream.
-    if (!Number.isSafeInteger(ts) || ts < Date.now() - 7 * 86400000 || ts > Date.now() + 600000 ||
-        (typeof targetFeed.canIngest === "function" && !targetFeed.canIngest(ts))) return false;
+    let ts;
+    const isBrokerTick = source === "websocket" && tickTime != null;
+    if (tickTime == null) {
+      ts = getBrokerNow();
+    } else {
+      let parsed = Number(tickTime);
+      if (!Number.isFinite(parsed)) return false;
+      while (Math.abs(parsed) >= 1e14) parsed /= 1000;
+      if (Math.abs(parsed) < 1e11) parsed *= 1000;
+      ts = Math.floor(parsed);
+    }
+    if (!Number.isSafeInteger(ts) || ts < 946684800000) return false;
+    // Validate against broker clock, not local clock. Local may be minutes off.
+    const brokerNowEst = getBrokerNow();
+    // Past: 7 days behind broker
+    if (ts < brokerNowEst - 7 * 86400000) return false;
+    // Future: 10 min ahead of broker, or 2 days ahead of local (garbage)
+    if (ts > brokerNowEst + 600000) {
+      // Allow small skew if broker clock hasn't been set yet
+      if (brokerNow != null || ts > Date.now() + 600000) return false;
+    }
+    if (ts > Date.now() + 2 * 86400000) return false;
+    if (typeof targetFeed.canIngest === "function" && !targetFeed.canIngest(ts)) return false;
+
+    // Update broker clock from validated broker ticks only
+    if (isBrokerTick) updateBrokerClock(ts);
 
     // Before genuine 1m history is available the feed contains a synthetic
     // indicator warm-up. Align that warm-up to the first valid real quote (and
@@ -1797,59 +2263,287 @@
    * timeframe and the dashboard sat on "Waiting for candles…" while Quotex
    * drew candles next to it.
    */
-  function requestPeriodHistory(id, period, force, requestedLimit) {
+  function requestPeriodHistory(id, period, force, requestedLimit, offset) {
     const safePeriod = Number.isFinite(Number(period)) && Number(period) >= 1
       ? Math.min(86400, Math.max(1, Math.floor(Number(period)))) : 60;
     const key = historyKey(id, safePeriod);
     const at = historyRequestedAt[key] || 0;
-    if (!force) {
+    const safeOffset = Number.isFinite(Number(offset)) ? Math.max(0, Math.floor(Number(offset))) : 0;
+    const isPagination = safeOffset > 0;
+    const now = Date.now();
+
+    // Enhanced throttling with attempt tracking
+    if (!historyPagination[key]) {
+      historyPagination[key] = { totalReceived: 0, lastOffset: 0, hasMore: true, attempts: 0, lastError: 0, gaps: [] };
+    }
+    const pag = historyPagination[key];
+
+    if (!force && !isPagination) {
       if (safePeriod === 60) {
-        // Once real history has arrived, live ticks extend the cache; do not
-        // pull a 5,000-row batch on every periodic scan. The backtest button
-        // can still force one refresh on demand.
-        if (historySeeded[id]) return null;
-      } else {
-        // The platform pushes its own updates for the visible chart, so a
-        // cached batch only needs re-pulling when it went stale (idle chart,
-        // reconnect) or never arrived at all.
+        // Once real history has arrived and no gaps, don't spam. But allow if:
+        // - never seeded, or
+        // - hasMore pagination pending, or
+        // - gaps detected, or
+        // - stale (>5 min for active asset, >10 min for others)
+        const isActive = id === activeAsset;
+        const staleThreshold = isActive ? 300000 : 600000;
         const cached = chartHistory[id] && chartHistory[id][safePeriod];
         const bars = cached && Array.isArray(cached.candles) ? cached.candles.length : 0;
-        if (bars && Date.now() - (Number(cached.ts) || 0) < 600000) return null;
+        const isStale = !cached || now - (Number(cached.ts) || 0) > staleThreshold;
+        const hasGaps = pag.gaps && pag.gaps.length > 0;
+        if (historySeeded[id] && !pag.hasMore && !hasGaps && !isStale && bars >= 100) return null;
+        // Backoff on repeated failures
+        if (pag.attempts >= 3 && now - pag.lastError < 60000) return null;
+      } else {
+        const cached = chartHistory[id] && chartHistory[id][safePeriod];
+        const bars = cached && Array.isArray(cached.candles) ? cached.candles.length : 0;
+        const isActive = id === activeAsset && safePeriod === lastWsPeriod;
+        const staleThreshold = isActive ? 120000 : 600000;
+        if (bars && now - (Number(cached.ts) || 0) < staleThreshold) return null;
       }
-      if (Date.now() - at < 30000) return null; // retry initial attachment at most every 30s
+      const throttleMs = id === activeAsset ? 10000 : 15000;
+      if (now - at < throttleMs) return null;
     }
+
+    // Exponential backoff for pagination retries
+    if (isPagination && pag.attempts >= 5) {
+      if (now - pag.lastError < 30000 * Math.min(4, pag.attempts)) return null;
+    }
+
     const rawLimit = Number(requestedLimit);
-    const wanted = Number.isFinite(rawLimit) ? Math.max(60, Math.min(5000, Math.floor(rawLimit))) : 5000;
-    // Higher timeframes need far fewer rows for the same wall-clock window.
-    const limit = safePeriod === 60 ? wanted : Math.max(60, Math.min(wanted, 1000));
-    const requestId = "history_" + Date.now() + "_" + (++historyRequestSequence % 1000000);
-    historyRequestedAt[key] = Date.now();
+    const wanted = Number.isFinite(rawLimit) ? Math.max(60, Math.min(10000, Math.floor(rawLimit))) : 5000;
+    const limit = safePeriod === 60 ? wanted : Math.max(60, Math.min(wanted, 2000));
+    const requestId = "history_" + now + "_" + (++historyRequestSequence % 1000000);
+    if (!isPagination) historyRequestedAt[key] = now;
+    pag.attempts = (pag.attempts || 0) + 1;
+
     try {
       window.postMessage({
         source: _SRC_OUT,
         kind: "subscribe",
-        payload: { requestId, asset: id, period: safePeriod, limit },
+        payload: { requestId, asset: id, period: safePeriod, limit, offset: safeOffset },
       }, "*");
-      pendingHistoryMeta[requestId] = { asset: id, period: safePeriod };
+      pendingHistoryMeta[requestId] = { asset: id, period: safePeriod, limit, offset: safeOffset, at: now };
       return requestId;
     } catch (_) {
-      historyRequestedAt[key] = 0;
+      if (!isPagination) historyRequestedAt[key] = 0;
+      pag.lastError = now;
       return null;
     }
+  }
+
+  function requestAllTimeframes(id, force) {
+    if (!id) return;
+    const now = Date.now();
+    if (!force && now - lastMtfRequestAt < 60000) return; // throttle MTF to 1/min
+    lastMtfRequestAt = now;
+    for (let i = 0; i < MTF_PERIODS.length; i++) {
+      const period = MTF_PERIODS[i];
+      (function(p, idx) {
+        setTimeout(function() {
+          try {
+            // For active asset, request more data; for background, less
+            const isActive = id === activeAsset;
+            const limit = p === 60 ? (isActive ? 5000 : 1000) : (isActive ? 2000 : 500);
+            requestPeriodHistory(id, p, force, limit);
+          } catch (_) {}
+        }, idx * 180);
+      })(period, i);
+    }
+  }
+
+  function requestGapFill(id, period) {
+    if (!id) return;
+    const now = Date.now();
+    if (now - lastGapCheckAt < GAP_CHECK_INTERVAL) return;
+    lastGapCheckAt = now;
+    try {
+      if (!QUOTEX || !QUOTEX.detectGaps) return;
+      const candles = liveCandlesByAsset[id];
+      if (!candles || candles.length < 10) return;
+      const gaps = QUOTEX.detectGaps(candles, period || 60);
+      if (!gaps.length) return;
+      // Track gaps in pagination state
+      const key = historyKey(id, period || 60);
+      if (historyPagination[key]) historyPagination[key].gaps = gaps.slice(0, 5);
+      // Request missing history via page-hook
+      try {
+        window.postMessage({
+          source: _SRC_OUT,
+          kind: "request_gaps",
+          payload: { asset: id, period: period || 60, gaps: gaps.slice(0, 3) }
+        }, "*");
+      } catch (_) {}
+      // Also try direct history request to fill gaps
+      for (let i = 0; i < Math.min(gaps.length, 2); i++) {
+        const gap = gaps[i];
+        if (gap.missing > 0) {
+          setTimeout(function(){
+            try { requestPeriodHistory(id, period || 60, false, Math.min(5000, gap.missing + 100)); } catch (_) {}
+          }, i * 500);
+        }
+      }
+    } catch (_) {}
+  }
+
+  function requestInstrumentsAndBalance(force) {
+    const now = Date.now();
+    if (!force) {
+      if (now - lastInstrumentsRequestAt < 60000 && now - lastBalanceRequestAt < 30000) return;
+    }
+    try {
+      if (now - lastInstrumentsRequestAt >= 60000 || force) {
+        lastInstrumentsRequestAt = now;
+        window.postMessage({ source: _SRC_OUT, kind: "request_instruments", payload: {} }, "*");
+      }
+      if (now - lastBalanceRequestAt >= 30000 || force) {
+        lastBalanceRequestAt = now;
+        window.postMessage({ source: _SRC_OUT, kind: "request_balance", payload: {} }, "*");
+      }
+    } catch (_) {}
+  }
+
+  function updateDataQuality(assetId, candleCount, isNewBatch, extra) {
+    if (!assetId) return;
+    const id = String(assetId).slice(0, 96);
+    if (!dataQuality[id]) {
+      dataQuality[id] = {
+        candleCount: 0, tickCount: 0, gaps: 0, lastUpdate: 0, qualityScore: 0, batches: 0,
+        continuity: 0, freshness: 0, gapList: [], lastGapCheck: 0
+      };
+    }
+    const dq = dataQuality[id];
+    const now = Date.now();
+    if (isNewBatch) {
+      dq.batches = (dq.batches || 0) + 1;
+      if (Number.isFinite(candleCount)) dq.candleCount = Math.max(dq.candleCount, candleCount);
+      dq.tickCount = (dq.tickCount || 0) + 1;
+    }
+    if (extra && typeof extra === "object") {
+      if (Number.isFinite(extra.gaps)) dq.gaps = extra.gaps;
+      if (Array.isArray(extra.gapList)) dq.gapList = extra.gapList.slice(0, 10);
+      if (Number.isFinite(extra.continuity)) dq.continuity = extra.continuity;
+    }
+    dq.lastUpdate = now;
+
+    // Gap detection if we have live candles
+    try {
+      if (QUOTEX && QUOTEX.detectGaps && liveCandlesByAsset[id] && liveCandlesByAsset[id].length >= 2) {
+        const gaps = QUOTEX.detectGaps(liveCandlesByAsset[id], 60);
+        dq.gaps = gaps.length;
+        dq.gapList = gaps.slice(0, 5);
+        dq.lastGapCheck = now;
+        // Continuity: 1 - (gaps / expected)
+        const expected = Math.max(1, dq.candleCount || liveCandlesByAsset[id].length);
+        dq.continuity = Math.max(0, Math.min(1, 1 - (gaps.reduce((s,g)=>s+(g.missing||0),0) / expected)));
+      }
+    } catch (_) {}
+
+    // Freshness: how recent is last update (0-1, 1 = very fresh)
+    const ageMin = (now - dq.lastUpdate) / 60000;
+    dq.freshness = Math.max(0, 1 - ageMin / 60);
+    const recencyScore = dq.freshness;
+    const countScore = Math.min(1, dq.candleCount / 500);
+    const batchScore = Math.min(1, dq.batches / 3);
+    const continuityScore = dq.continuity != null ? dq.continuity : 1;
+    const gapPenalty = dq.gaps ? Math.max(0, 1 - dq.gaps * 0.05) : 1;
+    // Weighted: count 40%, recency 20%, batches 15%, continuity 15%, gap penalty 10%
+    dq.qualityScore = Math.round((recencyScore * 0.2 + countScore * 0.4 + batchScore * 0.15 + continuityScore * 0.15 + gapPenalty * 0.1) * 100);
+    dq.qualityScore = Math.max(0, Math.min(100, dq.qualityScore));
   }
 
   function ensureHistorySubscription(det, force, requestedLimit) {
     if (!det || !QUOTEX || !QUOTEX.subscribeHistory) return null;
     const id = det.id;
     const engineRequestId = requestPeriodHistory(id, 60, force, requestedLimit);
-    // Keep the visible timeframe's chart fed too — never at the expense of
-    // the 1m series the engine runs on.
     const visiblePeriod = Number(lastWsPeriod);
     if (Number.isFinite(visiblePeriod) && visiblePeriod >= 1 && visiblePeriod <= 86400 &&
         Math.floor(visiblePeriod) !== 60) {
       requestPeriodHistory(id, Math.floor(visiblePeriod), force, requestedLimit);
     }
+    // v2.8: MTF prefetch — on force or when active asset has enough data, fetch other timeframes
+    // Also trigger on asset switch (force) or periodically for active asset
+    const shouldMtf = force || (id === activeAsset && historySeeded[id] && Date.now() - lastMtfRequestAt > MTF_PREFETCH_INTERVAL);
+    if (shouldMtf) {
+      try { requestAllTimeframes(id, force); } catch (_) {}
+    }
+    // Gap filling for active asset
+    if (id === activeAsset && historySeeded[id]) {
+      try { requestGapFill(id, 60); } catch (_) {}
+    }
+    try { requestInstrumentsAndBalance(false); } catch (_) {}
     return engineRequestId;
+  }
+
+  function scheduleBackgroundScan() {
+    if (backgroundScanTimer) return;
+    backgroundScanTimer = setInterval(function() {
+      try {
+        if (!isPrimaryContext) return;
+        const now = Date.now();
+        const candidates = [];
+        for (const aid in liveCandlesByAsset) {
+          if (!Object.prototype.hasOwnProperty.call(liveCandlesByAsset, aid)) continue;
+          const dq = dataQuality[aid];
+          const lastUp = dq ? dq.lastUpdate : 0;
+          const age = now - lastUp;
+          // Prioritize: stale (>2min) OR low quality (<60) OR has gaps
+          const isStale = age > 120000;
+          const isLowQuality = dq && dq.qualityScore < 60;
+          const hasGaps = dq && dq.gaps > 0;
+          if (isStale || isLowQuality || hasGaps) {
+            candidates.push({
+              id: aid,
+              score: dq ? dq.qualityScore : 0,
+              lastUp,
+              age,
+              gaps: dq ? dq.gaps : 0,
+              priority: (hasGaps ? 100 : 0) + (isLowQuality ? 50 : 0) + Math.min(30, age / 60000)
+            });
+          }
+        }
+        if (lastInstruments && lastInstruments.length) {
+          for (let i = 0; i < Math.min(lastInstruments.length, 30); i++) {
+            const it = lastInstruments[i];
+            if (!it || !it.symbol) continue;
+            const det = ASSETS.get(it.symbol);
+            if (!det) continue;
+            if (det.id === activeAsset) continue;
+            if (candidates.some(function(c){ return c.id === det.id; })) continue;
+            const dq = dataQuality[det.id];
+            const lastUp = dq ? dq.lastUpdate : 0;
+            const age = now - lastUp;
+            if (!dq || age > 300000 || (dq && dq.qualityScore < 50)) {
+              candidates.push({
+                id: det.id,
+                score: dq ? dq.qualityScore : 0,
+                lastUp,
+                age,
+                gaps: dq ? dq.gaps : 0,
+                priority: (dq && dq.gaps ? 100 : 0) + (dq && dq.qualityScore < 50 ? 50 : 0) + Math.min(20, age / 60000)
+              });
+            }
+          }
+        }
+        // Sort by priority descending, then by age descending
+        candidates.sort(function(a,b){
+          if (b.priority !== a.priority) return b.priority - a.priority;
+          return b.age - a.age;
+        });
+        // Request up to 2 background assets per cycle, with quality-aware limits
+        for (let j = 0; j < Math.min(2, candidates.length); j++) {
+          const c = candidates[j];
+          try {
+            const limit = c.gaps > 0 ? 2000 : (c.score < 50 ? 1500 : 1000);
+            requestPeriodHistory(c.id, 60, false, limit);
+          } catch (_) {}
+        }
+        // Periodically refresh instruments/balance
+        if (now - lastInstrumentsRequestAt > 120000) {
+          try { requestInstrumentsAndBalance(false); } catch (_) {}
+        }
+      } catch (_) {}
+    }, 25000);
   }
 
   function requestHistorySubscription(det, requestedLimit) {
@@ -1874,11 +2568,30 @@
   function tick() {
     const det = syncActiveAsset();
     const currentTime = Date.now();
+    const brokerTime = getBrokerNow();
+    // Periodic instruments/balance refresh
+    if (currentTime % 15000 < 1200) {
+      try { requestInstrumentsAndBalance(false); } catch (_) {}
+    }
+    // Periodic gap check for active asset (every 2 min)
+    if (currentTime % 120000 < 1200) {
+      try {
+        if (activeAsset && historySeeded[activeAsset]) requestGapFill(activeAsset, 60);
+      } catch (_) {}
+    }
+    // Periodic MTF refresh for active asset (every 5 min)
+    if (currentTime % 300000 < 1200) {
+      try {
+        if (activeAsset && historySeeded[activeAsset]) requestAllTimeframes(activeAsset, false);
+      } catch (_) {}
+    }
     // A wall-clock close is valid only while real quote input is fresh. After
     // a disconnect, repeatedly closing bars at an old price fabricates candle
     // outcomes and can settle expiries without a broker quote.
+    // Use broker time for bar close, but freshness check uses local time
+    // since lastAcceptedQuoteAt is local.
     if (currentTime - (lastAcceptedQuoteAt[activeAsset] || 0) <= 15000) {
-      const ev = activeFeed.forceClose(currentTime);
+      const ev = activeFeed.forceClose(brokerTime);
       settleFeedEvent(ev, activeAsset);
     }
     // Real WS ticks are ingested by the message router with their broker
@@ -1888,7 +2601,7 @@
       const p = findPrice();
       if (p && p !== lastDomPriceByAsset[activeAsset]) {
         lastDomPriceByAsset[activeAsset] = p;
-        ingest(p, det && det.id, currentTime, "dom");
+        ingest(p, det && det.id, brokerTime, "dom");
       }
     }
     maybeSignal();
@@ -1998,7 +2711,13 @@
             String(d.openTime || d.closeTime || "") === orderIdentity;
         })) lastOrders.unshift(order);
         if (lastOrders.length > 50) lastOrders.length = 50;
-        if (order.kind === "closed") processClosedOrder(order, false);
+        if (order.kind === "opened") {
+          try { addOpenOrder(order.data); } catch (_) {}
+        }
+        if (order.kind === "closed") {
+          try { removeOpenOrder(order.data); } catch (_) {}
+          processClosedOrder(order, false);
+        }
         if (order.kind === "opened") {
           const req = data.requestId != null ? String(data.requestId) : "";
           const lifecycle = confirmationLifecycle(data);
@@ -2106,9 +2825,16 @@
           error: p && p.ok === true ? null : String(detail.error || "broker history subscription failed").slice(0, 256),
         };
         const hasPendingRequest = !!(requestId && pendingHistory[requestId]);
-        // A failed subscription must release its own asset+timeframe slot,
-        // otherwise the 30s retry throttle blocks the visible chart's batch.
         const requestMeta = requestId ? pendingHistoryMeta[requestId] : null;
+        const metaKey = requestMeta ? historyKey(requestMeta.asset, requestMeta.period) : (asset ? historyKey(asset, result.period || 60) : null);
+        if (metaKey && historyPagination[metaKey]) {
+          if (result.ok) {
+            historyPagination[metaKey].attempts = 0;
+            historyPagination[metaKey].lastError = 0;
+          } else {
+            historyPagination[metaKey].lastError = Date.now();
+          }
+        }
         if (!result.ok && requestMeta) {
           historyRequestedAt[historyKey(requestMeta.asset, requestMeta.period)] = 0;
         } else if (!result.ok && asset && hasPendingRequest) {
@@ -2141,6 +2867,11 @@
         if (autoController) autoController.setArmed(isPrimaryContext && !!(runtimeSettings && runtimeSettings.armed));
         if (isPrimaryContext) replayClosedOrders();
         queueStatePush(cachedSignal, true);
+        // After primary confirmed, request fresh instruments/balance
+        if (isPrimaryContext) {
+          setTimeout(function(){ try { requestInstrumentsAndBalance(true); } catch (_) {} }, 1000);
+          try { scheduleBackgroundScan(); } catch (_) {}
+        }
       }).catch(() => {});
     } catch (_) {}
     loadStats();
@@ -2153,6 +2884,8 @@
     pollTimer = setInterval(tick, 1000);
     tick();
     setTimeout(requestHookSync, 1200); // hook may still be loading
+    setTimeout(function(){ try { requestInstrumentsAndBalance(true); } catch (_) {} }, 2000);
+    try { scheduleBackgroundScan(); } catch (_) {}
   }
 
   /* -------- confirmed real-platform trade placement -------- */
@@ -2274,6 +3007,9 @@
             // false (live), the opposite of the safe default.
             isDemo: orderArgs.isDemo !== false,
             optionType: orderArgs.optionType,
+            // Use broker clock for expiry math so Quotex and extension agree
+            // on the absolute expiry epoch even if local clock drifts.
+            nowMs: getBrokerNow(),
           },
         }, "*");
       } catch (e) {
@@ -2310,7 +3046,7 @@
         return { ok: false, confirmed: false, sent: true, requestId,
           error: "broker confirmation did not match the requested asset/direction/amount" };
       }
-      confirmed.expiryTime = confirmed.expiryTime || (confirmed.openTime || Date.now()) + orderArgs.expirySec * 1000;
+      confirmed.expiryTime = confirmed.expiryTime || (confirmed.openTime || getBrokerNow()) + orderArgs.expirySec * 1000;
       confirmed.expiry = orderArgs.expirySec;
       confirmed.requestId = requestId;
     }
@@ -2351,7 +3087,26 @@
     // otherwise fall back to the freshly loaded settings stake.
     const argsStake = Number(args.stake);
     const stake = Number.isFinite(argsStake) && argsStake > 0 && argsStake <= 1000000 ? argsStake : Number(s.stake);
-    const expiry = Number(s.expiry);
+    // v2.8: dynamic expiry — args.expiry (from auto controller) takes precedence when adaptive,
+    // otherwise use suggestedExpiry from current signal if adaptive mode, else fixed setting.
+    let expiry;
+    const argsExpiry = Number(args.expiry);
+    if (Number.isFinite(argsExpiry) && argsExpiry >= 0.5 && argsExpiry <= 1440) {
+      expiry = argsExpiry;
+    } else if (s.expiryMode === "adaptive" && cachedSignal && cachedSignal.suggestedExpiry) {
+      const dyn = Number(cachedSignal.suggestedExpiry);
+      if (Number.isFinite(dyn) && dyn >= 0.5 && dyn <= 1440) {
+        const minB = Number(s.adaptiveExpiryMin);
+        const maxB = Number(s.adaptiveExpiryMax);
+        const clampedMin = Number.isFinite(minB) ? Math.max(0.5, minB) : 0.5;
+        const clampedMax = Number.isFinite(maxB) ? Math.min(1440, maxB) : 1440;
+        expiry = Math.max(Math.min(clampedMin, clampedMax), Math.min(Math.max(clampedMin, clampedMax), dyn));
+      } else {
+        expiry = Number(s.expiry);
+      }
+    } else {
+      expiry = Number(s.expiry);
+    }
     if (!Number.isFinite(stake) || stake <= 0 || stake > 1000000) {
       return { ok: false, confirmed: false, error: "stake must be between 0 and 1,000,000" };
     }
@@ -2426,7 +3181,7 @@
     const confirmed = await domConfirmation;
     if (confirmed && confirmed.ok) {
       confirmed.expiry = expirySec;
-      confirmed.expiryTime = confirmed.expiryTime || (confirmed.openTime || Date.now()) + expirySec * 1000;
+      confirmed.expiryTime = confirmed.expiryTime || (confirmed.openTime || getBrokerNow()) + expirySec * 1000;
     }
     return confirmed;
   }
@@ -2500,6 +3255,10 @@
     }
     if (msg && msg.type === "CYBER_REQUEST_HISTORY") {
       const det = ASSETS.get(activeAsset) || ASSETS.ensureRegistered(lastWsSymbol || activeAsset);
+      // If msg.allTimeframes, request MTF
+      if (msg.allTimeframes) {
+        try { requestAllTimeframes(det.id, true); } catch (_) {}
+      }
       requestHistorySubscription(det, msg.limit).then(sendResponse).catch((e) => {
         sendResponse({ ok: false, requested: false, asset: det && det.id || activeAsset,
           error: String(e && e.message || e || "history request failed").slice(0, 256) });

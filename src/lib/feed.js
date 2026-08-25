@@ -50,6 +50,7 @@
     let candles = [];       // sorted CLOSED bars only (oldest → newest)
     let current = null;     // in-progress bar
     let last = null;
+    let lastBrokerTime = null; // last broker timestamp seen, for time-sync
     const volProfile = (opts && opts.volProfile) || null;
 
     function timestampMs(value) {
@@ -63,6 +64,16 @@
 
     function bucket(ts) {
       return Math.floor(ts / tf) * tf;
+    }
+
+    // Quotex candles are UTC-aligned to period boundaries. Flooring incoming
+    // times to the period ensures history rows (which may carry ms offsets)
+    // and live tick buckets land on the same epoch, so the engine and the
+    // platform chart share the same candle slots.
+    function bucketedTimestampMs(value) {
+      const ms = timestampMs(value);
+      if (ms == null) return null;
+      return bucket(ms);
     }
 
     function cap(reserveCurrent) {
@@ -83,7 +94,11 @@
 
     function normalizeCandle(c) {
       if (!c || typeof c !== "object") return null;
-      const time = timestampMs(c.time);
+      // Broker times must be bucketed to tf so engine, live bar and platform
+      // chart all share the same candle open. This eliminates drift where
+      // a candle like 1714000001234 would otherwise create a different slot
+      // than floor(1714000001234/60000)*60000 used by ticks.
+      const time = bucketedTimestampMs(c.time);
       const open = numberValue(c.open);
       const close = numberValue(c.close);
       if (!Number.isSafeInteger(time) || time < 0 || open == null || close == null ||
@@ -114,7 +129,10 @@
       if (current) map[current.time] = current;
       for (let i = 0; i < list.length; i++) {
         const n = normalizeCandle(list[i]);
-        if (n) map[n.time] = n;
+        if (n) {
+          map[n.time] = n;
+          if (lastBrokerTime == null || n.time > lastBrokerTime) lastBrokerTime = n.time;
+        }
       }
       const keys = Object.keys(map).map(Number).sort(function (a, b) { return a - b; });
       if (!keys.length) return { closed: null, closedBars: [], current, last };
@@ -127,6 +145,7 @@
       cap(true);
       current = Object.assign({}, all[all.length - 1]);
       last = current.close;
+      if (current && (lastBrokerTime == null || current.time > lastBrokerTime)) lastBrokerTime = current.time;
       const closed = closedBars.length ? closedBars[closedBars.length - 1]
         : (prevCurrentTime != null && prevCurrentTime !== current.time ? map[prevCurrentTime] : null);
       return { closed, closedBars, current, last };
@@ -148,15 +167,26 @@
       if (price == null || price <= 0 || price > 1e15 || !canIngest(ts)) return null;
       const parsedTickTime = ts != null ? numberValue(ts) : Date.now();
       const tickTime = parsedTickTime == null ? NaN : parsedTickTime;
+      if (!Number.isSafeInteger(tickTime) || tickTime < 0) return null;
       const t = bucket(tickTime);
-      // v2.6.10: a glitched timestamp hours in the future would open a
-      // far-ahead bucket that then swallows every real tick (canIngest
-      // rejects t < current.time forever). Refuse buckets more than 10
-      // minutes ahead of LOCAL wall-clock — measured against the clock, not
-      // against feed history, so a lagging history (reconnect/gap) still
-      // accepts fresh ticks while a far-future glitch never opens a bucket.
-      if (t - bucket(Date.now()) > Math.max(10 * tf, 600000)) return null;
+      // v2.6.10 + broker-clock fix: reject glitched far-future timestamps.
+      // The check is dual-reference: a tick is rejected only if it is far
+      // ahead of BOTH local wall-clock AND the last broker timestamp. This
+      // prevents a local clock that is minutes behind broker from dropping
+      // valid broker ticks, while still blocking a timestamp that would
+      // jump hours forward and swallow all subsequent ticks.
+      const farThreshold = Math.max(10 * tf, 600000);
+      const nowLocalBucket = bucket(Date.now());
+      if (t - nowLocalBucket > farThreshold) {
+        if (lastBrokerTime == null || t - bucket(lastBrokerTime) > farThreshold) return null;
+      }
+      // Also reject if far behind broker clock (stale replay)
+      if (lastBrokerTime != null && bucket(lastBrokerTime) - t > farThreshold * 6) {
+        // more than ~60min behind broker, likely stale replay
+        return null;
+      }
       last = price;
+      lastBrokerTime = tickTime;
       let closed = null;
       if (!current || current.time !== t) {
         if (current) {
@@ -210,13 +240,16 @@
      */
     function setSeries(arr) {
       if (!Array.isArray(arr) || !arr.length) {
-        candles = []; current = null; last = null;
+        candles = []; current = null; last = null; lastBrokerTime = null;
         return series();
       }
       const list = [];
       for (let i = 0; i < arr.length; i++) {
         const n = normalizeCandle(arr[i]);
-        if (n) list.push(n);
+        if (n) {
+          list.push(n);
+          if (lastBrokerTime == null || n.time > lastBrokerTime) lastBrokerTime = n.time;
+        }
       }
       const map = Object.create(null);
       for (let i = 0; i < list.length; i++) map[list[i].time] = list[i];
@@ -227,6 +260,7 @@
       if (candles.length) {
         current = Object.assign({}, candles.pop());
         last = current.close;
+        if (current && (lastBrokerTime == null || current.time > lastBrokerTime)) lastBrokerTime = current.time;
         // cap() above already trimmed; ensure final current is the newest.
       }
       return series();
@@ -317,13 +351,70 @@
       return before - candles.length;
     }
 
+    function detectGaps() {
+      if (candles.length < 2) return [];
+      const gaps = [];
+      for (let i = 1; i < candles.length; i++) {
+        const prev = candles[i-1], cur = candles[i];
+        if (!prev || !cur) continue;
+        const diff = cur.time - prev.time;
+        if (diff > tf * 1.5) {
+          const missing = Math.round(diff / tf) - 1;
+          if (missing > 0 && missing <= 1000) {
+            gaps.push({ from: prev.time + tf, to: cur.time - tf, missing, after: prev.time, before: cur.time });
+          }
+        }
+      }
+      // Also check gap between last closed and current
+      if (current && candles.length) {
+        const lastClosed = candles[candles.length-1];
+        const diff = current.time - lastClosed.time;
+        if (diff > tf * 1.5) {
+          const missing = Math.round(diff / tf) - 1;
+          if (missing > 0 && missing <= 1000) {
+            gaps.push({ from: lastClosed.time + tf, to: current.time - tf, missing, after: lastClosed.time, before: current.time, liveGap: true });
+          }
+        }
+      }
+      return gaps;
+    }
+
+    function getContinuity() {
+      if (candles.length < 2) return 1;
+      const gaps = detectGaps();
+      const totalMissing = gaps.reduce((s,g)=>s+(g.missing||0),0);
+      const total = candles.length + totalMissing;
+      return total > 0 ? Math.max(0, Math.min(1, candles.length / total)) : 1;
+    }
+
+    function validateSeries() {
+      if (!candles.length) return { valid: true, issues: [] };
+      const issues = [];
+      for (let i = 0; i < candles.length; i++) {
+        const c = candles[i];
+        if (!c || typeof c !== "object") { issues.push({ idx: i, issue: "invalid object" }); continue; }
+        if (!Number.isSafeInteger(c.time) || c.time < 0) issues.push({ idx: i, issue: "bad time" });
+        if (!(c.open > 0 && c.high > 0 && c.low > 0 && c.close > 0)) issues.push({ idx: i, time: c.time, issue: "bad OHLC" });
+        if (c.high < Math.max(c.open, c.close) - 1e-9) issues.push({ idx: i, time: c.time, issue: "high too low" });
+        if (c.low > Math.min(c.open, c.close) + 1e-9) issues.push({ idx: i, time: c.time, issue: "low too high" });
+      }
+      // Check ordering
+      for (let i = 1; i < candles.length; i++) {
+        if (candles[i].time <= candles[i-1].time) issues.push({ idx: i, issue: "out of order", time: candles[i].time });
+      }
+      return { valid: issues.length === 0, issues: issues.slice(0, 20), count: candles.length };
+    }
+
     return {
       ingest, canIngest, ingestCandle, mergeCandles, series, seedHistory, setSeries, rebase,
-      replaceCandles, forceClose, pruneBefore,
+      replaceCandles, forceClose, pruneBefore, detectGaps, getContinuity, validateSeries,
       lastPrice: () => last,
       hasCurrent: () => !!current,
-      reset: () => { candles = []; current = null; last = null; },
+      reset: () => { candles = []; current = null; last = null; lastBrokerTime = null; },
       size: () => candles.length + (current ? 1 : 0),
+      lastBrokerTime: () => lastBrokerTime,
+      bucket,
+      get tfMs() { return tf; }
     };
   }
 

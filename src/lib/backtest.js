@@ -32,7 +32,7 @@
     const o = opts && typeof opts === "object" ? opts : {};
     if (!asset || typeof asset.id !== "string" || !asset.id) return [];
     const requestedDays = Number(o.days);
-    const days = Number.isFinite(requestedDays) ? Math.max(1, Math.min(31, requestedDays)) : 7;
+    const days = Number.isFinite(requestedDays) ? Math.max(1, Math.min(60, requestedDays)) : 7;
     const minutes = Math.round(days * 24 * 60);
     const requestedSeed = Number(o.seed);
     const seed = Number.isFinite(requestedSeed) ? requestedSeed : 7;
@@ -40,10 +40,9 @@
     const cached = cachedByAsset && Object.prototype.hasOwnProperty.call(cachedByAsset, asset.id)
       ? cachedByAsset[asset.id] : o.cachedBars;
     const byTime = new Map();
+    let gaps = 0, lastTime = null;
     if (Array.isArray(cached) && cached.length) {
-      // Storage keeps this ascending, so the bounded tail is also the newest
-      // data. Duplicates are replaced by the last cached value.
-      for (const b of cached.slice(-10000)) {
+      for (const b of cached.slice(-15000)) {
         if (!b || typeof b !== "object" || Array.isArray(b)) continue;
         let time = Number(b.time);
         const open = Number(b.open), high = Number(b.high), low = Number(b.low), close = Number(b.close);
@@ -53,6 +52,9 @@
         if (![time, open, high, low, close].every(Number.isFinite) || !Number.isSafeInteger(time) || time < 0 ||
             open <= 0 || high <= 0 || low <= 0 || close <= 0 ||
             high < Math.max(open, low, close) || low > Math.min(open, high, close)) continue;
+        // Gap detection: >10 min gap
+        if (lastTime != null && time - lastTime > 10*60000) gaps++;
+        lastTime = time;
         const rawVolume = Number(b.volume);
         byTime.set(time, {
           time, open, high, low, close,
@@ -61,35 +63,49 @@
       }
     }
     let cleanCached = Array.from(byTime.values()).sort((a, b) => a.time - b.time);
+    // Filter out weekend gaps for non-OTC? Keep for now but track quality
     if (cleanCached.length > minutes) cleanCached = cleanCached.slice(-minutes);
     if (o.liveOnly === true || o.requireLive === true) return cleanCached;
     const missing = Math.max(0, minutes - cleanCached.length);
-    if (!missing || (cleanCached.length && cleanCached[0].time < missing * 60000)) return cleanCached;
+    if (!missing || (cleanCached.length && cleanCached[0].time < missing * 60000)) {
+      // Attach quality meta for UI
+      cleanCached._meta = { source: "live", gaps, quality: cleanCached.length >= minutes * 0.9 ? "high" : cleanCached.length >= minutes * 0.5 ? "medium" : "low" };
+      return cleanCached;
+    }
     const startTime = cleanCached.length ? cleanCached[0].time - missing * 60000 : undefined;
     const synth = FEED.syntheticSeries(asset.id, missing, { seed, startTime });
     if (cleanCached.length && synth.length) {
-      // Join the synthetic prefix continuously to the first real bar. Without
-      // this, a profile base around 1.0 followed by a cached BTC bar around
-      // 60,000 creates a fake multi-million-percent breakout at the seam.
       const tail = synth[synth.length - 1].close;
       const scale = Number.isFinite(tail) && tail > 0 ? cleanCached[0].open / tail : 1;
       for (const bar of synth) {
         bar.open *= scale; bar.high *= scale; bar.low *= scale; bar.close *= scale;
       }
     }
-    return synth.concat(cleanCached);
+    const combined = synth.concat(cleanCached);
+    combined._meta = {
+      source: cleanCached.length ? "live+sim" : "sim",
+      gaps,
+      liveBars: cleanCached.length,
+      simBars: synth.length,
+      quality: cleanCached.length >= minutes * 0.9 ? "high" : cleanCached.length >= minutes * 0.5 ? "medium" : "low"
+    };
+    return combined;
   }
 
   function normalizedOptions(opts) {
     const source = opts && typeof opts === "object" ? opts : {};
     const o = Object.assign({}, source);
     const days = Number(source.days), seed = Number(source.seed), horizon = Number(source.horizon);
-    const minConf = Number(source.minConf), minBars = Number(source.minBars);
-    o.days = Number.isFinite(days) ? Math.max(1, Math.min(31, days)) : 7;
+    const minConf = Number(source.minConf), minBars = Number(source.minBars), payout = Number(source.payout);
+    o.days = Number.isFinite(days) ? Math.max(1, Math.min(60, days)) : 7;
     o.seed = Number.isFinite(seed) ? seed : 7;
-    o.horizon = Number.isFinite(horizon) ? Math.max(1, Math.min(1440, Math.floor(horizon))) : 3;
+    o.horizon = Number.isFinite(horizon) ? Math.max(0.5, Math.min(1440, horizon)) : 3;
     o.minConf = Number.isFinite(minConf) ? Math.max(0, Math.min(100, minConf)) : 0;
     o.minBars = Number.isFinite(minBars) ? Math.max(40, Math.min(2000, Math.floor(minBars))) : 200;
+    o.payout = Number.isFinite(payout) ? Math.max(0, Math.min(5, payout)) : 0.85;
+    o.useAdaptiveExpiry = !!source.useAdaptiveExpiry;
+    o.adaptiveExpiryMin = Number.isFinite(Number(source.adaptiveExpiryMin)) ? Number(source.adaptiveExpiryMin) : 1;
+    o.adaptiveExpiryMax = Number.isFinite(Number(source.adaptiveExpiryMax)) ? Number(source.adaptiveExpiryMax) : 5;
     return o;
   }
 
@@ -104,7 +120,11 @@
       horizon: o.horizon,
       minConf: o.minConf,
       minBars: o.minBars,
-      lean: false,  // Match live signal path (content.js uses lean: false)
+      payout: o.payout,
+      useAdaptiveExpiry: o.useAdaptiveExpiry,
+      adaptiveExpiryMin: o.adaptiveExpiryMin,
+      adaptiveExpiryMax: o.adaptiveExpiryMax,
+      lean: false,
     });
     return {
       asset: asset.id,
@@ -114,10 +134,17 @@
       strategyLabel: strategy.label,
       horizon: o.horizon,
       days: o.days,
+      payout: o.payout,
       wins: res.wins, losses: res.losses, draws: res.draws || 0, total: res.total,
-      winrate: res.winrate, payoff: res.payoff, pnl: res.pnl,
+      winrate: res.winrate, payoff: res.payoff, pnl: res.pnl, pnlWithPayout: res.pnlWithPayout,
+      expectedValue: res.expectedValue, profitFactor: res.profitFactor, expectancy: res.expectancy,
       maxDrawdown: res.maxDrawdown, maxWinStreak: res.maxWinStreak, maxLossStreak: res.maxLossStreak,
-      byRegime: res.byRegime, calibration: res.calibration,
+      sharpe: res.sharpe, sortino: res.sortino, recoveryFactor: res.recoveryFactor,
+      exposure: res.exposure, bestTrade: res.bestTrade, worstTrade: res.worstTrade,
+      kelly: res.kelly, avgTrade: res.avgTrade,
+      byRegime: res.byRegime, byConfidence: res.byConfidence, byHour: res.byHour,
+      byStrategy: res.byStrategy, byExpiry: res.byExpiry,
+      calibration: res.calibration, equity: res.equity, trades: res.trades,
     };
   }
 
@@ -153,16 +180,24 @@
     const total = assets.length * strategies.length;
 
     for (const a of assets) {
-      // Keep only the current asset's candles. The former all-asset map made
-      // this synchronous fallback consume hundreds of MB at 31 days.
       const series = getSeries(a, o);
+      // Determine payout for this asset if available
+      let assetPayout = o.payout;
+      if (o.payoutByAsset && typeof o.payoutByAsset === "object" && o.payoutByAsset[a.id] != null) {
+        const p = Number(o.payoutByAsset[a.id]);
+        if (Number.isFinite(p) && p >= 0 && p <= 5) assetPayout = p;
+      }
       for (const s of strategies) {
         const res = ENG.backtest(series, {
           strategy: s.id,
           horizon: o.horizon,
           minConf: o.minConf,
           minBars: o.minBars,
-          lean: false,  // Match live signal path (content.js uses lean: false)
+          payout: assetPayout,
+          useAdaptiveExpiry: o.useAdaptiveExpiry,
+          adaptiveExpiryMin: o.adaptiveExpiryMin,
+          adaptiveExpiryMax: o.adaptiveExpiryMax,
+          lean: false,
         });
         results.push({
           asset: a.id,
@@ -172,10 +207,17 @@
           strategyLabel: s.label,
           horizon: o.horizon,
           days: o.days,
+          payout: assetPayout,
           wins: res.wins, losses: res.losses, draws: res.draws || 0, total: res.total,
-          winrate: res.winrate, payoff: res.payoff, pnl: res.pnl,
+          winrate: res.winrate, payoff: res.payoff, pnl: res.pnl, pnlWithPayout: res.pnlWithPayout,
+          expectedValue: res.expectedValue, profitFactor: res.profitFactor, expectancy: res.expectancy,
           maxDrawdown: res.maxDrawdown, maxWinStreak: res.maxWinStreak, maxLossStreak: res.maxLossStreak,
-          byRegime: res.byRegime, calibration: res.calibration,
+          sharpe: res.sharpe, sortino: res.sortino, recoveryFactor: res.recoveryFactor,
+          exposure: res.exposure, kelly: res.kelly, avgTrade: res.avgTrade,
+          byRegime: res.byRegime, byConfidence: res.byConfidence, byHour: res.byHour,
+          byStrategy: res.byStrategy, byExpiry: res.byExpiry,
+          calibration: res.calibration, equity: res.equity ? res.equity.slice(-200) : [],
+          trades: res.trades ? res.trades.slice(-50) : [],
         });
         i++;
         try { if (typeof o.onProgress === "function") o.onProgress({ i, total, asset: a.id, strategy: s.id, result: res }); } catch (_) {}
@@ -227,39 +269,63 @@
       const n = Number(value);
       return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 0;
     };
-    let wins = 0, losses = 0, draws = 0, pnl = 0, maxDrawdown = 0;
+    let wins = 0, losses = 0, draws = 0, pnl = 0, pnlWithPayout = 0, maxDrawdown = 0;
+    let totalProfitFactor = 0, pfCount = 0, totalEV = 0, totalSharpe = 0;
     const byStrategy = Object.create(null);
     const byKind = Object.create(null);
+    const byRegime = Object.create(null);
     const assetIds = new Set(), strategyIds = new Set();
     for (const r of all) {
       const rowWins = count(r.wins), rowLosses = count(r.losses), rowDraws = count(r.draws);
       wins += rowWins; losses += rowLosses; draws += rowDraws;
-      const rowPnl = Number(r.pnl);
-      if (Number.isFinite(rowPnl)) pnl += rowPnl;
+      const rowPnl = Number(r.pnlWithPayout != null ? r.pnlWithPayout : r.pnl);
+      if (Number.isFinite(rowPnl)) { pnl += rowPnl; pnlWithPayout += rowPnl; }
       const rowDrawdown = Number(r.maxDrawdown);
       if (Number.isFinite(rowDrawdown) && rowDrawdown >= 0) maxDrawdown = Math.max(maxDrawdown, rowDrawdown);
+      if (Number.isFinite(Number(r.profitFactor)) && r.profitFactor !== Infinity) { totalProfitFactor += Number(r.profitFactor); pfCount++; }
+      if (Number.isFinite(Number(r.expectedValue))) totalEV += Number(r.expectedValue);
+      if (Number.isFinite(Number(r.sharpe))) totalSharpe += Number(r.sharpe);
       if (typeof r.asset === "string" && r.asset) assetIds.add(r.asset);
       if (typeof r.strategy === "string" && r.strategy) strategyIds.add(r.strategy);
       const strategy = typeof r.strategy === "string" && r.strategy ? r.strategy : "unknown";
       const kind = typeof r.kind === "string" && r.kind ? r.kind : "unknown";
-      if (!byStrategy[strategy]) byStrategy[strategy] = { wins: 0, losses: 0, total: 0 };
-      if (!byKind[kind]) byKind[kind] = { wins: 0, losses: 0, total: 0 };
+      if (!byStrategy[strategy]) byStrategy[strategy] = { wins: 0, losses: 0, total: 0, pnl: 0 };
+      if (!byKind[kind]) byKind[kind] = { wins: 0, losses: 0, total: 0, pnl: 0 };
       for (const group of [byStrategy[strategy], byKind[kind]]) {
         group.wins += rowWins; group.losses += rowLosses; group.total += rowWins + rowLosses;
+        group.pnl += rowPnl;
+      }
+      // Aggregate regimes
+      if (r.byRegime && typeof r.byRegime === "object") {
+        for (const reg of Object.keys(r.byRegime)) {
+          if (!byRegime[reg]) byRegime[reg] = { wins: 0, losses: 0, draws: 0, total: 0, pnl: 0 };
+          const rv = r.byRegime[reg];
+          byRegime[reg].wins += Number(rv.wins)||0;
+          byRegime[reg].losses += Number(rv.losses)||0;
+          byRegime[reg].draws += Number(rv.draws)||0;
+          byRegime[reg].pnl += Number(rv.pnl)||0;
+        }
       }
     }
-    for (const groups of [byStrategy, byKind]) {
+    for (const groups of [byStrategy, byKind, byRegime]) {
       for (const k of Object.keys(groups)) {
         const v = groups[k];
         v.winrate = v.total ? (v.wins / v.total) * 100 : 0;
+        v.expectedValue = v.total ? (v.winrate/100 * 0.85 - (1-v.winrate/100)) * 100 : 0;
       }
     }
     const total = wins + losses;
+    const winrate = total ? (wins / total) * 100 : 0;
+    const expectedValue = total ? (winrate/100 * 0.85 - (1-winrate/100)) * 100 : 0;
     return {
       assets: assetIds.size, strategies: strategyIds.size,
       trades: total, decisions: total + draws, wins, losses, draws,
-      winrate: total ? (wins / total) * 100 : 0, pnl, maxDrawdown,
-      byStrategy, byKind,
+      winrate, pnl, pnlWithPayout, maxDrawdown,
+      avgProfitFactor: pfCount ? totalProfitFactor / pfCount : 0,
+      avgEV: all.length ? totalEV / all.length : 0,
+      avgSharpe: all.length ? totalSharpe / all.length : 0,
+      expectedValue,
+      byStrategy, byKind, byRegime,
     };
   }
 

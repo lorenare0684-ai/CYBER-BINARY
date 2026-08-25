@@ -70,6 +70,33 @@
           <div class="regime-row" id="regime-row">regime: —</div>
         </section>
 
+        <!-- Ongoing Trades Card -->
+        <section class="card ongoing-card" id="ongoing-card">
+          <div class="card-header">
+            <h3>Ongoing Trades (Live Broker)</h3>
+            <span id="ongoing-count" class="badge">0 active</span>
+          </div>
+          <div class="table-wrap">
+            <table class="table tight" id="ongoing-table">
+              <thead>
+                <tr>
+                  <th>Asset</th>
+                  <th>Dir</th>
+                  <th>Stake</th>
+                  <th>Entry</th>
+                  <th>Current</th>
+                  <th>P&L</th>
+                  <th>Expiry</th>
+                  <th>Time Left</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+            <div id="ongoing-empty" class="dim-text" style="padding:8px">No ongoing trades — broker open orders will appear here with live countdown.</div>
+          </div>
+        </section>
+
         <!-- Auto-Adaptive System Card -->
         <section class="card adaptive-card" id="adaptive-card">
           <div class="card-header">
@@ -118,9 +145,46 @@
           </div>
         </section>
 
-        <section class="chart-wrap">
-          <canvas id="chart" width="800" height="280"></canvas>
-          <div id="chart-demo-badge" class="demo-badge" hidden>DEMO DATA — synthetic candles. Open the Quotex trade tab so the extension can capture real candles.</div>
+        <section class="chart-wrap pro-chart" id="main-chart-wrap">
+          <div class="chart-toolbar">
+            <div class="chart-toolbar-left">
+              <span class="chart-title" id="chart-title">— · 1m</span>
+              <span class="chart-price" id="chart-price-badge">—</span>
+              <span class="chart-change" id="chart-change-badge"></span>
+              <span class="badge" id="chart-regime-badge" style="display:none">—</span>
+              <span class="badge blue" id="chart-session-badge" style="display:none">—</span>
+            </div>
+            <div class="chart-toolbar-right">
+              <div class="chart-type-group">
+                <button data-chart-type="candle" class="ghost-btn tiny active" title="Candlestick">Candles</button>
+                <button data-chart-type="line" class="ghost-btn tiny" title="Line chart">Line</button>
+                <button data-chart-type="area" class="ghost-btn tiny" title="Area chart">Area</button>
+                <button data-chart-type="heikin" class="ghost-btn tiny" title="Heikin-Ashi">HA</button>
+              </div>
+              <div class="chart-ind-group">
+                <label class="check small"><input type="checkbox" id="chart-ema" checked> EMA</label>
+                <label class="check small"><input type="checkbox" id="chart-bb"> BB</label>
+                <label class="check small"><input type="checkbox" id="chart-vol" checked> Vol</label>
+                <label class="check small"><input type="checkbox" id="chart-macd" checked> MACD</label>
+                <label class="check small"><input type="checkbox" id="chart-rsi"> RSI</label>
+                <label class="check small"><input type="checkbox" id="chart-orders" checked> Orders</label>
+                <label class="check small"><input type="checkbox" id="chart-regime" checked> Regime</label>
+                <label class="check small"><input type="checkbox" id="chart-levels" checked> Levels</label>
+              </div>
+              <button id="chart-reset" class="ghost-btn tiny" title="Reset zoom & pan (double-click chart also resets)">Reset</button>
+              <button id="chart-export" class="ghost-btn tiny" title="Export PNG">PNG</button>
+              <button id="chart-fullscreen" class="ghost-btn tiny" title="Fullscreen">⛶</button>
+            </div>
+          </div>
+          <div class="chart-canvas-wrap">
+            <canvas id="chart" width="800" height="380"></canvas>
+            <div id="chart-demo-badge" class="demo-badge" hidden>DEMO DATA — synthetic candles. Open the Quotex trade tab so the extension can capture real candles.</div>
+          </div>
+          <div class="chart-legend" id="chart-indicator-legend" style="min-height:22px"></div>
+          <div class="chart-statusbar">
+            <span id="chart-info-left">Scroll to zoom · Drag to pan · Double-click reset · Hover for OHLC + indicators</span>
+            <span id="chart-info-right"></span>
+          </div>
         </section>
 
         <section class="grid stats">
@@ -128,6 +192,24 @@
           <article><span>Accuracy Score</span><strong id="accuracy">—</strong></article>
           <article><span>Wins</span><strong id="wins">0</strong></article>
           <article><span>Losses</span><strong id="losses">0</strong></article>
+        </section>
+
+        <section class="chart-wrap pro-chart" id="perf-chart-wrap">
+          <div class="chart-toolbar" style="padding:8px 14px">
+            <div class="chart-toolbar-left">
+              <span class="chart-title">Performance Timeline (last 100 trades)</span>
+            </div>
+            <div class="chart-toolbar-right">
+              <button id="perf-export" class="ghost-btn tiny">PNG</button>
+            </div>
+          </div>
+          <div class="chart-canvas-wrap">
+            <canvas id="perf-chart" width="800" height="140"></canvas>
+          </div>
+          <div class="chart-statusbar">
+            <span>Cyan = winrate % · Green area = cumulative P&L</span>
+            <span></span>
+          </div>
         </section>
 
         <section class="confluence-section">
@@ -161,6 +243,30 @@
           <article><span>Last trade</span><strong id="last-trade">—</strong></article>
         </section>
 
+        <section class="card ongoing-card" id="auto-ongoing-card">
+          <div class="card-header">
+            <h3>Ongoing Trades</h3>
+            <span id="auto-ongoing-count" class="badge">0 active</span>
+          </div>
+          <div class="table-wrap">
+            <table class="table tight" id="auto-ongoing-table">
+              <thead>
+                <tr>
+                  <th>Asset</th>
+                  <th>Dir</th>
+                  <th>Stake</th>
+                  <th>Entry</th>
+                  <th>Expiry</th>
+                  <th>Time Left</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+            <div id="auto-ongoing-empty" class="dim-text" style="padding:8px">No active trades.</div>
+          </div>
+        </section>
+
         <section class="controls tight">
           <label class="ctl">
             <span>Mode</span>
@@ -179,8 +285,23 @@
             <input type="number" id="stake" min="0.1" step="0.1" value="1" />
           </label>
           <label class="ctl">
-            <span>Expiry (min)</span>
-            <input type="number" id="expiry" min="1" max="60" step="1" value="3" />
+            <span>Expiry mode</span>
+            <select id="expiry-mode">
+              <option value="adaptive">Adaptive (dynamic for accuracy)</option>
+              <option value="fixed">Fixed</option>
+            </select>
+          </label>
+          <label class="ctl">
+            <span>Expiry (min) — fixed mode</span>
+            <input type="number" id="expiry" min="0.5" max="1440" step="0.5" value="3" />
+          </label>
+          <label class="ctl">
+            <span>Adaptive min (min)</span>
+            <input type="number" id="adaptive-expiry-min" min="0.5" max="1440" step="0.5" value="1" />
+          </label>
+          <label class="ctl">
+            <span>Adaptive max (min)</span>
+            <input type="number" id="adaptive-expiry-max" min="0.5" max="1440" step="0.5" value="5" />
           </label>
           <label class="ctl">
             <span>Max / hour</span>
@@ -323,12 +444,16 @@
             <input type="number" id="bt-days" min="1" max="60" step="1" value="7" />
           </label>
           <label class="ctl">
-            <span>Horizon (bars)</span>
-            <input type="number" id="bt-horizon" min="1" max="10" step="1" value="3" />
+            <span>Horizon (bars/min)</span>
+            <input type="number" id="bt-horizon" min="0.5" max="60" step="0.5" value="3" />
           </label>
           <label class="ctl">
             <span>Min confidence</span>
             <input type="number" id="bt-minconf" min="0" max="100" step="1" value="0" />
+          </label>
+          <label class="ctl">
+            <span>Payout %</span>
+            <input type="number" id="bt-payout" min="0" max="200" step="1" value="85" />
           </label>
           <label class="ctl">
             <span>Assets</span>
@@ -341,69 +466,183 @@
               <option value="otc">OTC (all classes)</option>
             </select>
           </label>
+          <label class="check"><input type="checkbox" id="bt-adaptive" /> Adaptive expiry</label>
           <button id="bt-run" class="arm-btn">Run backtest</button>
-          <button id="bt-export" class="ghost-btn" title="Exports cached real Quotex 1m candles as JSON for offline backtests (tools/accuracy.js --candles)">Export live candles</button>
+          <button id="bt-walk" class="ghost-btn" title="Run walk-forward analysis">Walk-Forward</button>
+          <button id="bt-monte" class="ghost-btn" title="Run Monte Carlo simulation">Monte Carlo</button>
+          <button id="bt-export" class="ghost-btn" title="Exports cached real Quotex 1m candles as JSON">Export candles</button>
+          <button id="bt-export-trades" class="ghost-btn" title="Export detailed trade log as CSV">Export trades</button>
         </section>
 
         <section class="grid stats">
           <article><span>Trades</span><strong id="bt-trades">—</strong></article>
           <article><span>Win rate</span><strong id="bt-winrate">—</strong></article>
-          <article><span>P&amp;L (units)</span><strong id="bt-pnl">—</strong></article>
+          <article><span>Expected Value</span><strong id="bt-ev">—</strong></article>
+          <article><span>P&amp;L (payout)</span><strong id="bt-pnl">—</strong></article>
+          <article><span>Profit Factor</span><strong id="bt-pf">—</strong></article>
           <article><span>Max drawdown</span><strong id="bt-dd">—</strong></article>
+          <article><span>Sharpe</span><strong id="bt-sharpe">—</strong></article>
+          <article><span>Recovery</span><strong id="bt-recovery">—</strong></article>
+          <article><span>Kelly %</span><strong id="bt-kelly">—</strong></article>
+          <article><span>Exposure</span><strong id="bt-exposure">—</strong></article>
         </section>
 
-        <section>
-          <h2>Equity Curve</h2>
-          <div class="chart-wrap"><canvas id="bt-equity" width="800" height="160"></canvas></div>
+        <section class="bt-subtabs" style="display:flex;gap:6px;margin:12px 0;flex-wrap:wrap">
+          <button data-bt-tab="overview" class="ghost-btn active" style="padding:4px 10px">Overview</button>
+          <button data-bt-tab="trades" class="ghost-btn" style="padding:4px 10px">Trade Log</button>
+          <button data-bt-tab="walk" class="ghost-btn" style="padding:4px 10px">Walk-Forward</button>
+          <button data-bt-tab="monte" class="ghost-btn" style="padding:4px 10px">Monte Carlo</button>
+          <button data-bt-tab="heatmap" class="ghost-btn" style="padding:4px 10px">Heatmap</button>
         </section>
 
-        <section>
-          <h2>Per-Strategy</h2>
+        <section class="bt-pane active" data-bt-pane="overview">
+          <section>
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+              <h2 style="margin:0">Equity Curve (with Drawdown)</h2>
+              <div style="display:flex;gap:6px">
+                <button id="bt-equity-export" class="ghost-btn tiny">PNG</button>
+                <button id="bt-equity-fullscreen" class="ghost-btn tiny">⛶</button>
+              </div>
+            </div>
+            <div class="chart-wrap pro-chart" id="bt-equity-wrap">
+              <div class="chart-canvas-wrap">
+                <canvas id="bt-equity" width="800" height="220"></canvas>
+              </div>
+              <div class="chart-statusbar">
+                <span id="bt-equity-info">Green dots = wins · Red = losses · Dashed = peak</span>
+                <span></span>
+              </div>
+            </div>
+          </section>
+
+          <section>
+            <h2>Per-Strategy (sorted by Expected Value)</h2>
+            <div class="table-wrap">
+              <table class="table" id="bt-strategies">
+                <thead><tr><th>Strategy</th><th>Trades</th><th>Win Rate</th><th>EV</th><th>Profit Factor</th><th>Sharpe</th><th>P&L</th></tr></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section>
+            <h2>Per-Asset (sorted by P&L)</h2>
+            <div class="table-wrap">
+              <table class="table" id="bt-assets">
+                <thead><tr><th>Asset</th><th>Trades</th><th>Win Rate</th><th>EV</th><th>P&L</th><th>PF</th><th>Max DD</th><th>Data</th></tr></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="grid" style="grid-template-columns:1fr 1fr;gap:12px">
+            <div>
+              <h2>Regime Breakdown</h2>
+              <div class="table-wrap">
+                <table class="table" id="bt-regimes">
+                  <thead><tr><th>Regime</th><th>Trades</th><th>Win Rate</th><th>EV</th><th>P&L</th></tr></thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+            </div>
+            <div>
+              <h2>Expiry Breakdown</h2>
+              <div class="table-wrap">
+                <table class="table" id="bt-expiry">
+                  <thead><tr><th>Expiry</th><th>Trades</th><th>Win Rate</th><th>EV</th><th>P&L</th></tr></thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+            </div>
+          </section>
+
+          <section class="grid" style="grid-template-columns:1fr 1fr;gap:12px">
+            <div>
+              <h2>Confidence Calibration</h2>
+              <div class="table-wrap">
+                <table class="table" id="bt-calib">
+                  <thead><tr><th>Predicted</th><th>Trades</th><th>Observed WR</th><th>EV</th></tr></thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+            </div>
+            <div>
+              <h2>Hourly (UTC) Performance</h2>
+              <div class="table-wrap">
+                <table class="table" id="bt-hours">
+                  <thead><tr><th>Hour UTC</th><th>Trades</th><th>Win Rate</th><th>EV</th><th>P&L</th></tr></thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+            </div>
+          </section>
+        </section>
+
+        <section class="bt-pane" data-bt-pane="trades" style="display:none">
+          <h2>Detailed Trade Log (last 200 trades)</h2>
           <div class="table-wrap">
-            <table class="table" id="bt-strategies">
-              <thead><tr><th>Strategy</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Win Rate</th></tr></thead>
+            <table class="table tight" id="bt-trades-table">
+              <thead><tr><th>#</th><th>Time UTC</th><th>Asset</th><th>Dir</th><th>Entry</th><th>Exit</th><th>Change%</th><th>Conf</th><th>Regime</th><th>Expiry</th><th>Result</th><th>P&L</th></tr></thead>
               <tbody></tbody>
             </table>
           </div>
         </section>
 
-        <section>
-          <h2>Per-Asset</h2>
+        <section class="bt-pane" data-bt-pane="walk" style="display:none">
+          <h2>Walk-Forward Analysis (5 folds, 50% train / 50% test)</h2>
           <div class="table-wrap">
-            <table class="table" id="bt-assets">
-              <thead><tr><th>Asset</th><th>Trades</th><th>Win Rate</th><th>P&amp;L</th><th>Max DD</th><th>Data</th></tr></thead>
+            <table class="table" id="bt-walk-table">
+              <thead><tr><th>Fold</th><th>Train WR</th><th>Train P&L</th><th>Test WR</th><th>Test P&L</th><th>Test PF</th><th>Test EV</th><th>Sharpe</th></tr></thead>
               <tbody></tbody>
             </table>
           </div>
+          <div class="grid stats" style="margin-top:10px">
+            <article><span>Combined Test WR</span><strong id="bt-walk-wr">—</strong></article>
+            <article><span>Combined P&L</span><strong id="bt-walk-pnl">—</strong></article>
+            <article><span>Avg WR</span><strong id="bt-walk-avg">—</strong></article>
+            <article><span>Consistency</span><strong id="bt-walk-cons">—</strong></article>
+          </div>
+          <p class="disclaimer">Walk-forward tests if the strategy holds across time — high consistency (>60%) suggests robustness, not curve-fitting.</p>
         </section>
 
-        <section>
-          <h2>Regime Breakdown</h2>
-          <div class="table-wrap">
-            <table class="table" id="bt-regimes">
-              <thead><tr><th>Regime</th><th>Trades</th><th>Win Rate</th></tr></thead>
-              <tbody></tbody>
-            </table>
+        <section class="bt-pane" data-bt-pane="monte" style="display:none">
+          <h2>Monte Carlo Simulation (1000 shuffles)</h2>
+          <div class="grid stats">
+            <article><span>Avg P&L</span><strong id="bt-monte-avg">—</strong></article>
+            <article><span>Median P&L</span><strong id="bt-monte-median">—</strong></article>
+            <article><span>5% Worst</span><strong id="bt-monte-p5">—</strong></article>
+            <article><span>95% Best</span><strong id="bt-monte-p95">—</strong></article>
+            <article><span>Positive Rate</span><strong id="bt-monte-pos">—</strong></article>
+            <article><span>Avg Max DD</span><strong id="bt-monte-dd">—</strong></article>
           </div>
+          <div style="display:flex;justify-content:space-between;align-items:center;margin:10px 0 8px">
+            <h2 style="margin:0">Distribution</h2>
+            <div style="display:flex;gap:6px">
+              <button id="bt-monte-export" class="ghost-btn tiny">PNG</button>
+            </div>
+          </div>
+          <div class="chart-wrap pro-chart" id="bt-monte-wrap">
+            <div class="chart-canvas-wrap">
+              <canvas id="bt-monte-chart" width="800" height="200"></canvas>
+            </div>
+            <div class="chart-statusbar">
+              <span>Histogram of shuffled P&L outcomes · Red 5% worst · Cyan median · Green 95% best</span>
+              <span></span>
+            </div>
+          </div>
+          <p class="disclaimer">Monte Carlo shuffles trade order to estimate risk — shows distribution of possible outcomes if same trades occurred in different order.</p>
         </section>
 
-        <section>
-          <h2>Confidence Calibration</h2>
-          <div class="table-wrap">
-            <table class="table" id="bt-calib">
-              <thead><tr><th>Predicted</th><th>Trades</th><th>Observed Win Rate</th></tr></thead>
-              <tbody></tbody>
-            </table>
-          </div>
+        <section class="bt-pane" data-bt-pane="heatmap" style="display:none">
+          <h2>Strategy × Asset Heatmap (Win Rate)</h2>
+          <div id="bt-heatmap" style="overflow:auto;max-height:400px"></div>
         </section>
 
         <p class="disclaimer" id="bt-sources"></p>
         <p class="disclaimer">
-          Backtests cover every catalog asset for the selected class. Cached
-          Quotex live/tick-built 1m candles are preferred whenever they exist;
-          assets without a live cache run on the deterministic per-asset
-          simulator (see the Data column). They are <strong>not</strong> a
-          guarantee of future accuracy.
+          Backtests use cached Quotex live 1m candles when available, otherwise deterministic simulator.
+          Metrics include payout-aware P&L (EV = WR×payout − LR), Profit Factor, Sharpe, Kelly.
+          Walk-forward and Monte Carlo assess robustness. Not a guarantee of future results.
         </p>
       </section>
 
@@ -523,6 +762,7 @@
     <script src="lib/backtest.js"></script>
     <script src="lib/workers.js"></script>
     <script src="lib/quotex.js"></script>
+    <script src="lib/charts.js"></script>
     <script src="dashboard.js"></script>
   </body>
 </html>

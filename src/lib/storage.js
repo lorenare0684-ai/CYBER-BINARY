@@ -16,7 +16,10 @@
       autoMode: "off",            // "off" | "alerts" | "click"
       armed: false,
       stake: 1,                   // $ per trade
-      expiry: 3,                  // minutes
+      expiry: 3,                  // minutes — used when expiryMode=fixed
+      expiryMode: "adaptive",     // "fixed" | "adaptive" — dynamic expiry for accuracy
+      adaptiveExpiryMin: 1,       // min adaptive expiry (minutes)
+      adaptiveExpiryMax: 5,       // max adaptive expiry (minutes)
       maxTradesPerHour: 12,
       maxTradesPerDay: 60,
       dailyLossCap: 30,           // $ — stop on loss
@@ -112,6 +115,14 @@
     s.armed = s.autoMode !== "off" && !!s.armed;
     s.stake = finiteIn(s.stake, DEFAULTS.settings.stake, 0.01, 1000000);
     s.expiry = finiteIn(s.expiry, DEFAULTS.settings.expiry, 0.5, 1440);
+    s.expiryMode = s.expiryMode === "fixed" ? "fixed" : "adaptive";
+    s.adaptiveExpiryMin = finiteIn(s.adaptiveExpiryMin, DEFAULTS.settings.adaptiveExpiryMin, 0.5, 1440);
+    s.adaptiveExpiryMax = finiteIn(s.adaptiveExpiryMax, DEFAULTS.settings.adaptiveExpiryMax, 0.5, 1440);
+    if (s.adaptiveExpiryMin > s.adaptiveExpiryMax) {
+      const tmp = s.adaptiveExpiryMin;
+      s.adaptiveExpiryMin = s.adaptiveExpiryMax;
+      s.adaptiveExpiryMax = tmp;
+    }
     s.maxTradesPerHour = Math.floor(finiteIn(s.maxTradesPerHour, DEFAULTS.settings.maxTradesPerHour, 0, 10000));
     s.maxTradesPerDay = Math.floor(finiteIn(s.maxTradesPerDay, DEFAULTS.settings.maxTradesPerDay, 0, 100000));
     s.dailyLossCap = finiteIn(s.dailyLossCap, DEFAULTS.settings.dailyLossCap, 0, 1000000000);

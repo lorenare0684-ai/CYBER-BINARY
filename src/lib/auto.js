@@ -523,8 +523,22 @@
       // broker order-open confirmation. Unconfirmed standalone clicks are
       // deliberately not an automation path.
       if (ctx.mode === "click" && decision.settings) {
-        const rawExpiry = numberValue(decision.settings.expiry);
-        const expiryMin = rawExpiry != null && rawExpiry > 0 ? Math.max(0.5, Math.min(1440, rawExpiry)) : 1;
+        // v2.8: dynamic expiry for accuracy
+        let expiryMin;
+        const mode = decision.settings.expiryMode;
+        const suggested = signal && signal.suggestedExpiry != null ? numberValue(signal.suggestedExpiry) : null;
+        if (mode === "adaptive" && suggested != null && suggested >= 0.5 && suggested <= 1440) {
+          const minB = numberValue(decision.settings.adaptiveExpiryMin);
+          const maxB = numberValue(decision.settings.adaptiveExpiryMax);
+          const clampedMin = minB != null ? Math.max(0.5, minB) : 0.5;
+          const clampedMax = maxB != null ? Math.min(1440, maxB) : 1440;
+          const low = Math.min(clampedMin, clampedMax);
+          const high = Math.max(clampedMin, clampedMax);
+          expiryMin = Math.max(low, Math.min(high, suggested));
+        } else {
+          const rawExpiry = numberValue(decision.settings.expiry);
+          expiryMin = rawExpiry != null && rawExpiry > 0 ? Math.max(0.5, Math.min(1440, rawExpiry)) : 1;
+        }
         const hasConfirmedExecutor = !!(opts && typeof opts.executeTrade === "function");
         let result = null;
         ctx.lastAttemptAt = Date.now();
@@ -550,6 +564,8 @@
         }
         log.action = result;
         log.expiryMinutes = expiryMin;
+        log.expiryReason = signal && signal.expiryReason ? String(signal.expiryReason).slice(0, 256) : null;
+        log.suggestedExpiry = signal && signal.suggestedExpiry != null ? Number(signal.suggestedExpiry) : null;
         const rawEntryPrice = signal.entryPrice != null ? signal.entryPrice : (signal.metrics && signal.metrics.close);
         const entryPrice = numberValue(rawEntryPrice);
         log.entryPrice = entryPrice != null && entryPrice > 0 && entryPrice <= 1e15 ? entryPrice : null;
@@ -586,21 +602,37 @@
           let confirmedPersisted = await persistSafety();
           if (!confirmedPersisted) confirmedPersisted = await persistSafety();
           log.safetyPersisted = confirmedPersisted;
+          const expReason = signal && signal.expiryReason ? ` (${String(signal.expiryReason).slice(0,80)})` : "";
           pushLog(confirmedPersisted ? "trade" : "error",
-            `Trade confirmed: ${signal.direction} ${assetLabel} · expiry ${expiryMin}m · conf=${signal.confidence}${strategySuffix(signal)}` +
+            `Trade confirmed: ${signal.direction} ${assetLabel} · expiry ${expiryMin}m${expReason} · conf=${signal.confidence}${strategySuffix(signal)}` +
             (confirmedPersisted ? "" : " · local safety ledger unavailable"));
         } else {
           pushLog("error", `Trade not confirmed: ${(result && result.error) || "broker did not acknowledge the order"}`);
         }
       } else if (ctx.mode === "alerts") {
-        const rawExpiry = numberValue(decision.settings && decision.settings.expiry);
-        const expiryMin = rawExpiry != null && rawExpiry > 0 ? Math.max(0.5, Math.min(1440, rawExpiry)) : 1;
+        let expiryMin;
+        const mode = decision.settings && decision.settings.expiryMode;
+        const suggested = signal && signal.suggestedExpiry != null ? numberValue(signal.suggestedExpiry) : null;
+        if (mode === "adaptive" && suggested != null && suggested >= 0.5 && suggested <= 1440) {
+          const minB = numberValue(decision.settings.adaptiveExpiryMin);
+          const maxB = numberValue(decision.settings.adaptiveExpiryMax);
+          const clampedMin = minB != null ? Math.max(0.5, minB) : 0.5;
+          const clampedMax = maxB != null ? Math.min(1440, maxB) : 1440;
+          const low = Math.min(clampedMin, clampedMax);
+          const high = Math.max(clampedMin, clampedMax);
+          expiryMin = Math.max(low, Math.min(high, suggested));
+        } else {
+          const rawExpiry = numberValue(decision.settings && decision.settings.expiry);
+          expiryMin = rawExpiry != null && rawExpiry > 0 ? Math.max(0.5, Math.min(1440, rawExpiry)) : 1;
+        }
         log.action = { kind: "alert", ok: true };
         log.entryTime = toMs(signal.entryTime || signal.time, Date.now());
         const rawEntryPrice = signal.entryPrice != null ? signal.entryPrice : (signal.metrics && signal.metrics.close);
         const entryPrice = numberValue(rawEntryPrice);
         log.entryPrice = entryPrice != null && entryPrice > 0 && entryPrice <= 1e15 ? entryPrice : null;
         log.expiryMinutes = expiryMin;
+        log.expiryReason = signal && signal.expiryReason ? String(signal.expiryReason).slice(0, 256) : null;
+        log.suggestedExpiry = signal && signal.suggestedExpiry != null ? Number(signal.suggestedExpiry) : null;
         log.expiryTime = log.entryTime + expiryMin * 60000;
         ctx.lastAttemptAt = Date.now();
         const alertAttemptPersisted = await persistSafety();
@@ -626,8 +658,9 @@
           let alertPersisted = await persistSafety();
           if (!alertPersisted) alertPersisted = await persistSafety();
           log.safetyPersisted = alertPersisted;
+          const alertExpReason = signal && signal.expiryReason ? ` (${String(signal.expiryReason).slice(0,80)})` : "";
           pushLog(alertPersisted ? "alert" : "error",
-            `ALERT ${signal.direction} ${assetLabel} · expiry ${expiryMin}m · conf=${signal.confidence}${strategySuffix(signal)}` +
+            `ALERT ${signal.direction} ${assetLabel} · expiry ${expiryMin}m${alertExpReason} · conf=${signal.confidence}${strategySuffix(signal)}` +
             (alertPersisted ? "" : " · local safety ledger unavailable"));
         }
       }

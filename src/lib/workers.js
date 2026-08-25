@@ -110,11 +110,14 @@
     const out = [];
     const days = boundedDays(opts.days);
     const rawHorizon = numberValue(opts.horizon);
-    const horizon = rawHorizon != null ? Math.max(1, Math.min(1440, Math.floor(rawHorizon))) : 3;
+    const horizon = rawHorizon != null ? Math.max(0.5, Math.min(1440, rawHorizon)) : 3;
     const rawMinConf = numberValue(opts.minConf);
     const minConf = rawMinConf != null ? Math.max(0, Math.min(100, rawMinConf)) : 0;
     const rawMinBars = numberValue(opts.minBars);
     const minBars = rawMinBars != null ? Math.max(40, Math.min(2000, Math.floor(rawMinBars))) : 200;
+    const rawPayout = numberValue(opts.payout);
+    const payout = rawPayout != null ? Math.max(0, Math.min(5, rawPayout)) : 0.85;
+    const useAdaptiveExpiry = !!opts.useAdaptiveExpiry;
     if (!seriesByAsset || typeof seriesByAsset !== "object" || !Array.isArray(jobs)) return out;
     for (const j of jobs) {
       const a = j && j.asset;
@@ -122,21 +125,35 @@
       if (!a || typeof a.id !== "string" || !s || typeof s.id !== "string") continue;
       const series = seriesByAsset[a.id];
       if (!Array.isArray(series)) continue;
+      let assetPayout = payout;
+      if (opts.payoutByAsset && typeof opts.payoutByAsset === "object" && opts.payoutByAsset[a.id] != null) {
+        const p = Number(opts.payoutByAsset[a.id]);
+        if (Number.isFinite(p) && p >= 0 && p <= 5) assetPayout = p;
+      }
       const res = ENG.backtest(series, {
         strategy: s.id,
         horizon,
         minConf,
         minBars,
-        lean: false,  // Match live signal path (content.js uses lean: false)
+        payout: assetPayout,
+        useAdaptiveExpiry,
+        adaptiveExpiryMin: opts.adaptiveExpiryMin,
+        adaptiveExpiryMax: opts.adaptiveExpiryMax,
+        lean: false,
       });
       out.push({
         asset: a.id, name: a.name, kind: a.kind,
         strategy: s.id, strategyLabel: s.label,
-        horizon, days,
+        horizon, days, payout: assetPayout,
         wins: res.wins, losses: res.losses, draws: res.draws || 0, total: res.total,
-        winrate: res.winrate, payoff: res.payoff, pnl: res.pnl,
+        winrate: res.winrate, payoff: res.payoff, pnl: res.pnl, pnlWithPayout: res.pnlWithPayout,
+        expectedValue: res.expectedValue, profitFactor: res.profitFactor, expectancy: res.expectancy,
         maxDrawdown: res.maxDrawdown, maxWinStreak: res.maxWinStreak, maxLossStreak: res.maxLossStreak,
-        byRegime: res.byRegime, calibration: res.calibration,
+        sharpe: res.sharpe, sortino: res.sortino, recoveryFactor: res.recoveryFactor,
+        exposure: res.exposure, kelly: res.kelly, avgTrade: res.avgTrade,
+        byRegime: res.byRegime, byConfidence: res.byConfidence, byHour: res.byHour,
+        byStrategy: res.byStrategy, byExpiry: res.byExpiry,
+        calibration: res.calibration,
       });
     }
     return out;
@@ -212,15 +229,19 @@
               horizon: opts.horizon || 3,
               minConf: opts.minConf || 0,
               minBars: opts.minBars != null ? opts.minBars : 200,
-              lean: false,  // Match live signal path (content.js uses lean: false)
+              payout: opts.payout || 0.85,
+              useAdaptiveExpiry: !!opts.useAdaptiveExpiry,
+              lean: false,
             });
             out.push({
               asset: j.aid, name: currentMeta.name, kind: currentMeta.kind,
               strategy: strategy.id, strategyLabel: strategy.label,
-              horizon: opts.horizon || 3, days: opts.days || 2,
+              horizon: opts.horizon || 3, days: opts.days || 2, payout: opts.payout || 0.85,
               wins: res.wins, losses: res.losses, draws: res.draws || 0, total: res.total,
-              winrate: res.winrate, payoff: res.payoff, pnl: res.pnl,
+              winrate: res.winrate, payoff: res.payoff, pnl: res.pnl, pnlWithPayout: res.pnlWithPayout,
+              expectedValue: res.expectedValue, profitFactor: res.profitFactor, expectancy: res.expectancy,
               maxDrawdown: res.maxDrawdown, maxWinStreak: res.maxWinStreak, maxLossStreak: res.maxLossStreak,
+              sharpe: res.sharpe, sortino: res.sortino, recoveryFactor: res.recoveryFactor,
               byRegime: res.byRegime, calibration: res.calibration,
             });
           }
@@ -373,9 +394,14 @@
       strategies: strategies.map((s) => s.id),
       days: boundedDays(opts.days),
       seed: rawSeed != null ? rawSeed : 7,
-      horizon: rawHorizon != null ? Math.max(1, Math.min(1440, Math.floor(rawHorizon))) : 3,
+      horizon: rawHorizon != null ? Math.max(0.5, Math.min(1440, rawHorizon)) : 3,
       minConf: rawMinConf != null ? Math.max(0, Math.min(100, rawMinConf)) : 0,
       minBars: rawMinBars != null ? Math.max(40, Math.min(2000, Math.floor(rawMinBars))) : 200,
+      payout: opts.payout != null ? Math.max(0, Math.min(5, Number(opts.payout))) : 0.85,
+      payoutByAsset: opts.payoutByAsset && typeof opts.payoutByAsset === "object" ? opts.payoutByAsset : null,
+      useAdaptiveExpiry: !!opts.useAdaptiveExpiry,
+      adaptiveExpiryMin: opts.adaptiveExpiryMin,
+      adaptiveExpiryMax: opts.adaptiveExpiryMax,
       sortBy: opts.sortBy,
       cachedByAsset: opts.cachedByAsset && typeof opts.cachedByAsset === "object" ? opts.cachedByAsset : null,
       liveOnly: opts.liveOnly === true || opts.requireLive === true,

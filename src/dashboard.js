@@ -76,6 +76,9 @@
   let qxInstruments = [];
   let qxBalance = null;
   let qxOrders = [];
+  let openOrders = [];
+  let ongoingTimer = null;
+  let lastPriceMap = Object.create(null);
   let lastOrderError = null;   // last broker-side order rejection {error, at}
   let pendingLiveState = null;
   let liveRenderQueued = false;
@@ -271,298 +274,90 @@
     );
   }
 
+  // ===== Enhanced Charts v3 — delegates to CYBER_CHARTS =====
+  const CHARTS = self.CYBER_CHARTS || null;
+
   function drawChart(canvas, candles, opts) {
     if (!canvas) return;
-    const o = opts || {};
-    const parent = canvas.parentElement;
-    const parentWidth = finite(parent && parent.clientWidth, 0);
-    const viewportWidth = finite(window.innerWidth, 480);
-    const w = Math.max(180, Math.min(4096, parentWidth || viewportWidth));
-    const useMacd = o.macd !== false;
-    const priceH = Math.max(92, Math.round(w * 0.24));
-    const macdH = useMacd ? Math.max(52, Math.round(w * 0.14)) : 0;
-    const timeAxisH = 18;
-    const h = priceH + macdH + timeAxisH;
-    const rawDpr = finite(window.devicePixelRatio, 1);
-    const dpr = Math.max(1, Math.min(2, rawDpr));
-    const pixelW = Math.floor(w * dpr), pixelH = Math.floor(h * dpr);
-    if (canvas.width !== pixelW) canvas.width = pixelW;
-    if (canvas.height !== pixelH) canvas.height = pixelH;
-    if (canvas.style.width !== w + "px") canvas.style.width = w + "px";
-    if (canvas.style.height !== h + "px") canvas.style.height = h + "px";
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, w, h);
-    ctx.fillStyle = o.bg || "#0c1422";
-    ctx.fillRect(0, 0, w, h);
-    if (!Array.isArray(candles) || candles.length < 2) {
-      ctx.fillStyle = "rgba(255,255,255,0.45)";
-      ctx.font = "11px system-ui, sans-serif";
-      ctx.textAlign = "center";
-      ctx.fillText(o.emptyMessage || "Waiting for candles…", w / 2, h / 2);
+    opts = opts || {};
+    // Equity mode still supported via dedicated function
+    if (opts.equity) {
+      if (CHARTS && CHARTS.drawEquityChart) {
+        CHARTS.drawEquityChart(canvas, candles, { label: opts.equityLabel || "Equity", trades: opts.trades || null });
+      } else {
+        // fallback simple
+        const parent = canvas.parentElement;
+        const w = Math.max(180, Math.min(4096, (parent && parent.clientWidth) || 800));
+        const h = 180;
+        const dpr = Math.max(1, Math.min(2, Number(window.devicePixelRatio)||1));
+        canvas.width = Math.floor(w*dpr); canvas.height = Math.floor(h*dpr);
+        canvas.style.width=w+"px"; canvas.style.height=h+"px";
+        const ctx=canvas.getContext("2d"); if(!ctx) return;
+        ctx.setTransform(dpr,0,0,dpr,0,0); ctx.fillStyle="#0c1422"; ctx.fillRect(0,0,w,h);
+        ctx.fillStyle="rgba(255,255,255,0.45)"; ctx.font="11px system-ui"; ctx.textAlign="center";
+        ctx.fillText("Equity · " + (candles?candles.length:0) + " pts", w/2, h/2);
+      }
       return;
     }
-    if (o.equity) {
-      const eq = candles.map((point) => ({ equity: finite(point && point.equity, null) }))
-        .filter((point) => point.equity != null);
-      if (eq.length < 2) {
-        ctx.fillStyle = "rgba(255,255,255,0.45)";
-        ctx.font = "11px system-ui, sans-serif";
-        ctx.textAlign = "center";
-        ctx.fillText(o.emptyMessage || "Waiting for valid equity data…", w / 2, h / 2);
-        return;
+    if (CHARTS && CHARTS.drawMainChart) {
+      // Merge toolbar state if available
+      const toolbarState = CHARTS.getState ? CHARTS.getState(canvas) : null;
+      const mergedOpts = Object.assign({}, opts);
+      if (toolbarState) {
+        // preserve decimals from opts if provided
+        if (opts.decimals != null) toolbarState.decimals = opts.decimals;
       }
-      let eqLo = -Math.max(1, Math.abs(eq[0].equity));
-      let eqHi = Math.max(1, Math.abs(eq[0].equity || 0));
-      for (let i = 0; i < eq.length; i++) {
-        if (eq[i].equity < eqLo) eqLo = eq[i].equity;
-        if (eq[i].equity > eqHi) eqHi = eq[i].equity;
+      // Auto-bind interactions once
+      if (CHARTS.bindMainChartInteractions) {
+        try { CHARTS.bindMainChartInteractions(canvas); } catch(_) {}
       }
-      const pad = (eqHi - eqLo) * 0.1 || 1;
-      eqLo -= pad; eqHi += pad;
-      const zeroY = priceH - ((0 - eqLo) / (eqHi - eqLo)) * (priceH - 16) - 8;
-      ctx.strokeStyle = "rgba(255,255,255,0.06)";
-      ctx.beginPath(); ctx.moveTo(0, zeroY); ctx.lineTo(w, zeroY); ctx.stroke();
-      ctx.strokeStyle = "#4aa3ff";
-      ctx.lineWidth = 1.5;
-      ctx.beginPath();
-      for (let i = 0; i < eq.length; i++) {
-        const x = 8 + (i / (eq.length - 1)) * (w - 16);
-        const y = priceH - ((eq[i].equity - eqLo) / (eqHi - eqLo)) * (priceH - 16) - 8;
-        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-      }
-      ctx.stroke();
-      const grad = ctx.createLinearGradient(0, 0, 0, priceH);
-      grad.addColorStop(0, "rgba(74,163,255,0.3)");
-      grad.addColorStop(1, "rgba(74,163,255,0)");
-      ctx.fillStyle = grad;
-      ctx.lineTo(w - 8, priceH - 8);
-      ctx.lineTo(8, priceH - 8);
-      ctx.closePath();
-      ctx.fill();
-      ctx.fillStyle = "rgba(255,255,255,0.45)";
-      ctx.font = "9px system-ui, sans-serif";
-      ctx.fillText("Equity · " + eq.length + " " + (o.equityLabel || "points"), 8, 12);
-      return;
-    }
-
-    const padL = 8, padR = 54;
-    const plotW = w - padL - padR;
-    const byTime = new Map();
-    for (const raw of candles) {
-      if (!raw) continue;
-      let time = Number(raw.time);
-      const open = Number(raw.open), close = Number(raw.close);
-      if (!Number.isFinite(time) || !Number.isFinite(open) || !Number.isFinite(close) ||
-          open <= 0 || close <= 0 || open > 1e100 || close > 1e100) continue;
-      while (Math.abs(time) >= 1e14) time /= 1000;
-      if (Math.abs(time) < 1e11) time *= 1000;
-      time = Math.floor(time);
-      if (!Number.isFinite(time) || time <= 0 || time > 8640000000000000) continue;
-      const rawHigh = Number(raw.high), rawLow = Number(raw.low);
-      const validHigh = Number.isFinite(rawHigh) && rawHigh > 0 && rawHigh <= 1e100 ? rawHigh : open;
-      const validLow = Number.isFinite(rawLow) && rawLow > 0 && rawLow <= 1e100 ? rawLow : close;
-      const high = Math.max(validHigh, validLow, open, close);
-      const low = Math.min(validHigh, validLow, open, close);
-      const rawVolume = Number(raw.volume);
-      byTime.set(time, { time, open, high, low, close, volume: Number.isFinite(rawVolume) && rawVolume >= 0 ? Math.min(Number.MAX_VALUE, rawVolume) : 0 });
-    }
-    const normalized = Array.from(byTime.values()).sort((a, b) => a.time - b.time);
-    const requestedBars = Math.floor(Number(o.bars));
-    const barCount = Number.isFinite(requestedBars) && requestedBars >= 2 ? Math.min(500, requestedBars) : 100;
-    const view = normalized.slice(-barCount);
-    if (view.length < 2) {
-      ctx.fillStyle = "rgba(255,255,255,0.45)";
-      ctx.font = "11px system-ui, sans-serif";
-      ctx.textAlign = "center";
-      ctx.fillText("Waiting for valid broker candles…", w / 2, h / 2);
-      return;
-    }
-    let lo = Infinity, hi = -Infinity;
-    for (let i = 0; i < view.length; i++) {
-      lo = Math.min(lo, view[i].low);
-      hi = Math.max(hi, view[i].high);
-    }
-    const pad = (hi - lo) * 0.08 || 0.0001;
-    lo -= pad; hi += pad;
-    const yPrice = (p) => priceH - ((p - lo) / (hi - lo)) * (priceH - 10) - 5;
-    const bw = plotW / view.length;
-    const xFor = (i) => padL + (i + 0.5) * bw;
-
-    ctx.strokeStyle = "rgba(255,255,255,0.07)";
-    ctx.fillStyle = "rgba(255,255,255,0.5)";
-    ctx.font = "10px system-ui, sans-serif";
-    ctx.textAlign = "left";
-    ctx.lineWidth = 1;
-    const rows = 4;
-    for (let g = 0; g <= rows; g++) {
-      const p = lo + ((hi - lo) * g) / rows;
-      const y = yPrice(p);
-      ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(padL + plotW, y); ctx.stroke();
-      ctx.fillText(fmtPx(p), w - padR + 6, y + 3);
-    }
-
-    let emaFast = null, emaSlow = null;
-    if (self.CYBER_TA) {
-      const closes = view.map((c) => c.close);
-      emaFast = self.CYBER_TA.ema(closes, 8);
-      emaSlow = self.CYBER_TA.ema(closes, 21);
-    }
-    for (let i = 0; i < view.length; i++) {
-      const c = view[i];
-      const x = xFor(i);
-      const yH = yPrice(c.high), yL = yPrice(c.low);
-      const yO = yPrice(c.open), yC = yPrice(c.close);
-      const up = c.close >= c.open;
-      ctx.strokeStyle = up ? "#3dff9a" : "#ff5d7a";
-      ctx.fillStyle = up ? "#3dff9a" : "#ff5d7a";
-      ctx.beginPath(); ctx.moveTo(x, yH); ctx.lineTo(x, yL); ctx.stroke();
-      const top = Math.min(yO, yC);
-      const bh = Math.max(1, Math.abs(yC - yO));
-      ctx.fillRect(x - Math.max(1, bw * 0.32), top, Math.max(2, bw * 0.64), bh);
-    }
-    const drawLine = (arr, color) => {
-      if (!arr) return;
-      ctx.strokeStyle = color;
-      ctx.lineWidth = 1.2;
-      ctx.beginPath();
-      let started = false;
-      for (let i = 0; i < arr.length; i++) {
-        if (arr[i] == null) continue;
-        const x = xFor(i), y = yPrice(arr[i]);
-        if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
-      }
-      ctx.stroke();
-      ctx.lineWidth = 1;
-    };
-    drawLine(emaFast, "rgba(77,163,255,0.85)");
-    drawLine(emaSlow, "rgba(255,196,87,0.85)");
-
-    if (Array.isArray(o.markers) && o.markers.length) {
-      for (let mi = 0; mi < o.markers.length; mi++) {
-        const mk = o.markers[mi];
-        if (!mk || mk.time == null || mk.price == null || (mk.dir !== "CALL" && mk.dir !== "PUT")) continue;
-        let markerTime = Number(mk.time), markerPrice = Number(mk.price);
-        if (!Number.isFinite(markerTime) || !Number.isFinite(markerPrice) || markerPrice <= 0 || markerPrice > 1e100) continue;
-        while (Math.abs(markerTime) >= 1e14) markerTime /= 1000;
-        if (Math.abs(markerTime) < 1e11) markerTime *= 1000;
-        markerTime = Math.floor(markerTime);
-        if (markerTime <= 0 || markerTime > 8640000000000000) continue;
-        let idx = -1;
-        let lo2 = 0, hi2 = view.length - 1;
-        while (lo2 <= hi2) {
-          const mid = (lo2 + hi2) >> 1;
-          if (view[mid].time === markerTime) { idx = mid; break; }
-          if (view[mid].time < markerTime) lo2 = mid + 1; else hi2 = mid - 1;
+      // Preserve last opts for redraws (zoom/pan/tooltip)
+      try {
+        const st = CHARTS.getState ? CHARTS.getState(canvas) : null;
+        if (st) st._lastOpts = mergedOpts;
+      } catch(_) {}
+      CHARTS.drawMainChart(canvas, candles, mergedOpts);
+      // Update toolbar title/price badges if main chart
+      try {
+        if (canvas.id === "chart") {
+          const titleEl = document.getElementById("chart-title");
+          const priceEl = document.getElementById("chart-price-badge");
+          const changeEl = document.getElementById("chart-change-badge");
+          const infoRight = document.getElementById("chart-info-right");
+          const titleEl2 = document.getElementById("chart-title");
+          if (titleEl2) {
+            const assetName = (typeof activeAsset !== "undefined" && activeAsset) ? activeAsset : (opts.label || "—");
+            const tf = opts.timeframe || "1m";
+            titleEl2.textContent = assetName + " · " + tf + (opts.timeBasis ? " · " + opts.timeBasis : "");
+          }
+          if (priceEl && Array.isArray(candles) && candles.length) {
+            const last = candles[candles.length-1];
+            if (last && last.close != null) {
+              priceEl.textContent = (typeof fmtPx === "function" ? fmtPx(last.close) : String(last.close));
+              const prev = candles.length>1 ? candles[candles.length-2].close : last.open;
+              const isUp = last.close >= (last.open || prev);
+              priceEl.className = "chart-price " + (isUp ? "up" : "down");
+              if (changeEl) {
+                const ch = prev ? ((last.close - prev)/prev*100) : 0;
+                changeEl.textContent = (ch>=0?"+":"") + ch.toFixed(2) + "%";
+                changeEl.className = "chart-change " + (ch>=0 ? "up" : "down");
+              }
+            }
+          }
+          if (infoRight) {
+            const st = CHARTS.getState ? CHARTS.getState(canvas) : null;
+            if (st && st._lastPlot) {
+              infoRight.textContent = `${st._lastPlot.view.length} visible · ${st.visibleBars} window · ${st.scrollOffset>0?st.scrollOffset+" scrolled":"latest"}`;
+            }
+          }
         }
-        if (idx < 0) {
-          const insertion = lo2;
-          const left = insertion > 0 ? insertion - 1 : -1;
-          const right = insertion < view.length ? insertion : -1;
-          if (left >= 0 && right >= 0) idx = markerTime - view[left].time <= view[right].time - markerTime ? left : right;
-          else idx = left >= 0 ? left : right;
-          const typicalGap = view.length > 1 ? Math.max(1, view[view.length - 1].time - view[view.length - 2].time) : 60000;
-          if (idx < 0 || Math.abs(view[idx].time - markerTime) > typicalGap) continue;
-        }
-        const mx = xFor(idx);
-        const my = yPrice(markerPrice);
-        if (!Number.isFinite(my) || my < -12 || my > priceH + 12) continue;
-        const s = 7;
-        ctx.fillStyle = mk.dir === "PUT" ? "#ff5d7a" : "#3dff9a";
-        ctx.beginPath();
-        if (mk.dir === "PUT") {
-          ctx.moveTo(mx, my - 5);
-          ctx.lineTo(mx - s, my - 5 - s);
-          ctx.lineTo(mx + s, my - 5 - s);
-        } else {
-          ctx.moveTo(mx, my + 5);
-          ctx.lineTo(mx - s, my + 5 + s);
-          ctx.lineTo(mx + s, my + 5 + s);
-        }
-        ctx.closePath();
-        ctx.fill();
-      }
+      } catch(_) {}
+    } else {
+      // Fallback: simple text
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+      ctx.fillStyle="#0c1422"; ctx.fillRect(0,0,canvas.width,canvas.height);
     }
-
-    const lastC = view[view.length - 1].close;
-    const lastY = yPrice(lastC);
-    ctx.setLineDash([4, 4]);
-    ctx.strokeStyle = "rgba(255,255,255,0.35)";
-    ctx.beginPath(); ctx.moveTo(padL, lastY); ctx.lineTo(padL + plotW, lastY); ctx.stroke();
-    ctx.setLineDash([]);
-    ctx.fillStyle = lastC >= view[0].open ? "#3dff9a" : "#ff5d7a";
-    ctx.fillRect(w - padR - 42, lastY - 8, 44, 15);
-    ctx.fillStyle = "#0c1422";
-    ctx.font = "bold 9px system-ui, sans-serif";
-    ctx.textAlign = "center";
-    ctx.fillText(fmtPx(lastC), w - padR - 20, lastY + 3);
-    ctx.textAlign = "left";
-
-    ctx.strokeStyle = "rgba(255,255,255,0.07)";
-    ctx.beginPath(); ctx.moveTo(padL, priceH + 0.5); ctx.lineTo(padL + plotW, priceH + 0.5); ctx.stroke();
-    ctx.fillStyle = "rgba(255,255,255,0.45)";
-    ctx.font = "9px system-ui, sans-serif";
-    const labelEvery = Math.max(1, Math.floor(view.length / 6));
-    // The Quotex platform charts in UTC. Labelling the same epochs in the
-    // machine's local zone shifted every candle by the UTC offset, so the
-    // dashboard never lined up with the broker chart side by side.
-    const useUtc = o.timeBasis !== "local";
-    // The time axis owns the dedicated strip at the very bottom of the canvas.
-    // Drawing it at priceH + 12 put it inside the top of the MACD pane, where
-    // it collided with the "MACD 12/26/9" legend and left timeAxisH blank.
-    const axisBaseline = priceH + macdH + Math.round(timeAxisH * 0.72);
-    for (let i = 0; i < view.length; i += labelEvery) {
-      ctx.fillText(axisTimeLabel(view[i].time, useUtc), xFor(i), axisBaseline);
-    }
-
-    if (useMacd && self.CYBER_TA) {
-      const m = self.CYBER_TA.macd(view.map((c) => c.close), 12, 26, 9);
-      let mMax = 1e-9;
-      for (let i = 0; i < m.hist.length; i++) {
-        for (const v of [m.hist[i], m.line[i], m.signal[i]]) {
-          if (v != null && Math.abs(v) > mMax) mMax = Math.abs(v);
-        }
-      }
-      const y0 = priceH + 4 + macdH / 2;
-      const yMacd = (v) => y0 - ((v || 0) / mMax) * (macdH / 2 - 5);
-      ctx.strokeStyle = "rgba(255,255,255,0.12)";
-      ctx.beginPath(); ctx.moveTo(padL, y0); ctx.lineTo(padL + plotW, y0); ctx.stroke();
-      const mw = plotW / view.length;
-      for (let i = 0; i < m.hist.length; i++) {
-        if (m.hist[i] == null) continue;
-        const x = xFor(i);
-        const v = m.hist[i];
-        ctx.fillStyle = v >= 0 ? "rgba(61,255,154,0.85)" : "rgba(255,93,122,0.85)";
-        ctx.fillRect(x - Math.max(1, mw * 0.28), Math.min(y0, yMacd(v)), Math.max(2, mw * 0.56), Math.max(1, Math.abs(y0 - yMacd(v))));
-      }
-      const drawMacdLine = (arr, color) => {
-        if (!arr) return;
-        ctx.strokeStyle = color;
-        ctx.lineWidth = 1.2;
-        ctx.beginPath();
-        let started = false;
-        for (let i = 0; i < arr.length; i++) {
-          if (arr[i] == null) continue;
-          const x = xFor(i);
-          const y = yMacd(arr[i]);
-          if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
-        }
-        ctx.stroke();
-        ctx.lineWidth = 1;
-      };
-      drawMacdLine(m.line, "#4aa3ff");
-      drawMacdLine(m.signal, "#ffc457");
-      ctx.fillStyle = "rgba(255,255,255,0.45)";
-      ctx.font = "9px system-ui, sans-serif";
-      ctx.fillText("MACD 12/26/9", padL + 4, priceH + 14);
-    }
-
-    ctx.fillStyle = "rgba(255,255,255,0.35)";
-    ctx.font = "9px system-ui, sans-serif";
-    const newestLabel = view.length ? axisTimeLabel(view[view.length - 1].time, o.timeBasis !== "local") : "";
-    ctx.fillText("CYBER BINARY · " + (o.label || o.timeframe || "1m") + " · " + view.length + " bars" +
-      (newestLabel ? " · last " + newestLabel + " UTC" : ""), padL + 4, 12);
   }
 
   /* ---------- tab routing ---------- */
@@ -802,6 +597,94 @@
     }
   }
 
+  function fmtTimeLeft(expiryMs) {
+    const now = Date.now();
+    const diff = Number(expiryMs) - now;
+    if (!Number.isFinite(diff)) return "—";
+    if (diff <= 0) return "expired";
+    const s = Math.floor(diff / 1000);
+    const m = Math.floor(s / 60);
+    const sec = s % 60;
+    if (m > 0) return `${m}m ${sec}s`;
+    return `${sec}s`;
+  }
+
+  function renderOngoingTrades(virtualPending) {
+    const tables = [
+      { tbody: $("ongoing-table") ? $("ongoing-table").querySelector("tbody") : null, empty: $("ongoing-empty"), count: $("ongoing-count"), full: true },
+      { tbody: $("auto-ongoing-table") ? $("auto-ongoing-table").querySelector("tbody") : null, empty: $("auto-ongoing-empty"), count: $("auto-ongoing-count"), full: false },
+    ];
+    // Combine broker open orders + virtual pending for full view
+    const virtualList = [];
+    if (virtualPending && typeof virtualPending === 'object') {
+      virtualList.push({
+        asset: virtualPending.asset || "—",
+        dir: virtualPending.dir || "—",
+        direction: virtualPending.dir || "—",
+        amount: null,
+        openPrice: virtualPending.entry || virtualPending.entryPrice,
+        expiryTime: virtualPending.expireAt || virtualPending.expiryTime,
+        closeTime: virtualPending.expireAt || virtualPending.expiryTime,
+        isVirtual: true,
+      });
+    }
+    const all = openOrders.concat(virtualList);
+    const count = all.length;
+    for (const cfg of tables) {
+      if (!cfg.tbody) continue;
+      cfg.tbody.innerHTML = "";
+      if (cfg.count) cfg.count.textContent = `${count} active`;
+      if (cfg.empty) cfg.empty.style.display = count ? "none" : "block";
+      for (const o of all.slice(0, 20)) {
+        const tr = document.createElement("tr");
+        tr.className = "clickable";
+        tr.title = "Click to switch to this asset on chart";
+        const dirCls = o.direction === "CALL" || o.dir === "CALL" ? "win" : o.direction === "PUT" || o.dir === "PUT" ? "loss" : "";
+        const asset = esc(o.asset || "—");
+        const dir = esc(o.direction || o.dir || "—");
+        const stake = o.isVirtual ? "VIRTUAL" : (finite(o.amount, null) != null ? esc(finite(o.amount, 0).toFixed(2)) + "$" : "—");
+        const entry = o.openPrice ? esc(fmtPx(o.openPrice)) : "—";
+        const currPrice = lastPriceMap[o.asset] || null;
+        const curr = currPrice ? esc(fmtPx(currPrice)) : "—";
+        let pnl = "—";
+        let pnlCls = "";
+        if (currPrice && o.openPrice && !o.isVirtual) {
+          const isCall = (o.direction || o.dir) === "CALL";
+          const winning = isCall ? currPrice > o.openPrice : currPrice < o.openPrice;
+          const payout = 0.85;
+          const est = winning ? `+${(o.amount * payout).toFixed(2)}$` : `-${Number(o.amount).toFixed(2)}$`;
+          pnl = est;
+          pnlCls = winning ? "win" : "loss";
+        }
+        const expiry = esc(fmtTime(o.expiryTime || o.closeTime));
+        const timeLeft = esc(fmtTimeLeft(o.expiryTime || o.closeTime));
+        const status = o.isVirtual ? "VIRTUAL PENDING" : "OPEN";
+        const statusCls = o.isVirtual ? "" : "win";
+        if (cfg.full) {
+          tr.innerHTML = `<td><strong>${asset}</strong></td><td class="${dirCls}">${dir}</td><td>${stake}</td><td>${entry}</td><td>${curr}</td><td class="${pnlCls}">${pnl}</td><td>${expiry}</td><td>${timeLeft}</td><td class="${statusCls}">${status}</td>`;
+        } else {
+          tr.innerHTML = `<td><strong>${asset}</strong></td><td class="${dirCls}">${dir}</td><td>${stake}</td><td>${entry}</td><td>${expiry}</td><td>${timeLeft}</td><td class="${statusCls}">${status}</td>`;
+        }
+        // Click to switch asset on chart
+        tr.addEventListener("click", () => {
+          if (o.asset) {
+            try { selectAsset(o.asset); } catch(_) {}
+            activateTab("live");
+          }
+        });
+        cfg.tbody.appendChild(tr);
+      }
+    }
+  }
+
+  let lastVirtualPending = null;
+  function ensureOngoingTimer() {
+    if (ongoingTimer) return;
+    ongoingTimer = setInterval(() => {
+      if (openOrders.length || lastVirtualPending) renderOngoingTrades(lastVirtualPending);
+    }, 1000);
+  }
+
   function renderLive(state) {
     if (!state || typeof state !== "object" || Array.isArray(state)) return;
     if (state && state.quotex && typeof state.quotex === "object" && !Array.isArray(state.quotex)) {
@@ -814,6 +697,19 @@
       if (state.quotex.balance) qxBalance = QUOTEX ? QUOTEX.parseBalance(state.quotex.balance) : null;
       if (Array.isArray(state.quotex.lastOrders)) {
         qxOrders = mergeOrders(state.quotex.lastOrders.concat(qxOrders));
+      }
+      if (Array.isArray(state.quotex.openOrders)) {
+        openOrders = state.quotex.openOrders.slice(0, 50);
+      }
+      lastVirtualPending = state.pending && typeof state.pending === 'object' ? state.pending : null;
+      ensureOngoingTimer();
+      renderOngoingTrades(lastVirtualPending);
+      // Track last price per asset for P&L estimation
+      if (state.assetId && state.price != null) {
+        lastPriceMap[state.assetId] = Number(state.price);
+      }
+      if (state.quotex && state.quotex.activeSymbol && state.price != null) {
+        lastPriceMap[state.quotex.activeSymbol] = Number(state.price);
       }
     }
     paintQuotexPill();
@@ -891,9 +787,14 @@
     const noiseTxt = sig.noise && sig.noise.ready
       ? " · noise: " + Number(sig.noise.score).toFixed(2)
       : "";
+    // v2.8: show dynamic expiry suggestion
+    const exp = sig.suggestedExpiry != null ? Number(sig.suggestedExpiry) : null;
+    const expTxt = exp != null && Number.isFinite(exp)
+      ? ` · expiry: ${exp}m` + (sig.expiryReason ? ` (${String(sig.expiryReason).slice(0,120)})` : "") + (settings && settings.expiryMode === "adaptive" ? " [adaptive]" : " [fixed]")
+      : "";
     $("regime-row").textContent = "strategy: " + heroStrategy + routed +
       " · regime: " + (sig.regime || "—") + " · session: " + (sig.session || state.session || "—") + noiseTxt +
-      " · engine: 1m · mtf bias: " + ((sig.metrics && sig.metrics.mtfBias) || 0) + "/" + ((sig.metrics && sig.metrics.mtfChecked) || 0);
+      " · engine: 1m · mtf bias: " + ((sig.metrics && sig.metrics.mtfBias) || 0) + "/" + ((sig.metrics && sig.metrics.mtfChecked) || 0) + expTxt;
 
     // Auto-Adaptive Cockpit UI Update
     const adaptiveCard = $("adaptive-card");
@@ -1002,12 +903,41 @@
       ul.innerHTML = "";
       history.forEach((h) => {
         const li = document.createElement("li");
+        li.className = "clickable";
+        li.title = "Click to view " + (h.asset||"") + " on chart";
         const outcome = tradeOutcome(h);
         li.innerHTML =
           '<span class="' + outcome.cls + '">' + outcome.label + '</span>' +
           '<span class="meta">' + esc(h.dir || "") + " · " + esc(h.asset || "—") + " · conf " + esc(finite(h.confidence, 0)) + "%" +
             " · " + esc(strategyLabel(h.strategy, h.strategyLabel) || "—") + "<br>" + esc(tradeTimeline(h, true)) + '</span>' +
           '<span class="' + outcome.cls + '">' + esc(fmtMoney(h.pnl)) + '</span>';
+        li.addEventListener("click", () => {
+          if (h.asset) {
+            try { selectAsset(h.asset); } catch(_) {}
+            // Scroll chart to that time if possible
+            const CH = self.CYBER_CHARTS || null;
+            const canvas = $("chart");
+            if (CH && canvas) {
+              const st = CH.getState ? CH.getState(canvas) : null;
+              if (st && st._lastNormalized && h.entryTime) {
+                // Find index of entry time and set scroll offset to center it
+                let et = Number(h.entryTime);
+                while (Math.abs(et)>=1e14) et/=1000;
+                if (Math.abs(et)<1e11) et*=1000;
+                et=Math.floor(et);
+                const norm = st._lastNormalized;
+                let idx=-1;
+                for(let i=0;i<norm.length;i++){ if(norm[i].time>=et){ idx=i; break; } }
+                if(idx>=0){
+                  const total=norm.length;
+                  const vis=st.visibleBars||120;
+                  st.scrollOffset = Math.max(0, total - idx - Math.floor(vis/2));
+                  CH.drawMainChart(canvas, norm, st._lastOpts||{});
+                }
+              }
+            }
+          }
+        });
         ul.appendChild(li);
       });
     }
@@ -1016,12 +946,89 @@
       ? state.chartCandles : []).slice(-500);
     const markers = Array.isArray(state.markers) ? state.markers.slice(-600) : [];
     const nextChartKey = chartStateKey(chartCandles, state.chartPeriod, markers);
+    // Always update lastChartCandles/meta for integration even if key same? Keep key check for performance but enrich meta
     if (nextChartKey !== lastChartKey) {
       lastChartKey = nextChartKey;
       lastChartCandles = chartCandles.slice(-500);
-      lastChartMeta = { timeframe: tfLabel(state.chartPeriod || 60), markers, timeBasis: state.chartTimeBasis || "broker-utc" };
+    }
+    // Build enriched meta with integration
+    lastChartMeta = {
+      timeframe: tfLabel(state.chartPeriod || 60),
+      markers,
+      timeBasis: state.chartTimeBasis || "broker-utc",
+      signal: sig,
+      regime: sig.regime || state.regime || null,
+      session: sig.session || state.session || null,
+      openOrders: openOrders,
+      pending: lastVirtualPending || state.pending || null,
+      history: history,
+      decimals: assetDecimals(activeAsset),
+      label: (state.asset || activeAsset || "—") + " · " + tfLabel(state.chartPeriod || 60),
+    };
+    // Draw if key changed or every 2nd call to keep order lines fresh
+    if (nextChartKey !== lastChartKey || Date.now() % 2000 < 100) {
+      // Actually draw every time to keep live price line and order countdown fresh — but throttled by chartStateKey already
+      // So force draw with enriched meta
+      drawChart($("chart"), lastChartCandles, lastChartMeta);
+    } else {
+      // Still redraw to update order lines / price badge even when candles same
       drawChart($("chart"), lastChartCandles, lastChartMeta);
     }
+    // Update chart title with asset + regime + signal
+    try {
+      const titleEl = document.getElementById("chart-title");
+      if (titleEl) {
+        const assetName = state.asset || activeAsset || "—";
+        const regimeTxt = sig.regime ? " · " + sig.regime.toUpperCase() : "";
+        const stratTxt = sig.selectedStrategyLabel || signalStrategyLabel(sig, state) || "";
+        titleEl.textContent = assetName + " · " + tfLabel(state.chartPeriod || 60) + regimeTxt + (stratTxt ? " · " + stratTxt : "");
+      }
+      const regimeBadge = document.getElementById("chart-regime-badge");
+      if (regimeBadge) {
+        if (sig.regime) {
+          regimeBadge.textContent = sig.regime.toUpperCase();
+          regimeBadge.style.display = "inline-block";
+          const rc = (sig.regime||"").toLowerCase();
+          if (rc.includes("trend")) { regimeBadge.className="badge green"; }
+          else if (rc.includes("range")||rc.includes("choppy")) { regimeBadge.className="badge"; }
+          else if (rc.includes("volatile")||rc.includes("breakout")) { regimeBadge.className="badge blue"; }
+          else { regimeBadge.className="badge"; }
+        } else { regimeBadge.style.display="none"; }
+      }
+      const sessBadge = document.getElementById("chart-session-badge");
+      if (sessBadge) {
+        if (sig.session) {
+          sessBadge.textContent = sig.session.toUpperCase();
+          sessBadge.style.display="inline-block";
+        } else { sessBadge.style.display="none"; }
+      }
+    } catch(_) {}
+    // Update indicator legend with live metrics
+    try {
+      const m = sig.metrics || {};
+      const legend = document.getElementById("chart-indicator-legend");
+      if (legend && m) {
+        const rsi = m.rsi != null ? m.rsi.toFixed(1) : "—";
+        const stoch = m.stochK != null ? m.stochK.toFixed(1) : "—";
+        const adx = m.adx != null ? m.adx.toFixed(1) : "—";
+        const emaF = m.emaFast != null ? fmtPx(m.emaFast) : "—";
+        const emaS = m.emaSlow != null ? fmtPx(m.emaSlow) : "—";
+        const atr = m.atrPct != null ? (m.atrPct*100).toFixed(3)+"%" : "—";
+        const mtf = m.mtfBias != null ? m.mtfBias + "/" + (m.mtfChecked||0) : "—";
+        const exp = sig.suggestedExpiry != null ? sig.suggestedExpiry + "m" : "—";
+        legend.innerHTML = `<span>RSI ${rsi}</span> · <span>Stoch ${stoch}</span> · <span>ADX ${adx}</span> · <span>EMA ${emaF}/${emaS}</span> · <span>ATR ${atr}</span> · <span>MTF ${mtf}</span> · <span>EXP ${exp}</span> · <span style="color:${sig.direction==='CALL'?'#3dff9a':sig.direction==='PUT'?'#ff5d7a':'#8aa0c8'}">${sig.direction||'WAIT'} ${sig.confidence||0}%</span>`;
+      }
+    } catch(_) {}
+    // Performance chart
+    try {
+      const CH = self.CYBER_CHARTS || null;
+      const perfCanvas = $("perf-chart");
+      if (CH && perfCanvas && history && history.length>5) {
+        CH.drawPerformanceChart(perfCanvas, history, {});
+      }
+    } catch(_) {}
+
+
     const demoBadge = $("chart-demo-badge");
     if (demoBadge && chartCandles.length) demoBadge.hidden = true;
     if (state.autoState) updateAutoUI(state.autoState);
@@ -1360,6 +1367,8 @@
     bindNumberSetting("min-confidence", "minConfidence");
     bindNumberSetting("stake", "stake");
     bindNumberSetting("expiry", "expiry");
+    bindNumberSetting("adaptive-expiry-min", "adaptiveExpiryMin");
+    bindNumberSetting("adaptive-expiry-max", "adaptiveExpiryMax");
     bindNumberSetting("max-hour", "maxTradesPerHour");
     bindNumberSetting("max-day", "maxTradesPerDay");
     bindNumberSetting("loss-cap", "dailyLossCap");
@@ -1367,11 +1376,22 @@
     bindNumberSetting("cooldown", "cooldownBars");
     bindNumberSetting("stake-percent", "stakePercent");
     bindNumberSetting("min-balance", "minBalance");
-    for (const pair of [["account-mode", "accountMode"], ["stake-mode", "stakeMode"]]) {
+    for (const pair of [["account-mode", "accountMode"], ["stake-mode", "stakeMode"], ["expiry-mode", "expiryMode"]]) {
       const el = $(pair[0]);
       if (!el) continue;
       el.addEventListener("change", () => {
-        setSettings({ [pair[1]]: el.value }).then((saved) => { el.value = saved[pair[1]]; }).catch(() => {});
+        setSettings({ [pair[1]]: el.value }).then((saved) => {
+          el.value = saved[pair[1]];
+          // toggle fixed expiry input disabled state
+          if (pair[0] === "expiry-mode") {
+            const fixedEl = $("expiry");
+            const minEl = $("adaptive-expiry-min");
+            const maxEl = $("adaptive-expiry-max");
+            if (fixedEl) fixedEl.disabled = saved.expiryMode === "adaptive";
+            if (minEl) minEl.disabled = saved.expiryMode !== "adaptive";
+            if (maxEl) maxEl.disabled = saved.expiryMode !== "adaptive";
+          }
+        }).catch(() => {});
       });
     }
     const bindBooleanSetting = (id, key) => {
@@ -1417,6 +1437,13 @@
       $("min-confidence").value = s.minConfidence != null ? s.minConfidence : 65;
       $("stake").value = s.stake != null ? s.stake : 1;
       $("expiry").value = s.expiry != null ? s.expiry : 3;
+      if ($("expiry-mode")) $("expiry-mode").value = s.expiryMode === "fixed" ? "fixed" : "adaptive";
+      if ($("adaptive-expiry-min")) $("adaptive-expiry-min").value = s.adaptiveExpiryMin != null ? s.adaptiveExpiryMin : 1;
+      if ($("adaptive-expiry-max")) $("adaptive-expiry-max").value = s.adaptiveExpiryMax != null ? s.adaptiveExpiryMax : 5;
+      const isAdaptive = s.expiryMode !== "fixed";
+      if ($("expiry")) $("expiry").disabled = isAdaptive;
+      if ($("adaptive-expiry-min")) $("adaptive-expiry-min").disabled = !isAdaptive;
+      if ($("adaptive-expiry-max")) $("adaptive-expiry-max").disabled = !isAdaptive;
       $("max-hour").value = s.maxTradesPerHour != null ? s.maxTradesPerHour : 12;
       $("max-day").value = s.maxTradesPerDay != null ? s.maxTradesPerDay : 60;
       $("loss-cap").value = s.dailyLossCap != null ? s.dailyLossCap : 30;
@@ -1436,56 +1463,164 @@
     });
   }
 
-  /* ---------- backtest tab ---------- */
-  function runBacktest() {
+  /* ---------- backtest tab (v2.9 improved) ---------- */
+  let btWalkResults = null;
+  let btMonteResults = null;
+  let btAllTrades = [];
+
+  function drawEquityWithDrawdown(canvas, equity) {
+    const CH = self.CYBER_CHARTS || null;
+    if (CH && CH.drawEquityChart) {
+      // Try to pass trades if available
+      const trades = (typeof btAllTrades !== "undefined" && btAllTrades) ? btAllTrades : null;
+      CH.drawEquityChart(canvas, equity, { trades });
+      return;
+    }
+    if (!canvas) return;
+    const parent = canvas.parentElement;
+    const w = Math.max(180, Math.min(4096, (parent && parent.clientWidth) || window.innerWidth || 800));
+    const priceH = Math.max(120, Math.round(w * 0.26));
+    const ddH = Math.max(40, Math.round(w * 0.08));
+    const timeAxisH = 18;
+    const h = priceH + ddH + timeAxisH + 12;
+    const dpr = Math.max(1, Math.min(2, Number(window.devicePixelRatio) || 1));
+    canvas.width = Math.floor(w * dpr);
+    canvas.height = Math.floor(h * dpr);
+    canvas.style.width = w + "px";
+    canvas.style.height = h + "px";
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    ctx.fillStyle = "#0c1422";
+    ctx.fillRect(0, 0, w, h);
+    if (!Array.isArray(equity) || equity.length < 2) {
+      ctx.fillStyle = "rgba(255,255,255,0.45)";
+      ctx.font = "11px system-ui, sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText("No equity data — run backtest first", w/2, h/2);
+      return;
+    }
+    const eq = equity.filter(e => e && Number.isFinite(e.equity));
+    if (eq.length < 2) return;
+    let lo = Infinity, hi = -Infinity, maxDD = 0;
+    for (const e of eq) {
+      if (e.equity < lo) lo = e.equity;
+      if (e.equity > hi) hi = e.equity;
+      if (Number.isFinite(e.drawdown) && e.drawdown > maxDD) maxDD = e.drawdown;
+    }
+    const pad = (hi - lo) * 0.1 || 1;
+    lo -= pad; hi += pad;
+    if (maxDD < 0.1) maxDD = 1;
+    const yEq = (v) => priceH - ((v - lo) / (hi - lo)) * (priceH - 16) - 8;
+    const yDD = (v) => priceH + 8 + ddH - (v / maxDD) * (ddH - 8) - 4;
+    const xFor = (i) => 8 + (i / (eq.length - 1)) * (w - 16);
+    const zeroY = yEq(0);
+    ctx.strokeStyle = "rgba(255,255,255,0.08)";
+    ctx.beginPath(); ctx.moveTo(0, zeroY); ctx.lineTo(w, zeroY); ctx.stroke();
+    ctx.strokeStyle = "#4aa3ff";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    for (let i = 0; i < eq.length; i++) {
+      const x = xFor(i), y = yEq(eq[i].equity);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+    const grad = ctx.createLinearGradient(0, 0, 0, priceH);
+    grad.addColorStop(0, "rgba(74,163,255,0.3)");
+    grad.addColorStop(1, "rgba(74,163,255,0)");
+    ctx.fillStyle = grad;
+    ctx.lineTo(w - 8, priceH - 8);
+    ctx.lineTo(8, priceH - 8);
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillStyle = "rgba(255,93,122,0.25)";
+    ctx.beginPath();
+    ctx.moveTo(xFor(0), yDD(0));
+    for (let i = 0; i < eq.length; i++) {
+      ctx.lineTo(xFor(i), yDD(eq[i].drawdown || 0));
+    }
+    ctx.lineTo(xFor(eq.length-1), yDD(0));
+    ctx.closePath();
+    ctx.fill();
+    ctx.strokeStyle = "rgba(255,93,122,0.6)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let i = 0; i < eq.length; i++) {
+      const x = xFor(i), y = yDD(eq[i].drawdown || 0);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+    ctx.fillStyle = "rgba(255,255,255,0.5)";
+    ctx.font = "9px system-ui, sans-serif";
+    ctx.textAlign = "left";
+    ctx.fillText("Equity · " + eq.length + " pts · P&L " + eq[eq.length-1].equity.toFixed(2) + " · MaxDD " + maxDD.toFixed(2), 8, 12);
+    ctx.fillText("Drawdown", 8, priceH + 16);
+  }
+
+  function runBacktest(isWalkForward) {
     const rawDays = Number($("bt-days").value);
     const rawHorizon = Number($("bt-horizon").value);
     const rawMinConf = Number($("bt-minconf").value);
-    const days = Number.isFinite(rawDays) ? Math.max(1, Math.min(31, Math.floor(rawDays))) : 7;
-    const horizon = Number.isFinite(rawHorizon) ? Math.max(1, Math.min(60, Math.floor(rawHorizon))) : 3;
+    const rawPayout = Number($("bt-payout") ? $("bt-payout").value : 85);
+    const days = Number.isFinite(rawDays) ? Math.max(1, Math.min(60, Math.floor(rawDays))) : 7;
+    const horizon = Number.isFinite(rawHorizon) ? Math.max(0.5, Math.min(60, rawHorizon)) : 3;
     const minConf = Number.isFinite(rawMinConf) ? Math.max(0, Math.min(100, rawMinConf)) : 0;
+    const payoutPct = Number.isFinite(rawPayout) ? Math.max(0, Math.min(200, rawPayout)) : 85;
+    const payout = payoutPct / 100;
+    const useAdaptive = $("bt-adaptive") ? $("bt-adaptive").checked : false;
     const kind = $("bt-kinds").value;
     const kinds = kind === "all" ? null : [kind];
-    // The matrix runs across the WHOLE catalog (kind-filtered), not just the
-    // assets that happen to have a live candle cache. Cached broker candles
-    // are still preferred wherever they exist; every other asset is covered
-    // by the deterministic per-asset simulator, so a run always includes all
-    // assets and the per-asset table says which data each row used.
-    const o = { days, horizon, minConf, kinds, minBars: 50 };
 
-    const btn = $("bt-run");
+    // Build payout map from live instruments if available
+    const payoutByAsset = Object.create(null);
+    if (qxInstruments && qxInstruments.length) {
+      for (const it of qxInstruments) {
+        if (!it || !it.symbol || !it.id) continue;
+        const p = Number(it.payout);
+        if (Number.isFinite(p) && p > 0) {
+          const norm = p > 1 ? p / 100 : p;
+          payoutByAsset[it.id] = norm;
+          payoutByAsset[it.symbol] = norm;
+        }
+      }
+    }
+
+    const o = {
+      days, horizon, minConf, kinds, minBars: 50,
+      payout, payoutByAsset, useAdaptiveExpiry: useAdaptive,
+      adaptiveExpiryMin: settings && settings.adaptiveExpiryMin ? settings.adaptiveExpiryMin : 1,
+      adaptiveExpiryMax: settings && settings.adaptiveExpiryMax ? settings.adaptiveExpiryMax : 5,
+    };
+
+    const btn = isWalkForward ? $("bt-walk") : $("bt-run");
+    if (!btn) return;
     btn.disabled = true;
     const origLabel = btn.textContent;
     btn.textContent = "Loading Quotex candles…";
 
-    function tick(progress, total) {
+    function tick(progress) {
       const i = progress && typeof progress === "object" ? progress.i : progress;
-      const n = progress && typeof progress === "object" ? progress.total : total;
-      if (n) btn.textContent = "Running backtest " + i + " / " + n + "…";
+      const n = progress && typeof progress === "object" ? progress.total : 0;
+      if (n) btn.textContent = (isWalkForward ? "Walk-Forward " : "Backtest ") + i + " / " + n + "…";
     }
 
     const assetPool = ASSETS.list().filter((a) => !kinds || kinds.some((kindName) =>
       typeof ASSETS.matchesKind === "function" ? ASSETS.matchesKind(a, kindName) : a.kind === kindName)).slice(0, 256);
-    const minNeeded = Math.max(40, 50 + horizon + 1);
-    let historyProbeError = "";
+    const minNeeded = Math.max(40, 50 + Math.ceil(horizon) + 1);
+
     const nudgeHistory = () => {
       if (!hasChrome) return Promise.resolve(true);
-      return chrome.runtime.sendMessage({ type: "CYBER_REQUEST_HISTORY", limit: 5000 })
+      return chrome.runtime.sendMessage({ type: "CYBER_REQUEST_HISTORY", limit: 5000, allTimeframes: true })
         .then((response) => {
-          if (!response || !response.ok) {
-            throw new Error((response && response.error) || "The selected Quotex tab could not request history.");
-          }
+          if (!response || !response.ok) throw new Error((response && response.error) || "history request failed");
           return true;
         });
     };
-    const seedProbe = nudgeHistory().catch((e) => {
-      historyProbeError = String((e && e.message) || e || "history request failed").slice(0, 256);
-      return false;
-    });
+    const seedProbe = nudgeHistory().catch(() => false);
 
     const readLiveRows = () => STORE.load().then((snapshot) => {
-      const storedByAsset = snapshot && snapshot.candles && typeof snapshot.candles === "object"
-        ? snapshot.candles : {};
+      const storedByAsset = snapshot && snapshot.candles && typeof snapshot.candles === "object" ? snapshot.candles : {};
       return assetPool.map((a) => {
         const stored = storedByAsset[a.id];
         const immediate = liveCandlesByAsset[a.id];
@@ -1499,22 +1634,13 @@
     })));
 
     const waitForLiveRows = async () => {
-      // Cached broker candles are preferred but never required: this probe
-      // just gives an open Quotex chart a few seconds to deliver fresh
-      // history before the run starts. Assets without a cache fall back to
-      // the simulator, so the wait must stay short.
       const deadline = Date.now() + 5000;
-      let nudged = false;
       let rows = await readLiveRows();
       while (!rows.some((row) => Array.isArray(row.bars) && row.bars.length >= minNeeded) && Date.now() < deadline) {
         const secondsLeft = Math.max(1, Math.ceil((deadline - Date.now()) / 1000));
         const bestBars = rows.reduce((m, r) => Math.max(m, Array.isArray(r.bars) ? r.bars.length : 0), 0);
-        btn.textContent = "Waiting for broker candles… " + bestBars + "/" + minNeeded + " (" + secondsLeft + "s)";
-        if (!nudged && (historyProbeError || bestBars < minNeeded) && deadline - Date.now() <= 3000) {
-          nudged = true;
-          nudgeHistory().catch(() => {});
-        }
-        await new Promise((resolve) => setTimeout(resolve, 500));
+        btn.textContent = "Waiting candles… " + bestBars + "/" + minNeeded + " (" + secondsLeft + "s)";
+        await new Promise((resolve) => setTimeout(resolve, 400));
         rows = await readLiveRows();
       }
       return rows;
@@ -1526,9 +1652,6 @@
         const bars = Array.isArray(row.bars) ? row.bars : [];
         if (bars.length >= minNeeded) cachedByAsset[row.asset.id] = bars;
       });
-      // Tag each asset's data source so the UI can show it honestly:
-      // "live" (cache covers the whole window), "live+sim" (cache padded by
-      // the simulator) or "sim" (no cache for this asset).
       const minutes = days * 24 * 60;
       btDataByAsset = Object.create(null);
       for (const a of assetPool) {
@@ -1540,8 +1663,7 @@
       o.cachedByAsset = cachedByAsset;
       o.onProgress = tick;
       const useWorkers = WORKERS && WORKERS.runBrowser;
-      return useWorkers
-        ? WORKERS.runBrowser(o)
+      return useWorkers ? WORKERS.runBrowser(o)
         : new Promise((resolve, reject) => setTimeout(() => {
           try { resolve(HIST.runMatrix(o)); } catch (e) { reject(e); }
         }, 30));
@@ -1549,18 +1671,20 @@
 
     loadLiveCache.then((r) => {
       btResults = r;
-      paintBacktest(r, o);
-      if (r && r.error) {
-        const body = $("bt-assets") && $("bt-assets").querySelector("tbody");
-        if (body) body.innerHTML = "<tr><td colspan='6'>" + esc(r.error) + "</td></tr>";
+      if (isWalkForward) {
+        // For walk-forward, we need to run WF per asset? We'll aggregate first asset's WF as demo
+        // Actually run walk-forward on combined series of best asset or first with live data
+        runWalkForwardAnalysis(o);
+      } else {
+        paintBacktest(r, o);
       }
     }).catch((e) => {
       const message = String(e && e.message || e || "Backtest failed");
-      const failure = { results: [], count: 0, liveOnly: true, error: message };
+      const failure = { results: [], count: 0, error: message };
       btResults = failure;
       paintBacktest(failure, o);
       const body = $("bt-assets") && $("bt-assets").querySelector("tbody");
-      if (body) body.innerHTML = "<tr><td colspan='6'>" + esc(message) + "</td></tr>";
+      if (body) body.innerHTML = "<tr><td colspan='8'>" + esc(message) + "</td></tr>";
       console.error(e);
     }).then(() => {
       btn.disabled = false;
@@ -1568,58 +1692,512 @@
     });
   }
 
+  function runWalkForwardAnalysis(opts) {
+    // Walk-forward on the active asset's live candles for detailed view
+    const active = ASSETS.get(activeAsset) || ASSETS.list()[0];
+    if (!active) return;
+    const cached = btDataByAsset && btDataByAsset[active.id] !== "sim" && liveCandlesByAsset[active.id] ? liveCandlesByAsset[active.id] : null;
+    let series = null;
+    if (HIST && HIST.getSeries) {
+      series = HIST.getSeries(active, { days: opts.days, cachedByAsset: opts.cachedByAsset });
+    }
+    if (!series || series.length < 400) {
+      // fallback to first asset with enough data
+      const pool = ASSETS.list();
+      for (const a of pool) {
+        if (liveCandlesByAsset[a.id] && liveCandlesByAsset[a.id].length >= 400) {
+          series = liveCandlesByAsset[a.id];
+          break;
+        }
+      }
+    }
+    if (!series || series.length < 400) {
+      const body = $("bt-walk-table") && $("bt-walk-table").querySelector("tbody");
+      if (body) body.innerHTML = "<tr><td colspan='8'>Need at least 400 candles for walk-forward — open Quotex to cache live data</td></tr>";
+      return;
+    }
+    try {
+      const wf = ENG.walkForward(series, {
+        strategy: activeStrategy || "auto_adaptive",
+        horizon: opts.horizon, minConf: opts.minConf, payout: opts.payout,
+        useAdaptiveExpiry: opts.useAdaptiveExpiry, folds: 5,
+      });
+      btWalkResults = wf;
+      paintWalkForward(wf);
+      activateBtTab("walk");
+    } catch (e) {
+      console.error("walkForward failed", e);
+    }
+  }
+
+  function runMonteCarloAnalysis() {
+    if (!btResults || !btResults.results || !btResults.results.length) {
+      alert("Run backtest first to generate trades for Monte Carlo");
+      return;
+    }
+    // Collect all trades from results
+    const allTrades = [];
+    for (const r of btResults.results) {
+      if (r.trades && Array.isArray(r.trades)) {
+        for (const t of r.trades) allTrades.push(t);
+      } else if (r.equity && r.equity.length) {
+        // synthesize from equity diff
+      }
+    }
+    // If no detailed trades, use aggregated pnl series
+    let tradesForMC = allTrades;
+    if (tradesForMC.length < 10) {
+      // Build from equity curve
+      const seq = [];
+      let prev = 0;
+      for (const r of btResults.results.slice(0, 50)) {
+        const pnl = Number(r.pnlWithPayout != null ? r.pnlWithPayout : r.pnl) || 0;
+        const t = Number(r.total) || 1;
+        const avg = t ? pnl / t : 0;
+        for (let i = 0; i < Math.min(t, 20); i++) seq.push({ pnlPayout: avg });
+      }
+      tradesForMC = seq;
+    }
+    if (tradesForMC.length < 10) {
+      alert("Not enough trades for Monte Carlo — need at least 10");
+      return;
+    }
+    try {
+      const mc = ENG.monteCarlo(tradesForMC, { sims: 1000 });
+      btMonteResults = mc;
+      paintMonteCarlo(mc);
+      activateBtTab("monte");
+    } catch (e) {
+      console.error("monteCarlo failed", e);
+    }
+  }
+
+  function paintWalkForward(wf) {
+    if (!wf || wf.error) {
+      const body = $("bt-walk-table") && $("bt-walk-table").querySelector("tbody");
+      if (body) body.innerHTML = "<tr><td colspan='8'>" + esc(wf && wf.error || "Walk-forward failed") + "</td></tr>";
+      return;
+    }
+    const body = $("bt-walk-table") && $("bt-walk-table").querySelector("tbody");
+    if (!body) return;
+    body.innerHTML = "";
+    for (const f of wf.folds) {
+      const tr = document.createElement("tr");
+      const testWR = f.test.winrate || 0;
+      const cls = testWR >= 55 ? "win" : testWR <= 45 ? "loss" : "";
+      tr.innerHTML = "<td>" + f.fold + "</td>" +
+        "<td>" + fmtPct(f.train.winrate) + "</td>" +
+        "<td>" + (Number(f.train.pnl)||0).toFixed(2) + "</td>" +
+        "<td class='" + cls + "'>" + fmtPct(f.test.winrate) + "</td>" +
+        "<td>" + (Number(f.test.pnl)||0).toFixed(2) + "</td>" +
+        "<td>" + (Number(f.test.profitFactor)||0).toFixed(2) + "</td>" +
+        "<td>" + (Number(f.test.expectedValue)||0).toFixed(1) + "%</td>" +
+        "<td>" + (Number(f.test.sharpe)||0).toFixed(2) + "</td>";
+      body.appendChild(tr);
+    }
+    if ($("bt-walk-wr")) $("bt-walk-wr").textContent = fmtPct(wf.combined.winrate);
+    if ($("bt-walk-pnl")) $("bt-walk-pnl").textContent = (wf.combined.pnl||0).toFixed(2);
+    if ($("bt-walk-avg")) $("bt-walk-avg").textContent = fmtPct(wf.combined.avgWinrate);
+    if ($("bt-walk-cons")) $("bt-walk-cons").textContent = fmtPct(wf.combined.consistency);
+  }
+
+  function paintMonteCarlo(mc) {
+    if (!mc || mc.error) return;
+    if ($("bt-monte-avg")) $("bt-monte-avg").textContent = (mc.avgPnL||0).toFixed(2);
+    if ($("bt-monte-median")) $("bt-monte-median").textContent = (mc.median && mc.median.finalPnL || 0).toFixed(2);
+    if ($("bt-monte-p5")) $("bt-monte-p5").textContent = (mc.p5 && mc.p5.finalPnL || 0).toFixed(2);
+    if ($("bt-monte-p95")) $("bt-monte-p95").textContent = (mc.p95 && mc.p95.finalPnL || 0).toFixed(2);
+    if ($("bt-monte-pos")) $("bt-monte-pos").textContent = fmtPct(mc.positiveRate);
+    if ($("bt-monte-dd")) $("bt-monte-dd").textContent = (mc.avgDD||0).toFixed(2);
+
+    // Draw distribution via enhanced library
+    const canvas = $("bt-monte-chart");
+    if (!canvas) return;
+    const CH = self.CYBER_CHARTS || null;
+    if (CH && CH.drawMonteCarloChart) {
+      CH.drawMonteCarloChart(canvas, mc.results, {});
+    } else {
+      // fallback simple
+      const w = Math.max(180, Math.min(4096, (canvas.parentElement && canvas.parentElement.clientWidth) || 800));
+      const h = Math.max(120, Math.round(w * 0.22));
+      const dpr = Math.max(1, Math.min(2, Number(window.devicePixelRatio)||1));
+      canvas.width = Math.floor(w * dpr);
+      canvas.height = Math.floor(h * dpr);
+      canvas.style.width = w + "px";
+      canvas.style.height = h + "px";
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0,0,w,h);
+      ctx.fillStyle = "#0c1422";
+      ctx.fillRect(0,0,w,h);
+      const vals = mc.results.map(r=>r.finalPnL).sort((a,b)=>a-b);
+      const lo = vals[0], hi = vals[vals.length-1];
+      const range = hi - lo || 1;
+      const bins = 40;
+      const counts = new Array(bins).fill(0);
+      for (const v of vals) {
+        const idx = Math.min(bins-1, Math.max(0, Math.floor((v - lo)/range * bins)));
+        counts[idx]++;
+      }
+      const maxC = Math.max(...counts) || 1;
+      const padL = 40, padR = 10, padT = 10, padB = 20;
+      const plotW = w - padL - padR, plotH = h - padT - padB;
+      ctx.fillStyle = "rgba(74,163,255,0.6)";
+      for (let i = 0; i < bins; i++) {
+        const x = padL + (i / bins) * plotW;
+        const bw = plotW / bins * 0.8;
+        const bh = (counts[i] / maxC) * plotH;
+        ctx.fillRect(x, padT + plotH - bh, bw, bh);
+      }
+      ctx.fillStyle = "rgba(255,255,255,0.5)";
+      ctx.font = "9px system-ui, sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText(lo.toFixed(1), padL, h - 2);
+      ctx.fillText(hi.toFixed(1), padL + plotW, h - 2);
+      ctx.textAlign = "left";
+      ctx.fillText("P&L distribution (" + mc.simulations + " sims)", 8, 12);
+    }
+  }
+
+  function activateBtTab(name) {
+    const panes = document.querySelectorAll(".bt-pane");
+    panes.forEach(p => {
+      p.style.display = p.dataset.btPane === name ? "block" : "none";
+      p.classList.toggle("active", p.dataset.btPane === name);
+    });
+    const tabs = document.querySelectorAll("[data-bt-tab]");
+    tabs.forEach(t => t.classList.toggle("active", t.dataset.btTab === name));
+  }
+
   function paintBacktest(matrix, opts) {
     matrix = matrix && Array.isArray(matrix.results) ? matrix : { results: [] };
     const sum = HIST.summarize(matrix) || {
-      trades: 0, winrate: 0, pnl: 0, byStrategy: {}, byKind: {},
+      trades: 0, winrate: 0, pnl: 0, pnlWithPayout: 0, expectedValue: 0,
+      byStrategy: {}, byKind: {}, byRegime: {},
     };
     $("bt-trades").textContent = String(sum.trades || 0);
     $("bt-winrate").textContent = fmtPct(sum && sum.winrate);
-    $("bt-pnl").textContent = String(sum && sum.pnl || 0);
+    if ($("bt-ev")) $("bt-ev").textContent = sum.expectedValue != null ? sum.expectedValue.toFixed(1) + "%" : "—";
+    $("bt-pnl").textContent = sum.pnlWithPayout != null ? sum.pnlWithPayout.toFixed(2) : (sum.pnl != null ? String(sum.pnl) : "—");
+    if ($("bt-pf")) $("bt-pf").textContent = sum.avgProfitFactor != null ? sum.avgProfitFactor.toFixed(2) : "—";
     const maxDrawdown = finite(sum && sum.maxDrawdown, null);
     $("bt-dd").textContent = maxDrawdown == null ? "—" : maxDrawdown.toFixed(2);
+    if ($("bt-sharpe")) $("bt-sharpe").textContent = sum.avgSharpe != null ? sum.avgSharpe.toFixed(2) : "—";
+    if ($("bt-recovery")) {
+      const rec = sum.trades ? (sum.pnlWithPayout || sum.pnl || 0) / (maxDrawdown || 1) : 0;
+      $("bt-recovery").textContent = Number.isFinite(rec) ? rec.toFixed(2) : "—";
+    }
+    if ($("bt-kelly")) {
+      const wr = sum.winrate || 0;
+      const p = wr / 100, q = 1 - p, b = (opts && opts.payout) || 0.85;
+      const kelly = b > 0 ? (p - q / b) * 100 : 0;
+      $("bt-kelly").textContent = kelly.toFixed(1) + "%";
+    }
+    if ($("bt-exposure")) {
+      // exposure from avg of results
+      const totalBars = opts.days * 24 * 60;
+      const exp = totalBars ? (sum.trades / (totalBars * (sum.assets || 1))) * 100 : 0;
+      $("bt-exposure").textContent = exp.toFixed(1) + "%";
+    }
 
+    // Equity curve: aggregate all trades sorted by time if available, else by results order
+    let allEquity = [];
     let running = 0;
-    const seq = [{ equity: 0 }];
-    for (const r of matrix.results.slice(0, 2000)) {
-      running += finite(r && r.pnl, 0);
-      seq.push({ equity: running });
-    }
-    lastBtEquity = matrix.error ? null : seq;
-    drawChart($("bt-equity"), matrix.error ? [] : seq, {
-      equity: true,
-      equityLabel: "runs",
-      emptyMessage: matrix.error ? "No genuine Quotex history received — see status below." : undefined,
-    });
-
-    const stBody = $("bt-strategies").querySelector("tbody");
-    stBody.innerHTML = "";
-    for (const k of Object.keys(sum.byStrategy).sort((a, b) => sum.byStrategy[b].winrate - sum.byStrategy[a].winrate)) {
-      const v = sum.byStrategy[k];
-      const tr = document.createElement("tr");
-      tr.innerHTML = "<td>" + esc(k) + "</td><td>" + finite(v.total, 0) + "</td><td class='win'>" + finite(v.wins, 0) + "</td><td class='loss'>" + finite(v.losses, 0) + "</td><td>" + finite(v.winrate, 0).toFixed(1) + "%</td>";
-      stBody.appendChild(tr);
-    }
-
-    const aBody = $("bt-assets").querySelector("tbody");
-    aBody.innerHTML = "";
-    const perAsset = {};
+    const allTradesFlat = [];
     for (const r of matrix.results) {
-      if (!perAsset[r.asset]) perAsset[r.asset] = { wins: 0, losses: 0, pnl: 0, dd: 0, name: r.name };
-      perAsset[r.asset].wins += r.wins;
-      perAsset[r.asset].losses += r.losses;
-      perAsset[r.asset].pnl += r.pnl;
-      if (r.maxDrawdown > perAsset[r.asset].dd) perAsset[r.asset].dd = r.maxDrawdown;
+      if (r.equity && r.equity.length) {
+        // equity already has pnlWithPayout progression per result, but we need combined
+      }
+      if (r.trades && Array.isArray(r.trades)) {
+        for (const t of r.trades) allTradesFlat.push(t);
+      }
     }
-    const sourceLabel = { live: "Live", "live+sim": "Live+Sim", sim: "Sim" };
-    for (const k of Object.keys(perAsset).sort((a, b) => perAsset[b].pnl - perAsset[a].pnl)) {
-      const v = perAsset[k];
-      const t = v.wins + v.losses;
-      const wr = t ? (v.wins / t) * 100 : 0;
-      const source = btDataByAsset && btDataByAsset[k] ? sourceLabel[btDataByAsset[k]] || "Sim" : "—";
-      const tr = document.createElement("tr");
-      tr.innerHTML = "<td>" + esc(v.name || k) + "</td><td>" + t + "</td><td class='" + (wr >= 55 ? "win" : wr <= 45 ? "loss" : "") + "'>" + wr.toFixed(1) + "%</td><td>" + finite(v.pnl, 0) + "</td><td>" + finite(v.dd, 0) + "</td><td>" + source + "</td>";
-      aBody.appendChild(tr);
+    // Sort trades by entryTime if available
+    allTradesFlat.sort((a,b) => (a.entryTime||0) - (b.entryTime||0));
+    btAllTrades = allTradesFlat.slice(-500);
+    let eqPeak = -Infinity;
+    for (let i = 0; i < allTradesFlat.length; i++) {
+      const t = allTradesFlat[i];
+      running += Number(t.pnlPayout != null ? t.pnlPayout : t.pnl) || 0;
+      if (running > eqPeak) eqPeak = running;
+      allEquity.push({ equity: running, drawdown: eqPeak - running, time: t.entryTime, i });
+    }
+    if (allEquity.length < 2) {
+      // fallback to per-result pnl aggregation
+      running = 0;
+      allEquity = [{ equity: 0, drawdown: 0 }];
+      for (const r of matrix.results.slice(0, 2000)) {
+        running += finite(r && (r.pnlWithPayout != null ? r.pnlWithPayout : r.pnl), 0);
+        const dd = allEquity.length ? Math.max(0, allEquity[allEquity.length-1].equity - running) : 0;
+        allEquity.push({ equity: running, drawdown: 0 });
+      }
+    }
+    lastBtEquity = matrix.error ? null : allEquity;
+    if (matrix.error) {
+      drawChart($("bt-equity"), [], { emptyMessage: "No genuine Quotex history — see status below." });
+    } else {
+      drawEquityWithDrawdown($("bt-equity"), allEquity);
+    }
+
+    // Per-strategy sorted by EV
+    const stBody = $("bt-strategies") ? $("bt-strategies").querySelector("tbody") : null;
+    if (stBody) {
+      stBody.innerHTML = "";
+      const sortedStrat = Object.keys(sum.byStrategy).sort((a,b) => {
+        const av = sum.byStrategy[a], bv = sum.byStrategy[b];
+        const aEV = av.pnl != null ? av.pnl : av.winrate;
+        const bEV = bv.pnl != null ? bv.pnl : bv.winrate;
+        return bEV - aEV;
+      });
+      for (const k of sortedStrat) {
+        const v = sum.byStrategy[k];
+        const ev = v.total ? (v.winrate/100 * (opts.payout||0.85) - (1-v.winrate/100))*100 : 0;
+        const pf = v.wins && v.losses ? (v.wins * (opts.payout||0.85)) / v.losses : (v.wins ? 99 : 0);
+        const tr = document.createElement("tr");
+        tr.innerHTML = "<td>" + esc(k) + "</td>" +
+          "<td>" + finite(v.total,0) + "</td>" +
+          "<td class='" + (v.winrate>=55?"win":v.winrate<=45?"loss":"") + "'>" + finite(v.winrate,0).toFixed(1) + "%</td>" +
+          "<td class='" + (ev>0?"win":"loss") + "'>" + ev.toFixed(1) + "%</td>" +
+          "<td>" + (Number.isFinite(pf)?pf.toFixed(2):"—") + "</td>" +
+          "<td>—</td>" +
+          "<td>" + finite(v.pnl,0).toFixed(2) + "</td>";
+        stBody.appendChild(tr);
+      }
+    }
+
+    // Per-asset
+    const aBody = $("bt-assets") ? $("bt-assets").querySelector("tbody") : null;
+    if (aBody) {
+      aBody.innerHTML = "";
+      const perAsset = {};
+      for (const r of matrix.results) {
+        if (!perAsset[r.asset]) perAsset[r.asset] = { wins: 0, losses: 0, pnl: 0, pnlPayout: 0, dd: 0, name: r.name, pf: 0, ev: 0 };
+        perAsset[r.asset].wins += r.wins;
+        perAsset[r.asset].losses += r.losses;
+        perAsset[r.asset].pnl += Number(r.pnl)||0;
+        perAsset[r.asset].pnlPayout += Number(r.pnlWithPayout != null ? r.pnlWithPayout : r.pnl)||0;
+        if (r.maxDrawdown > perAsset[r.asset].dd) perAsset[r.asset].dd = r.maxDrawdown;
+        if (r.profitFactor) perAsset[r.asset].pf = r.profitFactor;
+        if (r.expectedValue) perAsset[r.asset].ev = r.expectedValue;
+      }
+      const sourceLabel = { live: "Live", "live+sim": "Live+Sim", sim: "Sim" };
+      const sortedAssets = Object.keys(perAsset).sort((a,b) => perAsset[b].pnlPayout - perAsset[a].pnlPayout);
+      for (const k of sortedAssets.slice(0, 100)) {
+        const v = perAsset[k];
+        const t = v.wins + v.losses;
+        const wr = t ? (v.wins / t) * 100 : 0;
+        const ev = t ? (wr/100 * (opts.payout||0.85) - (1-wr/100))*100 : 0;
+        const pf = v.losses ? (v.wins * (opts.payout||0.85)) / v.losses : (v.wins ? 99 : 0);
+        const source = btDataByAsset && btDataByAsset[k] ? sourceLabel[btDataByAsset[k]] || "Sim" : "—";
+        const tr = document.createElement("tr");
+        tr.className = "clickable";
+        tr.title = "Click to view " + (v.name||k) + " on live chart and filter trades";
+        tr.innerHTML = "<td><strong>" + esc(v.name || k) + "</strong></td>" +
+          "<td>" + t + "</td>" +
+          "<td class='" + (wr>=55?"win":wr<=45?"loss":"") + "'>" + wr.toFixed(1) + "%</td>" +
+          "<td class='" + (ev>0?"win":"loss") + "'>" + ev.toFixed(1) + "%</td>" +
+          "<td>" + v.pnlPayout.toFixed(2) + "</td>" +
+          "<td>" + (Number.isFinite(pf)?pf.toFixed(2):"—") + "</td>" +
+          "<td>" + finite(v.dd,0).toFixed(2) + "</td>" +
+          "<td>" + source + "</td>";
+        tr.addEventListener("click", () => {
+          try { selectAsset(k); } catch(_) {}
+          // Filter trade log to this asset
+          const filter = btAllTrades.filter(trd => (trd.asset||"")===k);
+          if (filter.length) {
+            // Rebuild equity for this asset only
+            let run=0, peak=-Infinity, eq=[];
+            const sorted = [...filter].sort((a,b)=>(a.entryTime||0)-(b.entryTime||0));
+            for (const td of sorted) { run+=Number(td.pnlPayout!=null?td.pnlPayout:td.pnl)||0; if(run>peak) peak=run; eq.push({ equity: run, drawdown: peak-run, time: td.entryTime }); }
+            if (eq.length>1) {
+              const CH = self.CYBER_CHARTS || null;
+              const c = $("bt-equity");
+              if (CH && c) CH.drawEquityChart(c, eq, { trades: sorted });
+              activateBtTab("trades");
+              // Highlight trades table filtered
+              const tb = $("bt-trades-table") && $("bt-trades-table").querySelector("tbody");
+              if (tb) {
+                tb.innerHTML="";
+                const rev=[...sorted].reverse().slice(0,200);
+                for (let idx=0; idx<rev.length; idx++){ const tt=rev[idx]; const out=tt.draw?"DRAW":tt.won?"WIN":"LOSS"; const cls=tt.draw?"":tt.won?"win":"loss"; const tr2=document.createElement("tr"); tr2.innerHTML="<td>"+(idx+1)+"</td><td>"+esc(fmtTime(tt.entryTime))+"</td><td>"+esc(tt.asset||k)+"</td><td class='"+cls+"'>"+esc(tt.dir||"")+"</td><td>"+esc(fmtPx(tt.entry))+"</td><td>"+esc(fmtPx(tt.exit))+"</td><td>"+(tt.priceChangePct!=null?tt.priceChangePct.toFixed(3)+"%":"—")+"</td><td>"+(tt.confidence||0)+"%</td><td>"+esc(tt.regime||"—")+"</td><td>"+(tt.expiryMinutes||"—")+"m</td><td class='"+cls+"'>"+out+"</td><td class='"+cls+"'>"+(Number(tt.pnlPayout!=null?tt.pnlPayout:tt.pnl)||0).toFixed(2)+"</td>"; tb.appendChild(tr2); }
+              }
+            }
+          }
+        });
+        aBody.appendChild(tr);
+      }
+    }
+
+    // Regime breakdown
+    const regBody = $("bt-regimes") ? $("bt-regimes").querySelector("tbody") : null;
+    if (regBody) {
+      regBody.innerHTML = "";
+      const regAgg = sum.byRegime || {};
+      for (const k of Object.keys(regAgg).sort((a,b) => (regAgg[b].wins + regAgg[b].losses) - (regAgg[a].wins + regAgg[a].losses))) {
+        const v = regAgg[k];
+        const t = v.wins + v.losses;
+        const wr = t ? (v.wins / t) * 100 : 0;
+        const ev = t ? (wr/100 * (opts.payout||0.85) - (1-wr/100))*100 : 0;
+        const tr = document.createElement("tr");
+        tr.innerHTML = "<td>" + esc(k) + "</td><td>" + t + "</td>" +
+          "<td class='" + (wr>=55?"win":wr<=45?"loss":"") + "'>" + wr.toFixed(1) + "%</td>" +
+          "<td class='" + (ev>0?"win":"loss") + "'>" + ev.toFixed(1) + "%</td>" +
+          "<td>" + (Number(v.pnl)||0).toFixed(2) + "</td>";
+        regBody.appendChild(tr);
+      }
+    }
+
+    // Expiry breakdown
+    const expBody = $("bt-expiry") ? $("bt-expiry").querySelector("tbody") : null;
+    if (expBody) {
+      expBody.innerHTML = "";
+      const expAgg = {};
+      for (const r of matrix.results) {
+        if (!r.byExpiry) continue;
+        for (const ek of Object.keys(r.byExpiry)) {
+          if (!expAgg[ek]) expAgg[ek] = { wins: 0, losses: 0, draws: 0, pnl: 0 };
+          expAgg[ek].wins += r.byExpiry[ek].wins||0;
+          expAgg[ek].losses += r.byExpiry[ek].losses||0;
+          expAgg[ek].draws += r.byExpiry[ek].draws||0;
+          expAgg[ek].pnl += r.byExpiry[ek].pnl||0;
+        }
+      }
+      for (const k of Object.keys(expAgg).sort((a,b) => Number(a)-Number(b))) {
+        const v = expAgg[k];
+        const t = v.wins + v.losses;
+        const wr = t ? (v.wins / t) * 100 : 0;
+        const ev = t ? (wr/100 * (opts.payout||0.85) - (1-wr/100))*100 : 0;
+        const tr = document.createElement("tr");
+        tr.innerHTML = "<td>" + esc(k) + "m</td><td>" + t + "</td>" +
+          "<td class='" + (wr>=55?"win":wr<=45?"loss":"") + "'>" + wr.toFixed(1) + "%</td>" +
+          "<td class='" + (ev>0?"win":"loss") + "'>" + ev.toFixed(1) + "%</td>" +
+          "<td>" + (Number(v.pnl)||0).toFixed(2) + "</td>";
+        expBody.appendChild(tr);
+      }
+    }
+
+    // Confidence calibration
+    const calBody = $("bt-calib") ? $("bt-calib").querySelector("tbody") : null;
+    if (calBody) {
+      calBody.innerHTML = "";
+      const calAgg = {};
+      for (const r of matrix.results) {
+        for (const c of (r.calibration || [])) {
+          if (!calAgg[c.bucket]) calAgg[c.bucket] = { w: 0, l: 0, pnl: 0 };
+          calAgg[c.bucket].w += c.wins;
+          calAgg[c.bucket].l += c.losses;
+          calAgg[c.bucket].pnl += (c.wins * (opts.payout||0.85) - c.losses);
+        }
+      }
+      for (const b of Object.keys(calAgg).map(Number).sort((a,b) => a-b)) {
+        const v = calAgg[b];
+        const t = v.w + v.l;
+        const wr = t ? (v.w / t) * 100 : 0;
+        const ev = t ? (wr/100 * (opts.payout||0.85) - (1-wr/100))*100 : 0;
+        const tr = document.createElement("tr");
+        tr.innerHTML = "<td>" + b + "%</td><td>" + t + "</td>" +
+          "<td class='" + (wr>=b?"win":"loss") + "'>" + wr.toFixed(1) + "%</td>" +
+          "<td class='" + (ev>0?"win":"loss") + "'>" + ev.toFixed(1) + "%</td>";
+        calBody.appendChild(tr);
+      }
+    }
+
+    // Hourly
+    const hourBody = $("bt-hours") ? $("bt-hours").querySelector("tbody") : null;
+    if (hourBody) {
+      hourBody.innerHTML = "";
+      const hourAgg = {};
+      for (const r of matrix.results) {
+        if (!r.byHour) continue;
+        for (const hk of Object.keys(r.byHour)) {
+          if (!hourAgg[hk]) hourAgg[hk] = { wins: 0, losses: 0, draws: 0, pnl: 0 };
+          hourAgg[hk].wins += r.byHour[hk].wins||0;
+          hourAgg[hk].losses += r.byHour[hk].losses||0;
+          hourAgg[hk].draws += r.byHour[hk].draws||0;
+          hourAgg[hk].pnl += r.byHour[hk].pnl||0;
+        }
+      }
+      for (const hk of Object.keys(hourAgg).map(Number).sort((a,b) => a-b)) {
+        const v = hourAgg[hk];
+        const t = v.wins + v.losses;
+        const wr = t ? (v.wins / t) * 100 : 0;
+        const ev = t ? (wr/100 * (opts.payout||0.85) - (1-wr/100))*100 : 0;
+        const tr = document.createElement("tr");
+        tr.innerHTML = "<td>" + hk + ":00 UTC</td><td>" + t + "</td>" +
+          "<td class='" + (wr>=55?"win":wr<=45?"loss":"") + "'>" + wr.toFixed(1) + "%</td>" +
+          "<td class='" + (ev>0?"win":"loss") + "'>" + ev.toFixed(1) + "%</td>" +
+          "<td>" + (Number(v.pnl)||0).toFixed(2) + "</td>";
+        hourBody.appendChild(tr);
+      }
+    }
+
+    // Trade log with integration to equity chart
+    const tradesBody = $("bt-trades-table") ? $("bt-trades-table").querySelector("tbody") : null;
+    if (tradesBody) {
+      tradesBody.innerHTML = "";
+      const trades = btAllTrades.slice(-200).reverse();
+      for (let idx = 0; idx < trades.length; idx++) {
+        const t = trades[idx];
+        const outcome = t.draw ? "DRAW" : t.won ? "WIN" : "LOSS";
+        const cls = t.draw ? "" : t.won ? "win" : "loss";
+        const tr = document.createElement("tr");
+        tr.dataset.tradeIdx = String(btAllTrades.length - 1 - idx);
+        tr.innerHTML = "<td>" + (idx+1) + "</td>" +
+          "<td>" + esc(fmtTime(t.entryTime)) + "</td>" +
+          "<td>" + esc(t.asset || activeAsset || "—") + "</td>" +
+          "<td class='" + cls + "'>" + esc(t.dir || "") + "</td>" +
+          "<td>" + esc(fmtPx(t.entry)) + "</td>" +
+          "<td>" + esc(fmtPx(t.exit)) + "</td>" +
+          "<td>" + (t.priceChangePct != null ? t.priceChangePct.toFixed(3) + "%" : "—") + "</td>" +
+          "<td>" + (t.confidence||0) + "%</td>" +
+          "<td>" + esc(t.regime||"—") + "</td>" +
+          "<td>" + (t.expiryMinutes||"—") + "m</td>" +
+          "<td class='" + cls + "'>" + outcome + "</td>" +
+          "<td class='" + cls + "'>" + (Number(t.pnlPayout != null ? t.pnlPayout : t.pnl)||0).toFixed(2) + "</td>";
+        // Hover integration with equity chart
+        tr.addEventListener("mouseenter", () => {
+          const CH = self.CYBER_CHARTS || null;
+          const eqCanvas = $("bt-equity");
+          if (CH && eqCanvas && CH.highlightEquityTrade) {
+            const tradeIdx = Number(tr.dataset.tradeIdx);
+            if (Number.isFinite(tradeIdx)) CH.highlightEquityTrade(eqCanvas, tradeIdx);
+          }
+          tr.style.background = "rgba(0,229,255,0.08)";
+        });
+        tr.addEventListener("mouseleave", () => {
+          tr.style.background = "";
+          const CH = self.CYBER_CHARTS || null;
+          const eqCanvas = $("bt-equity");
+          if (CH && eqCanvas && CH.highlightEquityTrade) {
+            CH.highlightEquityTrade(eqCanvas, null);
+          }
+        });
+        tradesBody.appendChild(tr);
+      }
+    }
+
+    // Heatmap
+    const heatmapEl = $("bt-heatmap");
+    if (heatmapEl && matrix.results.length) {
+      const assets = [...new Set(matrix.results.map(r=>r.asset))].slice(0, 20);
+      const strats = [...new Set(matrix.results.map(r=>r.strategy))];
+      let html = "<table class='table tight'><thead><tr><th>Asset\\Strategy</th>";
+      for (const s of strats) html += "<th>" + esc(s.slice(0,12)) + "</th>";
+      html += "</tr></thead><tbody>";
+      for (const a of assets) {
+        html += "<tr><td><strong>" + esc(a) + "</strong></td>";
+        for (const s of strats) {
+          const found = matrix.results.find(r=>r.asset===a && r.strategy===s);
+          const wr = found ? found.winrate : 0;
+          const bg = wr >= 60 ? "background:rgba(61,255,154,0.25)" : wr >= 50 ? "background:rgba(255,196,87,0.2)" : wr ? "background:rgba(255,93,122,0.2)" : "";
+          const cls = wr >= 55 ? "win" : wr <= 45 && wr ? "loss" : "";
+          html += "<td class='" + cls + "' style='" + bg + "'>" + (found ? wr.toFixed(1)+"%" : "—") + "</td>";
+        }
+        html += "</tr>";
+      }
+      html += "</tbody></table>";
+      heatmapEl.innerHTML = html;
     }
 
     const sourcesEl = $("bt-sources");
@@ -1627,64 +2205,36 @@
       if (matrix.error) {
         sourcesEl.textContent = "";
       } else {
+        const perAsset = {};
+        for (const r of matrix.results) if (!perAsset[r.asset]) perAsset[r.asset] = true;
         const counts = { live: 0, "live+sim": 0, sim: 0 };
         for (const k of Object.keys(perAsset)) {
           if (btDataByAsset && btDataByAsset[k] && counts[btDataByAsset[k]] != null) counts[btDataByAsset[k]]++;
         }
         const covered = Object.keys(perAsset).length;
-        sourcesEl.textContent = "Covered " + covered + " asset" + (covered === 1 ? "" : "s") +
-          " — " + counts.live + " live-cached, " + counts["live+sim"] + " live+simulated, " +
-          counts.sim + " simulated. Cached Quotex candles are used when available; the rest of the catalog runs on the deterministic simulator.";
+        sourcesEl.textContent = "Covered " + covered + " assets — " + counts.live + " live, " + counts["live+sim"] + " live+sim, " + counts.sim + " sim. Payout " + (opts.payout*100).toFixed(0) + "% · Horizon " + opts.horizon + "m · " + (opts.useAdaptiveExpiry ? "Adaptive expiry" : "Fixed expiry") + ". EV = WR×payout − LR. PF = gross profit / gross loss. Sharpe = mean/std. Kelly = optimal stake %.";
       }
-    }
-
-    const regBody = $("bt-regimes").querySelector("tbody");
-    regBody.innerHTML = "";
-    const regAgg = {};
-    for (const r of matrix.results) {
-      for (const reg of Object.keys(r.byRegime || {})) {
-        if (!regAgg[reg]) regAgg[reg] = { wins: 0, losses: 0 };
-        regAgg[reg].wins += r.byRegime[reg].wins;
-        regAgg[reg].losses += r.byRegime[reg].losses;
-      }
-    }
-    for (const k of Object.keys(regAgg).sort((a, b) => (regAgg[b].wins + regAgg[b].losses) - (regAgg[a].wins + regAgg[a].losses))) {
-      const v = regAgg[k];
-      const t = v.wins + v.losses;
-      const wr = t ? (v.wins / t) * 100 : 0;
-      const tr = document.createElement("tr");
-      tr.innerHTML = "<td>" + esc(k) + "</td><td>" + t + "</td><td class='" + (wr >= 55 ? "win" : wr <= 45 ? "loss" : "") + "'>" + wr.toFixed(1) + "%</td>";
-      regBody.appendChild(tr);
-    }
-
-    const calBody = $("bt-calib").querySelector("tbody");
-    calBody.innerHTML = "";
-    const calAgg = {};
-    for (const r of matrix.results) {
-      for (const c of (r.calibration || [])) {
-        if (!calAgg[c.bucket]) calAgg[c.bucket] = { w: 0, l: 0 };
-        calAgg[c.bucket].w += c.wins;
-        calAgg[c.bucket].l += c.losses;
-      }
-    }
-    for (const b of Object.keys(calAgg).map(Number).sort((a, b) => a - b)) {
-      const v = calAgg[b];
-      const t = v.w + v.l;
-      const wr = t ? (v.w / t) * 100 : 0;
-      const tr = document.createElement("tr");
-      tr.innerHTML = "<td>" + b + "%</td><td>" + t + "</td><td class='" + (wr >= b ? "win" : "loss") + "'>" + wr.toFixed(1) + "%</td>";
-      calBody.appendChild(tr);
     }
   }
 
   function bindBacktest() {
-    $("bt-run").addEventListener("click", runBacktest);
+    // Sub-tab switching
+    const btTabs = document.querySelectorAll("[data-bt-tab]");
+    btTabs.forEach(btn => {
+      btn.addEventListener("click", () => activateBtTab(btn.dataset.btTab));
+    });
+
+    $("bt-run").addEventListener("click", () => runBacktest(false));
+    const walkBtn = $("bt-walk");
+    if (walkBtn) walkBtn.addEventListener("click", () => runBacktest(true));
+    const monteBtn = $("bt-monte");
+    if (monteBtn) monteBtn.addEventListener("click", runMonteCarloAnalysis);
+
     const exportBtn = $("bt-export");
     if (exportBtn) exportBtn.addEventListener("click", () => {
       const origLabel = exportBtn.textContent;
       STORE.load().then((snapshot) => {
-        const candles = snapshot && snapshot.candles && typeof snapshot.candles === "object" && !Array.isArray(snapshot.candles)
-          ? snapshot.candles : {};
+        const candles = snapshot && snapshot.candles && typeof snapshot.candles === "object" && !Array.isArray(snapshot.candles) ? snapshot.candles : {};
         const assets = Object.keys(candles).filter((k) => Array.isArray(candles[k]) && candles[k].length);
         const bars = assets.reduce((n, k) => n + candles[k].length, 0);
         const payload = {
@@ -1701,18 +2251,41 @@
         a.download = "cyber-binary-candles-" + new Date().toISOString().replace(/[:.]/g, "-").slice(0, 16) + ".json";
         a.click();
         setTimeout(() => URL.revokeObjectURL(url), 1000);
-        exportBtn.textContent = assets.length
-          ? "Exported " + assets.length + " assets / " + bars + " bars"
-          : "No live candle cache yet — open Quotex first";
+        exportBtn.textContent = assets.length ? "Exported " + assets.length + " assets / " + bars + " bars" : "No live cache — open Quotex first";
         setTimeout(() => { exportBtn.textContent = origLabel; }, 3000);
       }).catch(() => {
         exportBtn.textContent = "Export failed";
         setTimeout(() => { exportBtn.textContent = origLabel; }, 3000);
       });
     });
+
+    const exportTradesBtn = $("bt-export-trades");
+    if (exportTradesBtn) exportTradesBtn.addEventListener("click", () => {
+      if (!btAllTrades || !btAllTrades.length) {
+        exportTradesBtn.textContent = "No trades — run backtest first";
+        setTimeout(() => { exportTradesBtn.textContent = "Export trades"; }, 2000);
+        return;
+      }
+      const rows = [["time_utc","asset","dir","entry","exit","change_pct","confidence","regime","strategy","expiry_m","result","pnl","pnl_payout"]];
+      for (const t of btAllTrades) {
+        rows.push([
+          isoTime(t.entryTime), t.asset||activeAsset, t.dir, t.entry, t.exit,
+          t.priceChangePct, t.confidence, t.regime, t.selectedStrategy, t.expiryMinutes,
+          t.draw ? "DRAW" : t.won ? "WIN" : "LOSS", t.pnl, t.pnlPayout
+        ]);
+      }
+      const csv = rows.map(r => r.map(csvCell).join(",")).join("\n");
+      const blob = new Blob([csv], { type: "text/csv" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = "cyber-binary-backtest-trades-" + new Date().toISOString().slice(0,10) + ".csv"; a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    });
   }
 
-  /* ---------- history tab ---------- */
+
+
+    /* ---------- history tab ---------- */
   function refreshHistoryTab() {
     const token = ++historyRenderToken;
     STORE.getStats().then((stats) => {
@@ -1737,12 +2310,20 @@
       ul.innerHTML = "";
       for (const h of list.slice(0, 100)) {
         const li = document.createElement("li");
+        li.className = "clickable";
+        li.title = "Click to view " + (h.asset||"") + " on chart";
         const outcome = tradeOutcome(h);
         li.innerHTML =
           '<span class="' + outcome.cls + '">' + outcome.label + '</span>' +
           '<span class="meta">' + esc(h.dir || "") + " · " + esc(h.asset || "—") + " · conf " + esc(finite(h.confidence, 0)) + "% · " + esc(h.regime || "—") +
             " · " + esc(strategyLabel(h.strategy, h.strategyLabel) || "—") + "<br>" + esc(tradeTimeline(h, true)) + '</span>' +
           '<span class="' + outcome.cls + '">' + esc(fmtMoney(h.pnl)) + '</span>';
+        li.addEventListener("click", () => {
+          if (h.asset) {
+            try { selectAsset(h.asset); } catch(_) {}
+            activateTab("live");
+          }
+        });
         ul.appendChild(li);
       }
     }).catch(() => {});
@@ -1996,6 +2577,114 @@
   }
 
   /* ---------- bootstrap ---------- */
+
+  /* ---------- pro chart toolbar ---------- */
+  function bindProChartToolbar() {
+    const CH = self.CYBER_CHARTS || null;
+    if (!CH) return;
+    const canvas = $("chart");
+    if (!canvas) return;
+    const state = CH.getState ? CH.getState(canvas) : null;
+    if (!state) return;
+
+    // Chart type buttons
+    document.querySelectorAll("[data-chart-type]").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const type = btn.dataset.chartType;
+        if (!type) return;
+        state.chartType = type;
+        document.querySelectorAll("[data-chart-type]").forEach(b => b.classList.toggle("active", b===btn));
+        if (state._lastNormalized) CH.drawMainChart(canvas, state._lastNormalized, {});
+      });
+    });
+
+    const bindCheck = (id, key) => {
+      const el = $(id);
+      if (!el) return;
+      el.addEventListener("change", () => {
+        state[key] = el.checked;
+        if (state._lastNormalized) CH.drawMainChart(canvas, state._lastNormalized, state._lastOpts||{});
+      });
+    };
+    bindCheck("chart-ema", "showEMA");
+    bindCheck("chart-bb", "showBB");
+    bindCheck("chart-vol", "showVolume");
+    bindCheck("chart-macd", "showMACD");
+    bindCheck("chart-rsi", "showRSI");
+    bindCheck("chart-orders", "showOrders");
+    bindCheck("chart-regime", "showRegime");
+    bindCheck("chart-levels", "showLevels");
+
+    const resetBtn = $("chart-reset");
+    if (resetBtn) resetBtn.addEventListener("click", () => {
+      state.visibleBars = 120;
+      state.scrollOffset = 0;
+      state.crosshair = null;
+      if (state._lastNormalized) CH.drawMainChart(canvas, state._lastNormalized, {});
+    });
+
+    const exportBtn = $("chart-export");
+    if (exportBtn) exportBtn.addEventListener("click", () => {
+      if (CH.exportCanvasPNG) CH.exportCanvasPNG(canvas, "cyber-binary-" + (activeAsset||"chart") + "-" + new Date().toISOString().slice(0,10) + ".png");
+    });
+
+    const fsBtn = $("chart-fullscreen");
+    const wrap = $("main-chart-wrap");
+    if (fsBtn && wrap) {
+      fsBtn.addEventListener("click", () => {
+        const isFs = wrap.classList.contains("fullscreen");
+        if (isFs) {
+          wrap.classList.remove("fullscreen");
+          fsBtn.textContent = "⛶";
+          if (document.exitFullscreen) document.exitFullscreen().catch(()=>{});
+        } else {
+          wrap.classList.add("fullscreen");
+          fsBtn.textContent = "✕";
+          // try native fullscreen
+          if (wrap.requestFullscreen) wrap.requestFullscreen().catch(()=>{});
+        }
+        setTimeout(() => {
+          if (state._lastNormalized) CH.drawMainChart(canvas, state._lastNormalized, {});
+        }, 100);
+      });
+      document.addEventListener("fullscreenchange", () => {
+        if (!document.fullscreenElement) {
+          wrap.classList.remove("fullscreen");
+          if (fsBtn) fsBtn.textContent = "⛶";
+          setTimeout(() => { if (state._lastNormalized) CH.drawMainChart(canvas, state._lastNormalized, {}); }, 100);
+        }
+      });
+    }
+
+    // Equity export
+    const eqExport = $("bt-equity-export");
+    if (eqExport) eqExport.addEventListener("click", () => {
+      const c = $("bt-equity");
+      if (c && CH.exportCanvasPNG) CH.exportCanvasPNG(c, "cyber-binary-equity-" + new Date().toISOString().slice(0,10) + ".png");
+    });
+    const eqFs = $("bt-equity-fullscreen");
+    const eqWrap = $("bt-equity-wrap");
+    if (eqFs && eqWrap) {
+      eqFs.addEventListener("click", () => {
+        const isFs = eqWrap.classList.contains("fullscreen");
+        if (isFs) { eqWrap.classList.remove("fullscreen"); eqFs.textContent="⛶"; if (document.exitFullscreen) document.exitFullscreen().catch(()=>{}); }
+        else { eqWrap.classList.add("fullscreen"); eqFs.textContent="✕"; if (eqWrap.requestFullscreen) eqWrap.requestFullscreen().catch(()=>{}); }
+      });
+    }
+
+    const monteExport = $("bt-monte-export");
+    if (monteExport) monteExport.addEventListener("click", () => {
+      const c = $("bt-monte-chart");
+      if (c && CH.exportCanvasPNG) CH.exportCanvasPNG(c, "cyber-binary-monte-" + new Date().toISOString().slice(0,10) + ".png");
+    });
+
+    const perfExport = $("perf-export");
+    if (perfExport) perfExport.addEventListener("click", () => {
+      const c = $("perf-chart");
+      if (c && CH.exportCanvasPNG) CH.exportCanvasPNG(c, "cyber-binary-performance-" + new Date().toISOString().slice(0,10) + ".png");
+    });
+  }
+
   function scale() {
     const w = window.innerWidth;
     document.documentElement.style.fontSize = Math.max(12, Math.min(17, w / 32)) + "px";
@@ -2037,6 +2726,7 @@
   bindHistoryTab();
   bindAssetsTab();
   bindSettingsTab();
+  bindProChartToolbar();
   loadAutoSettings();
   scale();
   paintBuildStamp();
