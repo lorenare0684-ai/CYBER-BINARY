@@ -145,9 +145,40 @@
           </div>
         </section>
 
-        <section class="chart-wrap">
-          <canvas id="chart" width="800" height="280"></canvas>
-          <div id="chart-demo-badge" class="demo-badge" hidden>DEMO DATA — synthetic candles. Open the Quotex trade tab so the extension can capture real candles.</div>
+        <section class="chart-wrap pro-chart" id="main-chart-wrap">
+          <div class="chart-toolbar">
+            <div class="chart-toolbar-left">
+              <span class="chart-title" id="chart-title">— · 1m</span>
+              <span class="chart-price" id="chart-price-badge">—</span>
+              <span class="chart-change" id="chart-change-badge"></span>
+            </div>
+            <div class="chart-toolbar-right">
+              <div class="chart-type-group">
+                <button data-chart-type="candle" class="ghost-btn tiny active" title="Candlestick">Candles</button>
+                <button data-chart-type="line" class="ghost-btn tiny" title="Line chart">Line</button>
+                <button data-chart-type="area" class="ghost-btn tiny" title="Area chart">Area</button>
+                <button data-chart-type="heikin" class="ghost-btn tiny" title="Heikin-Ashi">HA</button>
+              </div>
+              <div class="chart-ind-group">
+                <label class="check small"><input type="checkbox" id="chart-ema" checked> EMA</label>
+                <label class="check small"><input type="checkbox" id="chart-bb"> BB</label>
+                <label class="check small"><input type="checkbox" id="chart-vol" checked> Vol</label>
+                <label class="check small"><input type="checkbox" id="chart-macd" checked> MACD</label>
+                <label class="check small"><input type="checkbox" id="chart-rsi"> RSI</label>
+              </div>
+              <button id="chart-reset" class="ghost-btn tiny" title="Reset zoom & pan">Reset</button>
+              <button id="chart-export" class="ghost-btn tiny" title="Export PNG">PNG</button>
+              <button id="chart-fullscreen" class="ghost-btn tiny" title="Fullscreen">⛶</button>
+            </div>
+          </div>
+          <div class="chart-canvas-wrap">
+            <canvas id="chart" width="800" height="340"></canvas>
+            <div id="chart-demo-badge" class="demo-badge" hidden>DEMO DATA — synthetic candles. Open the Quotex trade tab so the extension can capture real candles.</div>
+          </div>
+          <div class="chart-statusbar">
+            <span id="chart-info-left">Scroll to zoom · Drag to pan · Hover for details</span>
+            <span id="chart-info-right"></span>
+          </div>
         </section>
 
         <section class="grid stats">
@@ -442,8 +473,22 @@
 
         <section class="bt-pane active" data-bt-pane="overview">
           <section>
-            <h2>Equity Curve (with Drawdown)</h2>
-            <div class="chart-wrap"><canvas id="bt-equity" width="800" height="180"></canvas></div>
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+              <h2 style="margin:0">Equity Curve (with Drawdown)</h2>
+              <div style="display:flex;gap:6px">
+                <button id="bt-equity-export" class="ghost-btn tiny">PNG</button>
+                <button id="bt-equity-fullscreen" class="ghost-btn tiny">⛶</button>
+              </div>
+            </div>
+            <div class="chart-wrap pro-chart" id="bt-equity-wrap">
+              <div class="chart-canvas-wrap">
+                <canvas id="bt-equity" width="800" height="220"></canvas>
+              </div>
+              <div class="chart-statusbar">
+                <span id="bt-equity-info">Green dots = wins · Red = losses · Dashed = peak</span>
+                <span></span>
+              </div>
+            </div>
           </section>
 
           <section>
@@ -546,7 +591,21 @@
             <article><span>Positive Rate</span><strong id="bt-monte-pos">—</strong></article>
             <article><span>Avg Max DD</span><strong id="bt-monte-dd">—</strong></article>
           </div>
-          <div class="chart-wrap"><canvas id="bt-monte-chart" width="800" height="180"></canvas></div>
+          <div style="display:flex;justify-content:space-between;align-items:center;margin:10px 0 8px">
+            <h2 style="margin:0">Distribution</h2>
+            <div style="display:flex;gap:6px">
+              <button id="bt-monte-export" class="ghost-btn tiny">PNG</button>
+            </div>
+          </div>
+          <div class="chart-wrap pro-chart" id="bt-monte-wrap">
+            <div class="chart-canvas-wrap">
+              <canvas id="bt-monte-chart" width="800" height="200"></canvas>
+            </div>
+            <div class="chart-statusbar">
+              <span>Histogram of shuffled P&L outcomes · Red 5% worst · Cyan median · Green 95% best</span>
+              <span></span>
+            </div>
+          </div>
           <p class="disclaimer">Monte Carlo shuffles trade order to estimate risk — shows distribution of possible outcomes if same trades occurred in different order.</p>
         </section>
 
@@ -679,6 +738,7 @@
     <script src="lib/backtest.js"></script>
     <script src="lib/workers.js"></script>
     <script src="lib/quotex.js"></script>
+    <script src="lib/charts.js"></script>
     <script src="dashboard.js"></script>
   </body>
 </html>

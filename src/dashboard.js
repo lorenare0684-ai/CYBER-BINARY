@@ -274,298 +274,85 @@
     );
   }
 
+  // ===== Enhanced Charts v3 — delegates to CYBER_CHARTS =====
+  const CHARTS = self.CYBER_CHARTS || null;
+
   function drawChart(canvas, candles, opts) {
     if (!canvas) return;
-    const o = opts || {};
-    const parent = canvas.parentElement;
-    const parentWidth = finite(parent && parent.clientWidth, 0);
-    const viewportWidth = finite(window.innerWidth, 480);
-    const w = Math.max(180, Math.min(4096, parentWidth || viewportWidth));
-    const useMacd = o.macd !== false;
-    const priceH = Math.max(92, Math.round(w * 0.24));
-    const macdH = useMacd ? Math.max(52, Math.round(w * 0.14)) : 0;
-    const timeAxisH = 18;
-    const h = priceH + macdH + timeAxisH;
-    const rawDpr = finite(window.devicePixelRatio, 1);
-    const dpr = Math.max(1, Math.min(2, rawDpr));
-    const pixelW = Math.floor(w * dpr), pixelH = Math.floor(h * dpr);
-    if (canvas.width !== pixelW) canvas.width = pixelW;
-    if (canvas.height !== pixelH) canvas.height = pixelH;
-    if (canvas.style.width !== w + "px") canvas.style.width = w + "px";
-    if (canvas.style.height !== h + "px") canvas.style.height = h + "px";
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, w, h);
-    ctx.fillStyle = o.bg || "#0c1422";
-    ctx.fillRect(0, 0, w, h);
-    if (!Array.isArray(candles) || candles.length < 2) {
-      ctx.fillStyle = "rgba(255,255,255,0.45)";
-      ctx.font = "11px system-ui, sans-serif";
-      ctx.textAlign = "center";
-      ctx.fillText(o.emptyMessage || "Waiting for candles…", w / 2, h / 2);
+    opts = opts || {};
+    // Equity mode still supported via dedicated function
+    if (opts.equity) {
+      if (CHARTS && CHARTS.drawEquityChart) {
+        CHARTS.drawEquityChart(canvas, candles, { label: opts.equityLabel || "Equity", trades: opts.trades || null });
+      } else {
+        // fallback simple
+        const parent = canvas.parentElement;
+        const w = Math.max(180, Math.min(4096, (parent && parent.clientWidth) || 800));
+        const h = 180;
+        const dpr = Math.max(1, Math.min(2, Number(window.devicePixelRatio)||1));
+        canvas.width = Math.floor(w*dpr); canvas.height = Math.floor(h*dpr);
+        canvas.style.width=w+"px"; canvas.style.height=h+"px";
+        const ctx=canvas.getContext("2d"); if(!ctx) return;
+        ctx.setTransform(dpr,0,0,dpr,0,0); ctx.fillStyle="#0c1422"; ctx.fillRect(0,0,w,h);
+        ctx.fillStyle="rgba(255,255,255,0.45)"; ctx.font="11px system-ui"; ctx.textAlign="center";
+        ctx.fillText("Equity · " + (candles?candles.length:0) + " pts", w/2, h/2);
+      }
       return;
     }
-    if (o.equity) {
-      const eq = candles.map((point) => ({ equity: finite(point && point.equity, null) }))
-        .filter((point) => point.equity != null);
-      if (eq.length < 2) {
-        ctx.fillStyle = "rgba(255,255,255,0.45)";
-        ctx.font = "11px system-ui, sans-serif";
-        ctx.textAlign = "center";
-        ctx.fillText(o.emptyMessage || "Waiting for valid equity data…", w / 2, h / 2);
-        return;
+    if (CHARTS && CHARTS.drawMainChart) {
+      // Merge toolbar state if available
+      const toolbarState = CHARTS.getState ? CHARTS.getState(canvas) : null;
+      const mergedOpts = Object.assign({}, opts);
+      if (toolbarState) {
+        // preserve decimals from opts if provided
+        if (opts.decimals != null) toolbarState.decimals = opts.decimals;
       }
-      let eqLo = -Math.max(1, Math.abs(eq[0].equity));
-      let eqHi = Math.max(1, Math.abs(eq[0].equity || 0));
-      for (let i = 0; i < eq.length; i++) {
-        if (eq[i].equity < eqLo) eqLo = eq[i].equity;
-        if (eq[i].equity > eqHi) eqHi = eq[i].equity;
+      // Auto-bind interactions once
+      if (CHARTS.bindMainChartInteractions) {
+        try { CHARTS.bindMainChartInteractions(canvas); } catch(_) {}
       }
-      const pad = (eqHi - eqLo) * 0.1 || 1;
-      eqLo -= pad; eqHi += pad;
-      const zeroY = priceH - ((0 - eqLo) / (eqHi - eqLo)) * (priceH - 16) - 8;
-      ctx.strokeStyle = "rgba(255,255,255,0.06)";
-      ctx.beginPath(); ctx.moveTo(0, zeroY); ctx.lineTo(w, zeroY); ctx.stroke();
-      ctx.strokeStyle = "#4aa3ff";
-      ctx.lineWidth = 1.5;
-      ctx.beginPath();
-      for (let i = 0; i < eq.length; i++) {
-        const x = 8 + (i / (eq.length - 1)) * (w - 16);
-        const y = priceH - ((eq[i].equity - eqLo) / (eqHi - eqLo)) * (priceH - 16) - 8;
-        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-      }
-      ctx.stroke();
-      const grad = ctx.createLinearGradient(0, 0, 0, priceH);
-      grad.addColorStop(0, "rgba(74,163,255,0.3)");
-      grad.addColorStop(1, "rgba(74,163,255,0)");
-      ctx.fillStyle = grad;
-      ctx.lineTo(w - 8, priceH - 8);
-      ctx.lineTo(8, priceH - 8);
-      ctx.closePath();
-      ctx.fill();
-      ctx.fillStyle = "rgba(255,255,255,0.45)";
-      ctx.font = "9px system-ui, sans-serif";
-      ctx.fillText("Equity · " + eq.length + " " + (o.equityLabel || "points"), 8, 12);
-      return;
-    }
-
-    const padL = 8, padR = 54;
-    const plotW = w - padL - padR;
-    const byTime = new Map();
-    for (const raw of candles) {
-      if (!raw) continue;
-      let time = Number(raw.time);
-      const open = Number(raw.open), close = Number(raw.close);
-      if (!Number.isFinite(time) || !Number.isFinite(open) || !Number.isFinite(close) ||
-          open <= 0 || close <= 0 || open > 1e100 || close > 1e100) continue;
-      while (Math.abs(time) >= 1e14) time /= 1000;
-      if (Math.abs(time) < 1e11) time *= 1000;
-      time = Math.floor(time);
-      if (!Number.isFinite(time) || time <= 0 || time > 8640000000000000) continue;
-      const rawHigh = Number(raw.high), rawLow = Number(raw.low);
-      const validHigh = Number.isFinite(rawHigh) && rawHigh > 0 && rawHigh <= 1e100 ? rawHigh : open;
-      const validLow = Number.isFinite(rawLow) && rawLow > 0 && rawLow <= 1e100 ? rawLow : close;
-      const high = Math.max(validHigh, validLow, open, close);
-      const low = Math.min(validHigh, validLow, open, close);
-      const rawVolume = Number(raw.volume);
-      byTime.set(time, { time, open, high, low, close, volume: Number.isFinite(rawVolume) && rawVolume >= 0 ? Math.min(Number.MAX_VALUE, rawVolume) : 0 });
-    }
-    const normalized = Array.from(byTime.values()).sort((a, b) => a.time - b.time);
-    const requestedBars = Math.floor(Number(o.bars));
-    const barCount = Number.isFinite(requestedBars) && requestedBars >= 2 ? Math.min(500, requestedBars) : 100;
-    const view = normalized.slice(-barCount);
-    if (view.length < 2) {
-      ctx.fillStyle = "rgba(255,255,255,0.45)";
-      ctx.font = "11px system-ui, sans-serif";
-      ctx.textAlign = "center";
-      ctx.fillText("Waiting for valid broker candles…", w / 2, h / 2);
-      return;
-    }
-    let lo = Infinity, hi = -Infinity;
-    for (let i = 0; i < view.length; i++) {
-      lo = Math.min(lo, view[i].low);
-      hi = Math.max(hi, view[i].high);
-    }
-    const pad = (hi - lo) * 0.08 || 0.0001;
-    lo -= pad; hi += pad;
-    const yPrice = (p) => priceH - ((p - lo) / (hi - lo)) * (priceH - 10) - 5;
-    const bw = plotW / view.length;
-    const xFor = (i) => padL + (i + 0.5) * bw;
-
-    ctx.strokeStyle = "rgba(255,255,255,0.07)";
-    ctx.fillStyle = "rgba(255,255,255,0.5)";
-    ctx.font = "10px system-ui, sans-serif";
-    ctx.textAlign = "left";
-    ctx.lineWidth = 1;
-    const rows = 4;
-    for (let g = 0; g <= rows; g++) {
-      const p = lo + ((hi - lo) * g) / rows;
-      const y = yPrice(p);
-      ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(padL + plotW, y); ctx.stroke();
-      ctx.fillText(fmtPx(p), w - padR + 6, y + 3);
-    }
-
-    let emaFast = null, emaSlow = null;
-    if (self.CYBER_TA) {
-      const closes = view.map((c) => c.close);
-      emaFast = self.CYBER_TA.ema(closes, 8);
-      emaSlow = self.CYBER_TA.ema(closes, 21);
-    }
-    for (let i = 0; i < view.length; i++) {
-      const c = view[i];
-      const x = xFor(i);
-      const yH = yPrice(c.high), yL = yPrice(c.low);
-      const yO = yPrice(c.open), yC = yPrice(c.close);
-      const up = c.close >= c.open;
-      ctx.strokeStyle = up ? "#3dff9a" : "#ff5d7a";
-      ctx.fillStyle = up ? "#3dff9a" : "#ff5d7a";
-      ctx.beginPath(); ctx.moveTo(x, yH); ctx.lineTo(x, yL); ctx.stroke();
-      const top = Math.min(yO, yC);
-      const bh = Math.max(1, Math.abs(yC - yO));
-      ctx.fillRect(x - Math.max(1, bw * 0.32), top, Math.max(2, bw * 0.64), bh);
-    }
-    const drawLine = (arr, color) => {
-      if (!arr) return;
-      ctx.strokeStyle = color;
-      ctx.lineWidth = 1.2;
-      ctx.beginPath();
-      let started = false;
-      for (let i = 0; i < arr.length; i++) {
-        if (arr[i] == null) continue;
-        const x = xFor(i), y = yPrice(arr[i]);
-        if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
-      }
-      ctx.stroke();
-      ctx.lineWidth = 1;
-    };
-    drawLine(emaFast, "rgba(77,163,255,0.85)");
-    drawLine(emaSlow, "rgba(255,196,87,0.85)");
-
-    if (Array.isArray(o.markers) && o.markers.length) {
-      for (let mi = 0; mi < o.markers.length; mi++) {
-        const mk = o.markers[mi];
-        if (!mk || mk.time == null || mk.price == null || (mk.dir !== "CALL" && mk.dir !== "PUT")) continue;
-        let markerTime = Number(mk.time), markerPrice = Number(mk.price);
-        if (!Number.isFinite(markerTime) || !Number.isFinite(markerPrice) || markerPrice <= 0 || markerPrice > 1e100) continue;
-        while (Math.abs(markerTime) >= 1e14) markerTime /= 1000;
-        if (Math.abs(markerTime) < 1e11) markerTime *= 1000;
-        markerTime = Math.floor(markerTime);
-        if (markerTime <= 0 || markerTime > 8640000000000000) continue;
-        let idx = -1;
-        let lo2 = 0, hi2 = view.length - 1;
-        while (lo2 <= hi2) {
-          const mid = (lo2 + hi2) >> 1;
-          if (view[mid].time === markerTime) { idx = mid; break; }
-          if (view[mid].time < markerTime) lo2 = mid + 1; else hi2 = mid - 1;
+      CHARTS.drawMainChart(canvas, candles, mergedOpts);
+      // Update toolbar title/price badges if main chart
+      try {
+        if (canvas.id === "chart") {
+          const titleEl = document.getElementById("chart-title");
+          const priceEl = document.getElementById("chart-price-badge");
+          const changeEl = document.getElementById("chart-change-badge");
+          const infoRight = document.getElementById("chart-info-right");
+          const titleEl2 = document.getElementById("chart-title");
+          if (titleEl2) {
+            const assetName = (typeof activeAsset !== "undefined" && activeAsset) ? activeAsset : (opts.label || "—");
+            const tf = opts.timeframe || "1m";
+            titleEl2.textContent = assetName + " · " + tf + (opts.timeBasis ? " · " + opts.timeBasis : "");
+          }
+          if (priceEl && Array.isArray(candles) && candles.length) {
+            const last = candles[candles.length-1];
+            if (last && last.close != null) {
+              priceEl.textContent = (typeof fmtPx === "function" ? fmtPx(last.close) : String(last.close));
+              const prev = candles.length>1 ? candles[candles.length-2].close : last.open;
+              const isUp = last.close >= (last.open || prev);
+              priceEl.className = "chart-price " + (isUp ? "up" : "down");
+              if (changeEl) {
+                const ch = prev ? ((last.close - prev)/prev*100) : 0;
+                changeEl.textContent = (ch>=0?"+":"") + ch.toFixed(2) + "%";
+                changeEl.className = "chart-change " + (ch>=0 ? "up" : "down");
+              }
+            }
+          }
+          if (infoRight) {
+            const st = CHARTS.getState ? CHARTS.getState(canvas) : null;
+            if (st && st._lastPlot) {
+              infoRight.textContent = `${st._lastPlot.view.length} visible · ${st.visibleBars} window · ${st.scrollOffset>0?st.scrollOffset+" scrolled":"latest"}`;
+            }
+          }
         }
-        if (idx < 0) {
-          const insertion = lo2;
-          const left = insertion > 0 ? insertion - 1 : -1;
-          const right = insertion < view.length ? insertion : -1;
-          if (left >= 0 && right >= 0) idx = markerTime - view[left].time <= view[right].time - markerTime ? left : right;
-          else idx = left >= 0 ? left : right;
-          const typicalGap = view.length > 1 ? Math.max(1, view[view.length - 1].time - view[view.length - 2].time) : 60000;
-          if (idx < 0 || Math.abs(view[idx].time - markerTime) > typicalGap) continue;
-        }
-        const mx = xFor(idx);
-        const my = yPrice(markerPrice);
-        if (!Number.isFinite(my) || my < -12 || my > priceH + 12) continue;
-        const s = 7;
-        ctx.fillStyle = mk.dir === "PUT" ? "#ff5d7a" : "#3dff9a";
-        ctx.beginPath();
-        if (mk.dir === "PUT") {
-          ctx.moveTo(mx, my - 5);
-          ctx.lineTo(mx - s, my - 5 - s);
-          ctx.lineTo(mx + s, my - 5 - s);
-        } else {
-          ctx.moveTo(mx, my + 5);
-          ctx.lineTo(mx - s, my + 5 + s);
-          ctx.lineTo(mx + s, my + 5 + s);
-        }
-        ctx.closePath();
-        ctx.fill();
-      }
+      } catch(_) {}
+    } else {
+      // Fallback: simple text
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+      ctx.fillStyle="#0c1422"; ctx.fillRect(0,0,canvas.width,canvas.height);
     }
-
-    const lastC = view[view.length - 1].close;
-    const lastY = yPrice(lastC);
-    ctx.setLineDash([4, 4]);
-    ctx.strokeStyle = "rgba(255,255,255,0.35)";
-    ctx.beginPath(); ctx.moveTo(padL, lastY); ctx.lineTo(padL + plotW, lastY); ctx.stroke();
-    ctx.setLineDash([]);
-    ctx.fillStyle = lastC >= view[0].open ? "#3dff9a" : "#ff5d7a";
-    ctx.fillRect(w - padR - 42, lastY - 8, 44, 15);
-    ctx.fillStyle = "#0c1422";
-    ctx.font = "bold 9px system-ui, sans-serif";
-    ctx.textAlign = "center";
-    ctx.fillText(fmtPx(lastC), w - padR - 20, lastY + 3);
-    ctx.textAlign = "left";
-
-    ctx.strokeStyle = "rgba(255,255,255,0.07)";
-    ctx.beginPath(); ctx.moveTo(padL, priceH + 0.5); ctx.lineTo(padL + plotW, priceH + 0.5); ctx.stroke();
-    ctx.fillStyle = "rgba(255,255,255,0.45)";
-    ctx.font = "9px system-ui, sans-serif";
-    const labelEvery = Math.max(1, Math.floor(view.length / 6));
-    // The Quotex platform charts in UTC. Labelling the same epochs in the
-    // machine's local zone shifted every candle by the UTC offset, so the
-    // dashboard never lined up with the broker chart side by side.
-    const useUtc = o.timeBasis !== "local";
-    // The time axis owns the dedicated strip at the very bottom of the canvas.
-    // Drawing it at priceH + 12 put it inside the top of the MACD pane, where
-    // it collided with the "MACD 12/26/9" legend and left timeAxisH blank.
-    const axisBaseline = priceH + macdH + Math.round(timeAxisH * 0.72);
-    for (let i = 0; i < view.length; i += labelEvery) {
-      ctx.fillText(axisTimeLabel(view[i].time, useUtc), xFor(i), axisBaseline);
-    }
-
-    if (useMacd && self.CYBER_TA) {
-      const m = self.CYBER_TA.macd(view.map((c) => c.close), 12, 26, 9);
-      let mMax = 1e-9;
-      for (let i = 0; i < m.hist.length; i++) {
-        for (const v of [m.hist[i], m.line[i], m.signal[i]]) {
-          if (v != null && Math.abs(v) > mMax) mMax = Math.abs(v);
-        }
-      }
-      const y0 = priceH + 4 + macdH / 2;
-      const yMacd = (v) => y0 - ((v || 0) / mMax) * (macdH / 2 - 5);
-      ctx.strokeStyle = "rgba(255,255,255,0.12)";
-      ctx.beginPath(); ctx.moveTo(padL, y0); ctx.lineTo(padL + plotW, y0); ctx.stroke();
-      const mw = plotW / view.length;
-      for (let i = 0; i < m.hist.length; i++) {
-        if (m.hist[i] == null) continue;
-        const x = xFor(i);
-        const v = m.hist[i];
-        ctx.fillStyle = v >= 0 ? "rgba(61,255,154,0.85)" : "rgba(255,93,122,0.85)";
-        ctx.fillRect(x - Math.max(1, mw * 0.28), Math.min(y0, yMacd(v)), Math.max(2, mw * 0.56), Math.max(1, Math.abs(y0 - yMacd(v))));
-      }
-      const drawMacdLine = (arr, color) => {
-        if (!arr) return;
-        ctx.strokeStyle = color;
-        ctx.lineWidth = 1.2;
-        ctx.beginPath();
-        let started = false;
-        for (let i = 0; i < arr.length; i++) {
-          if (arr[i] == null) continue;
-          const x = xFor(i);
-          const y = yMacd(arr[i]);
-          if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
-        }
-        ctx.stroke();
-        ctx.lineWidth = 1;
-      };
-      drawMacdLine(m.line, "#4aa3ff");
-      drawMacdLine(m.signal, "#ffc457");
-      ctx.fillStyle = "rgba(255,255,255,0.45)";
-      ctx.font = "9px system-ui, sans-serif";
-      ctx.fillText("MACD 12/26/9", padL + 4, priceH + 14);
-    }
-
-    ctx.fillStyle = "rgba(255,255,255,0.35)";
-    ctx.font = "9px system-ui, sans-serif";
-    const newestLabel = view.length ? axisTimeLabel(view[view.length - 1].time, o.timeBasis !== "local") : "";
-    ctx.fillText("CYBER BINARY · " + (o.label || o.timeframe || "1m") + " · " + view.length + " bars" +
-      (newestLabel ? " · last " + newestLabel + " UTC" : ""), padL + 4, 12);
   }
 
   /* ---------- tab routing ---------- */
@@ -1562,6 +1349,13 @@
   let btAllTrades = [];
 
   function drawEquityWithDrawdown(canvas, equity) {
+    const CH = self.CYBER_CHARTS || null;
+    if (CH && CH.drawEquityChart) {
+      // Try to pass trades if available
+      const trades = (typeof btAllTrades !== "undefined" && btAllTrades) ? btAllTrades : null;
+      CH.drawEquityChart(canvas, equity, { trades });
+      return;
+    }
     if (!canvas) return;
     const parent = canvas.parentElement;
     const w = Math.max(180, Math.min(4096, (parent && parent.clientWidth) || window.innerWidth || 800));
@@ -1601,13 +1395,9 @@
     const yEq = (v) => priceH - ((v - lo) / (hi - lo)) * (priceH - 16) - 8;
     const yDD = (v) => priceH + 8 + ddH - (v / maxDD) * (ddH - 8) - 4;
     const xFor = (i) => 8 + (i / (eq.length - 1)) * (w - 16);
-
-    // Zero line
     const zeroY = yEq(0);
     ctx.strokeStyle = "rgba(255,255,255,0.08)";
     ctx.beginPath(); ctx.moveTo(0, zeroY); ctx.lineTo(w, zeroY); ctx.stroke();
-
-    // Equity line
     ctx.strokeStyle = "#4aa3ff";
     ctx.lineWidth = 1.5;
     ctx.beginPath();
@@ -1624,8 +1414,6 @@
     ctx.lineTo(8, priceH - 8);
     ctx.closePath();
     ctx.fill();
-
-    // Drawdown area (red)
     ctx.fillStyle = "rgba(255,93,122,0.25)";
     ctx.beginPath();
     ctx.moveTo(xFor(0), yDD(0));
@@ -1643,7 +1431,6 @@
       if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
     }
     ctx.stroke();
-
     ctx.fillStyle = "rgba(255,255,255,0.5)";
     ctx.font = "9px system-ui, sans-serif";
     ctx.textAlign = "left";
@@ -1903,49 +1690,54 @@
     if ($("bt-monte-pos")) $("bt-monte-pos").textContent = fmtPct(mc.positiveRate);
     if ($("bt-monte-dd")) $("bt-monte-dd").textContent = (mc.avgDD||0).toFixed(2);
 
-    // Draw distribution
+    // Draw distribution via enhanced library
     const canvas = $("bt-monte-chart");
-    if (!canvas || !mc.results || !mc.results.length) return;
-    const w = Math.max(180, Math.min(4096, (canvas.parentElement && canvas.parentElement.clientWidth) || 800));
-    const h = Math.max(120, Math.round(w * 0.22));
-    const dpr = Math.max(1, Math.min(2, Number(window.devicePixelRatio)||1));
-    canvas.width = Math.floor(w * dpr);
-    canvas.height = Math.floor(h * dpr);
-    canvas.style.width = w + "px";
-    canvas.style.height = h + "px";
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0,0,w,h);
-    ctx.fillStyle = "#0c1422";
-    ctx.fillRect(0,0,w,h);
-    const vals = mc.results.map(r=>r.finalPnL).sort((a,b)=>a-b);
-    const lo = vals[0], hi = vals[vals.length-1];
-    const range = hi - lo || 1;
-    // Histogram
-    const bins = 40;
-    const counts = new Array(bins).fill(0);
-    for (const v of vals) {
-      const idx = Math.min(bins-1, Math.max(0, Math.floor((v - lo)/range * bins)));
-      counts[idx]++;
+    if (!canvas) return;
+    const CH = self.CYBER_CHARTS || null;
+    if (CH && CH.drawMonteCarloChart) {
+      CH.drawMonteCarloChart(canvas, mc.results, {});
+    } else {
+      // fallback simple
+      const w = Math.max(180, Math.min(4096, (canvas.parentElement && canvas.parentElement.clientWidth) || 800));
+      const h = Math.max(120, Math.round(w * 0.22));
+      const dpr = Math.max(1, Math.min(2, Number(window.devicePixelRatio)||1));
+      canvas.width = Math.floor(w * dpr);
+      canvas.height = Math.floor(h * dpr);
+      canvas.style.width = w + "px";
+      canvas.style.height = h + "px";
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0,0,w,h);
+      ctx.fillStyle = "#0c1422";
+      ctx.fillRect(0,0,w,h);
+      const vals = mc.results.map(r=>r.finalPnL).sort((a,b)=>a-b);
+      const lo = vals[0], hi = vals[vals.length-1];
+      const range = hi - lo || 1;
+      const bins = 40;
+      const counts = new Array(bins).fill(0);
+      for (const v of vals) {
+        const idx = Math.min(bins-1, Math.max(0, Math.floor((v - lo)/range * bins)));
+        counts[idx]++;
+      }
+      const maxC = Math.max(...counts) || 1;
+      const padL = 40, padR = 10, padT = 10, padB = 20;
+      const plotW = w - padL - padR, plotH = h - padT - padB;
+      ctx.fillStyle = "rgba(74,163,255,0.6)";
+      for (let i = 0; i < bins; i++) {
+        const x = padL + (i / bins) * plotW;
+        const bw = plotW / bins * 0.8;
+        const bh = (counts[i] / maxC) * plotH;
+        ctx.fillRect(x, padT + plotH - bh, bw, bh);
+      }
+      ctx.fillStyle = "rgba(255,255,255,0.5)";
+      ctx.font = "9px system-ui, sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText(lo.toFixed(1), padL, h - 2);
+      ctx.fillText(hi.toFixed(1), padL + plotW, h - 2);
+      ctx.textAlign = "left";
+      ctx.fillText("P&L distribution (" + mc.simulations + " sims)", 8, 12);
     }
-    const maxC = Math.max(...counts) || 1;
-    const padL = 40, padR = 10, padT = 10, padB = 20;
-    const plotW = w - padL - padR, plotH = h - padT - padB;
-    ctx.fillStyle = "rgba(74,163,255,0.6)";
-    for (let i = 0; i < bins; i++) {
-      const x = padL + (i / bins) * plotW;
-      const bw = plotW / bins * 0.8;
-      const bh = (counts[i] / maxC) * plotH;
-      ctx.fillRect(x, padT + plotH - bh, bw, bh);
-    }
-    ctx.fillStyle = "rgba(255,255,255,0.5)";
-    ctx.font = "9px system-ui, sans-serif";
-    ctx.textAlign = "center";
-    ctx.fillText(lo.toFixed(1), padL, h - 2);
-    ctx.fillText(hi.toFixed(1), padL + plotW, h - 2);
-    ctx.textAlign = "left";
-    ctx.fillText("P&L distribution (" + mc.simulations + " sims)", 8, 12);
   }
 
   function activateBtTab(name) {
@@ -2612,6 +2404,105 @@
   }
 
   /* ---------- bootstrap ---------- */
+
+  /* ---------- pro chart toolbar ---------- */
+  function bindProChartToolbar() {
+    const CH = self.CYBER_CHARTS || null;
+    if (!CH) return;
+    const canvas = $("chart");
+    if (!canvas) return;
+    const state = CH.getState ? CH.getState(canvas) : null;
+    if (!state) return;
+
+    // Chart type buttons
+    document.querySelectorAll("[data-chart-type]").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const type = btn.dataset.chartType;
+        if (!type) return;
+        state.chartType = type;
+        document.querySelectorAll("[data-chart-type]").forEach(b => b.classList.toggle("active", b===btn));
+        if (state._lastNormalized) CH.drawMainChart(canvas, state._lastNormalized, {});
+      });
+    });
+
+    const bindCheck = (id, key) => {
+      const el = $(id);
+      if (!el) return;
+      el.addEventListener("change", () => {
+        state[key] = el.checked;
+        if (state._lastNormalized) CH.drawMainChart(canvas, state._lastNormalized, {});
+      });
+    };
+    bindCheck("chart-ema", "showEMA");
+    bindCheck("chart-bb", "showBB");
+    bindCheck("chart-vol", "showVolume");
+    bindCheck("chart-macd", "showMACD");
+    bindCheck("chart-rsi", "showRSI");
+
+    const resetBtn = $("chart-reset");
+    if (resetBtn) resetBtn.addEventListener("click", () => {
+      state.visibleBars = 120;
+      state.scrollOffset = 0;
+      state.crosshair = null;
+      if (state._lastNormalized) CH.drawMainChart(canvas, state._lastNormalized, {});
+    });
+
+    const exportBtn = $("chart-export");
+    if (exportBtn) exportBtn.addEventListener("click", () => {
+      if (CH.exportCanvasPNG) CH.exportCanvasPNG(canvas, "cyber-binary-" + (activeAsset||"chart") + "-" + new Date().toISOString().slice(0,10) + ".png");
+    });
+
+    const fsBtn = $("chart-fullscreen");
+    const wrap = $("main-chart-wrap");
+    if (fsBtn && wrap) {
+      fsBtn.addEventListener("click", () => {
+        const isFs = wrap.classList.contains("fullscreen");
+        if (isFs) {
+          wrap.classList.remove("fullscreen");
+          fsBtn.textContent = "⛶";
+          if (document.exitFullscreen) document.exitFullscreen().catch(()=>{});
+        } else {
+          wrap.classList.add("fullscreen");
+          fsBtn.textContent = "✕";
+          // try native fullscreen
+          if (wrap.requestFullscreen) wrap.requestFullscreen().catch(()=>{});
+        }
+        setTimeout(() => {
+          if (state._lastNormalized) CH.drawMainChart(canvas, state._lastNormalized, {});
+        }, 100);
+      });
+      document.addEventListener("fullscreenchange", () => {
+        if (!document.fullscreenElement) {
+          wrap.classList.remove("fullscreen");
+          if (fsBtn) fsBtn.textContent = "⛶";
+          setTimeout(() => { if (state._lastNormalized) CH.drawMainChart(canvas, state._lastNormalized, {}); }, 100);
+        }
+      });
+    }
+
+    // Equity export
+    const eqExport = $("bt-equity-export");
+    if (eqExport) eqExport.addEventListener("click", () => {
+      const c = $("bt-equity");
+      if (c && CH.exportCanvasPNG) CH.exportCanvasPNG(c, "cyber-binary-equity-" + new Date().toISOString().slice(0,10) + ".png");
+    });
+    const eqFs = $("bt-equity-fullscreen");
+    const eqWrap = $("bt-equity-wrap");
+    if (eqFs && eqWrap) {
+      eqFs.addEventListener("click", () => {
+        const isFs = eqWrap.classList.contains("fullscreen");
+        if (isFs) { eqWrap.classList.remove("fullscreen"); eqFs.textContent="⛶"; if (document.exitFullscreen) document.exitFullscreen().catch(()=>{}); }
+        else { eqWrap.classList.add("fullscreen"); eqFs.textContent="✕"; if (eqWrap.requestFullscreen) eqWrap.requestFullscreen().catch(()=>{}); }
+      });
+    }
+
+    const monteExport = $("bt-monte-export");
+    if (monteExport) monteExport.addEventListener("click", () => {
+      const c = $("bt-monte-chart");
+      if (c && CH.exportCanvasPNG) CH.exportCanvasPNG(c, "cyber-binary-monte-" + new Date().toISOString().slice(0,10) + ".png");
+    });
+  }
+
   function scale() {
     const w = window.innerWidth;
     document.documentElement.style.fontSize = Math.max(12, Math.min(17, w / 32)) + "px";
@@ -2653,6 +2544,7 @@
   bindHistoryTab();
   bindAssetsTab();
   bindSettingsTab();
+  bindProChartToolbar();
   loadAutoSettings();
   scale();
   paintBuildStamp();
