@@ -351,15 +351,70 @@
       return before - candles.length;
     }
 
+    function detectGaps() {
+      if (candles.length < 2) return [];
+      const gaps = [];
+      for (let i = 1; i < candles.length; i++) {
+        const prev = candles[i-1], cur = candles[i];
+        if (!prev || !cur) continue;
+        const diff = cur.time - prev.time;
+        if (diff > tf * 1.5) {
+          const missing = Math.round(diff / tf) - 1;
+          if (missing > 0 && missing <= 1000) {
+            gaps.push({ from: prev.time + tf, to: cur.time - tf, missing, after: prev.time, before: cur.time });
+          }
+        }
+      }
+      // Also check gap between last closed and current
+      if (current && candles.length) {
+        const lastClosed = candles[candles.length-1];
+        const diff = current.time - lastClosed.time;
+        if (diff > tf * 1.5) {
+          const missing = Math.round(diff / tf) - 1;
+          if (missing > 0 && missing <= 1000) {
+            gaps.push({ from: lastClosed.time + tf, to: current.time - tf, missing, after: lastClosed.time, before: current.time, liveGap: true });
+          }
+        }
+      }
+      return gaps;
+    }
+
+    function getContinuity() {
+      if (candles.length < 2) return 1;
+      const gaps = detectGaps();
+      const totalMissing = gaps.reduce((s,g)=>s+(g.missing||0),0);
+      const total = candles.length + totalMissing;
+      return total > 0 ? Math.max(0, Math.min(1, candles.length / total)) : 1;
+    }
+
+    function validateSeries() {
+      if (!candles.length) return { valid: true, issues: [] };
+      const issues = [];
+      for (let i = 0; i < candles.length; i++) {
+        const c = candles[i];
+        if (!c || typeof c !== "object") { issues.push({ idx: i, issue: "invalid object" }); continue; }
+        if (!Number.isSafeInteger(c.time) || c.time < 0) issues.push({ idx: i, issue: "bad time" });
+        if (!(c.open > 0 && c.high > 0 && c.low > 0 && c.close > 0)) issues.push({ idx: i, time: c.time, issue: "bad OHLC" });
+        if (c.high < Math.max(c.open, c.close) - 1e-9) issues.push({ idx: i, time: c.time, issue: "high too low" });
+        if (c.low > Math.min(c.open, c.close) + 1e-9) issues.push({ idx: i, time: c.time, issue: "low too high" });
+      }
+      // Check ordering
+      for (let i = 1; i < candles.length; i++) {
+        if (candles[i].time <= candles[i-1].time) issues.push({ idx: i, issue: "out of order", time: candles[i].time });
+      }
+      return { valid: issues.length === 0, issues: issues.slice(0, 20), count: candles.length };
+    }
+
     return {
       ingest, canIngest, ingestCandle, mergeCandles, series, seedHistory, setSeries, rebase,
-      replaceCandles, forceClose, pruneBefore,
+      replaceCandles, forceClose, pruneBefore, detectGaps, getContinuity, validateSeries,
       lastPrice: () => last,
       hasCurrent: () => !!current,
       reset: () => { candles = []; current = null; last = null; lastBrokerTime = null; },
       size: () => candles.length + (current ? 1 : 0),
       lastBrokerTime: () => lastBrokerTime,
       bucket,
+      get tfMs() { return tf; }
     };
   }
 
