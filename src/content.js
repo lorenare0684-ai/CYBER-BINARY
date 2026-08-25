@@ -48,6 +48,52 @@
   // never silently change the signal clock or expiry math.
   const ENGINE_TIMEFRAME_SEC = 60;
 
+  // ---- broker clock ----
+  // Quotex server time is the source of truth for candle boundaries and
+  // expiry math. Local Date.now() can drift by seconds to minutes (system
+  // clock, sleep, VM). We track the last broker timestamp seen and keep an
+  // offset so getBrokerNow() returns broker-aligned time even between ticks.
+  let brokerNow = null;      // last known broker epoch ms
+  let brokerLocalAt = 0;     // local Date.now() when brokerNow was set
+  let brokerOffset = 0;      // brokerNow - brokerLocalAt
+
+  function updateBrokerClock(brokerMs) {
+    const ms = Number(brokerMs);
+    if (!Number.isSafeInteger(ms) || ms < 946684800000) return;
+    // Reject far-future garbage (>2 days ahead of local)
+    if (ms > Date.now() + 2 * 86400000) return;
+    // Only move forward unless the jump is small (<5 min backward is allowed
+    // for out-of-order batches)
+    if (brokerNow != null && ms < brokerNow - 5 * 60000) return;
+    if (brokerNow == null || ms > brokerNow) {
+      brokerNow = ms;
+      brokerLocalAt = Date.now();
+      brokerOffset = brokerNow - brokerLocalAt;
+    } else if (ms === brokerNow) {
+      // Same bucket, refresh local reference to reduce drift
+      brokerLocalAt = Date.now();
+      brokerOffset = brokerNow - brokerLocalAt;
+    }
+  }
+
+  function getBrokerNow() {
+    const nowLocal = Date.now();
+    if (brokerNow != null) {
+      const elapsed = nowLocal - brokerLocalAt;
+      if (elapsed >= 0 && elapsed <= 60000) {
+        return brokerNow + elapsed;
+      }
+      // After 60s without broker tick, use offset estimate
+      return nowLocal + brokerOffset;
+    }
+    return nowLocal;
+  }
+
+  function brokerBucket(ms, periodMs) {
+    const p = Number(periodMs) || TF_MS;
+    return Math.floor(ms / p) * p;
+  }
+
   function marketSession(ts, assetId) {
     const id = String(assetId || "").toUpperCase();
     if (/_OTC$/.test(id) || /CRYPTO|BTC|ETH|XRP|SOL|DOGE/.test(id)) return "otc-24h";
@@ -241,8 +287,11 @@
     const lastChartBar = chart && Array.isArray(chart.candles) && chart.candles.length ? chart.candles[chart.candles.length - 1] : null;
     const basePrice = (assetId === activeAsset && lastWsPrice) || (lastChartBar && lastChartBar.close) || lastDomPriceByAsset[assetId] || a.basePrice || 1.0;
     const profile = Object.assign({}, a, { basePrice });
+    // Use broker clock for synthetic seed alignment when available, so the
+    // warm-up series lands on the same minute boundaries as broker history.
+    const seedBase = getBrokerNow();
     f.setSeries(self.CYBER_FEED.syntheticSeries(profile, 120, {
-      startTime: Math.floor(Date.now() / TF_MS) * TF_MS - 120 * TF_MS,
+      startTime: Math.floor(seedBase / TF_MS) * TF_MS - 120 * TF_MS,
     }));
     return f;
   }
@@ -980,11 +1029,20 @@
   function mergeChartCandles(assetId, period, incoming) {
     const rawPeriod = Number(period);
     const p = Number.isFinite(rawPeriod) && rawPeriod > 0 ? Math.min(86400, Math.floor(rawPeriod)) : 60;
+    const periodMs = p * 1000;
     const byPeriod = chartHistory[assetId] || (chartHistory[assetId] = Object.create(null));
     const prev = byPeriod[p] && Array.isArray(byPeriod[p].candles) ? byPeriod[p].candles : [];
     const map = Object.create(null);
-    for (const c of prev) if (c && Number.isFinite(Number(c.time))) map[Number(c.time)] = c;
-    for (const c of incoming || []) if (c && Number.isFinite(Number(c.time))) map[Number(c.time)] = c;
+    for (const c of prev) {
+      if (!c || !Number.isFinite(Number(c.time))) continue;
+      const t = brokerBucket(Number(c.time), periodMs);
+      map[t] = Object.assign({}, c, { time: t });
+    }
+    for (const c of incoming || []) {
+      if (!c || !Number.isFinite(Number(c.time))) continue;
+      const t = brokerBucket(Number(c.time), periodMs);
+      map[t] = Object.assign({}, c, { time: t });
+    }
     const times = Object.keys(map).map(Number).sort((a, b) => a - b).slice(-400);
     const merged = times.map((t) => map[t]);
     byPeriod[p] = { period: p, candles: merged, ts: Date.now() };
@@ -1044,11 +1102,26 @@
     if (!Number.isSafeInteger(liveTime) || liveTime <= 0) return bars;
     const lastIdx = bars.length - 1;
     const lastTime = Number(bars[lastIdx] && bars[lastIdx].time);
-    if (!Number.isSafeInteger(lastTime) || liveTime <= lastTime) return bars;
-    // v2.7.1: only append if the live bar is strictly newer. Never modify
-    // the broker's existing candles — they are the source of truth for the
-    // dashboard chart. Modifying them caused the "dashboard doesn't match
-    // Quotex" issue.
+    if (!Number.isSafeInteger(lastTime)) return bars;
+    if (liveTime < lastTime) return bars;
+    if (liveTime === lastTime) {
+      // Same bucket: merge live aggregation into broker's forming candle.
+      // The broker history for the forming bar is stale between WS updates;
+      // our resampled 1m live bar has fresher high/low/close from ticks.
+      const last = bars[lastIdx];
+      if (!last || typeof last !== "object") return bars;
+      const merged = Object.assign({}, last, {
+        high: Math.max(Number(last.high) || 0, Number(liveBar.high) || 0),
+        low: Math.min(Number(last.low) || Number.MAX_VALUE, Number(liveBar.low) || Number.MAX_VALUE),
+        close: Number.isFinite(Number(liveBar.close)) ? Number(liveBar.close) : last.close,
+        volume: Math.max(Number(last.volume) || 0, Number(liveBar.volume) || 0),
+      });
+      // Guard low against NaN when both are 0
+      if (!Number.isFinite(merged.low) || merged.low <= 0) merged.low = Math.min(last.low, liveBar.low);
+      const out = bars.slice();
+      out[lastIdx] = merged;
+      return out;
+    }
     return bars.concat([liveBar]);
   }
 
@@ -1094,6 +1167,7 @@
     const feed = createFeedFor(id);
     const rawPeriod = Number(period);
     const safePeriod = Number.isFinite(rawPeriod) && rawPeriod > 0 ? Math.min(86400, Math.floor(rawPeriod)) : 60;
+    const periodMs = safePeriod * 1000;
     const real = [];
     const limit = Math.min(candles.length, 6000);
     const firstTime = Number(candles[0] && candles[0].time);
@@ -1105,10 +1179,16 @@
       if (!c || typeof c !== "object" || Array.isArray(c)) continue;
       const rawTime = Number(c.time), open = Number(c.open), close = Number(c.close);
       const rawHigh = Number(c.high), rawLow = Number(c.low);
-      const time = Math.abs(rawTime) >= 1e14 ? Math.floor(rawTime / 1000)
+      let time = Math.abs(rawTime) >= 1e14 ? Math.floor(rawTime / 1000)
         : Math.abs(rawTime) >= 1e11 ? Math.floor(rawTime) : Math.floor(rawTime * 1000);
+      // Bucket to period boundary to match Quotex UTC alignment.
+      // Broker candles are already aligned, but flooring ensures ticks and
+      // history share the same slot even if ms offsets appear.
+      time = brokerBucket(time, periodMs);
+      const brokerNowEst = getBrokerNow();
       if (![time, open, close, rawHigh, rawLow].every(Number.isFinite) ||
-          time < 946684800000 || time > Date.now() + 86400000 ||
+          time < 946684800000 || time > brokerNowEst + 86400000 ||
+          time > Date.now() + 2 * 86400000 ||
           open <= 0 || close <= 0 || rawHigh <= 0 || rawLow <= 0 ||
           Math.max(open, close, rawHigh, rawLow) > 1e12) continue;
       const rawVolume = Number(c.volume);
@@ -1121,6 +1201,9 @@
     }
     if (!real.length) return;
     real.sort((a, b) => a.time - b.time);
+    // Update broker clock from newest candle (open + period = approx now)
+    const newestTime = real[real.length - 1].time;
+    updateBrokerClock(newestTime + periodMs);
 
     // The engine runs on 1m bars; accept 60s history directly and build 1m
     // from ticks for everything else (the chart shows the broker timeframe).
@@ -1166,10 +1249,9 @@
     // minutes after an asset switch.
     if (useForEngine && feed.series().length >= 20) realHistoryReady[id] = true;
     const newestRealTime = real[real.length - 1].time;
-    // v2.6.5: the upper bound tolerates broker-server clock skew (old bound
-    // was +1 minute, which made "live" detection fail whenever the server
-    // clock ran ahead of the user's PC).
-    if (useForEngine && newestRealTime >= Date.now() - 2 * TF_MS && newestRealTime <= Date.now() + 86400000) {
+    // Use broker clock for freshness check — Date.now() may be off by minutes.
+    const brokerNowForCheck = getBrokerNow();
+    if (useForEngine && newestRealTime >= brokerNowForCheck - 2 * TF_MS && newestRealTime <= brokerNowForCheck + 86400000) {
       lastAcceptedQuoteAt[id] = Date.now();
     }
     // Merge incremental batches instead of replacing the dashboard series
@@ -1234,7 +1316,7 @@
   }
 
   function confirmationLifecycle(data) {
-    const receivedAt = Date.now();
+    const receivedAt = getBrokerNow();
     const rawOpen = Number(data && data.openTime);
     const openTime = Number.isSafeInteger(rawOpen) && rawOpen >= receivedAt - 86400000 && rawOpen <= receivedAt + 86400000
       ? rawOpen : receivedAt;
@@ -1251,7 +1333,7 @@
     // close is counted once per open tab and races whole automation snapshots.
     if (!isPrimaryContext || !autoController || !order || order.kind !== "closed" || !order.data) return false;
     const data = order.data;
-    const now = Date.now();
+    const now = getBrokerNow();
     const closeTime = Number(data.closeTime);
     const currentDate = new Date(now);
     const dayStart = Date.UTC(currentDate.getUTCFullYear(), currentDate.getUTCMonth(), currentDate.getUTCDate());
@@ -1463,8 +1545,9 @@
     const authoritativeMain = !!lastWsSymbol && !!QUOTEX &&
       QUOTEX.normalizeSymbol(activeAsset) === QUOTEX.normalizeSymbol(lastWsSymbol);
     const closedAt = closed && Number(closed.time) + TF_MS;
-    const liveClosedBar = Number.isFinite(closedAt) && closedAt <= Date.now() + TF_MS &&
-      Date.now() - closedAt <= 10 * TF_MS;
+    const brokerNowCheck = getBrokerNow();
+    const liveClosedBar = Number.isFinite(closedAt) && closedAt <= brokerNowCheck + TF_MS &&
+      brokerNowCheck - closedAt <= 10 * TF_MS;
     if (isPrimaryContext && authoritativeMain && realHistoryReady[activeAsset] && liveClosedBar &&
         sig && sig.ready && sig.direction !== "WAIT" && closed && a.length >= 2 && !pendingByAsset[activeAsset]) {
       const key = String(closed.time);
@@ -1735,18 +1818,32 @@
     // WebSocket quotes and broker OHLC remain authoritative.
     if (source === "dom" && historySeeded[targetAsset] && relativeMove > 0.02) return false;
 
-    let ts = tickTime == null ? Date.now() : Number(tickTime);
-    if (!Number.isFinite(ts)) return false;
-    while (Math.abs(ts) >= 1e14) ts /= 1000;
-    if (Math.abs(ts) < 1e11) ts *= 1000;
-    ts = Math.floor(ts);
-    // v2.6.10: history batches tolerate 24h of server clock skew, but a LIVE
-    // quote running ahead by more than 10 minutes is a glitch: accepting it
-    // would open a far-future bucket that swallows every subsequent real
-    // tick (canIngest rejects t < current.time forever). 10 minutes covers
-    // any realistic broker-vs-client drift on a real-time stream.
-    if (!Number.isSafeInteger(ts) || ts < Date.now() - 7 * 86400000 || ts > Date.now() + 600000 ||
-        (typeof targetFeed.canIngest === "function" && !targetFeed.canIngest(ts))) return false;
+    let ts;
+    const isBrokerTick = source === "websocket" && tickTime != null;
+    if (tickTime == null) {
+      ts = getBrokerNow();
+    } else {
+      let parsed = Number(tickTime);
+      if (!Number.isFinite(parsed)) return false;
+      while (Math.abs(parsed) >= 1e14) parsed /= 1000;
+      if (Math.abs(parsed) < 1e11) parsed *= 1000;
+      ts = Math.floor(parsed);
+    }
+    if (!Number.isSafeInteger(ts) || ts < 946684800000) return false;
+    // Validate against broker clock, not local clock. Local may be minutes off.
+    const brokerNowEst = getBrokerNow();
+    // Past: 7 days behind broker
+    if (ts < brokerNowEst - 7 * 86400000) return false;
+    // Future: 10 min ahead of broker, or 2 days ahead of local (garbage)
+    if (ts > brokerNowEst + 600000) {
+      // Allow small skew if broker clock hasn't been set yet
+      if (brokerNow != null || ts > Date.now() + 600000) return false;
+    }
+    if (ts > Date.now() + 2 * 86400000) return false;
+    if (typeof targetFeed.canIngest === "function" && !targetFeed.canIngest(ts)) return false;
+
+    // Update broker clock from validated broker ticks only
+    if (isBrokerTick) updateBrokerClock(ts);
 
     // Before genuine 1m history is available the feed contains a synthetic
     // indicator warm-up. Align that warm-up to the first valid real quote (and
@@ -1874,11 +1971,14 @@
   function tick() {
     const det = syncActiveAsset();
     const currentTime = Date.now();
+    const brokerTime = getBrokerNow();
     // A wall-clock close is valid only while real quote input is fresh. After
     // a disconnect, repeatedly closing bars at an old price fabricates candle
     // outcomes and can settle expiries without a broker quote.
+    // Use broker time for bar close, but freshness check uses local time
+    // since lastAcceptedQuoteAt is local.
     if (currentTime - (lastAcceptedQuoteAt[activeAsset] || 0) <= 15000) {
-      const ev = activeFeed.forceClose(currentTime);
+      const ev = activeFeed.forceClose(brokerTime);
       settleFeedEvent(ev, activeAsset);
     }
     // Real WS ticks are ingested by the message router with their broker
@@ -1888,7 +1988,7 @@
       const p = findPrice();
       if (p && p !== lastDomPriceByAsset[activeAsset]) {
         lastDomPriceByAsset[activeAsset] = p;
-        ingest(p, det && det.id, currentTime, "dom");
+        ingest(p, det && det.id, brokerTime, "dom");
       }
     }
     maybeSignal();
@@ -2274,6 +2374,9 @@
             // false (live), the opposite of the safe default.
             isDemo: orderArgs.isDemo !== false,
             optionType: orderArgs.optionType,
+            // Use broker clock for expiry math so Quotex and extension agree
+            // on the absolute expiry epoch even if local clock drifts.
+            nowMs: getBrokerNow(),
           },
         }, "*");
       } catch (e) {
@@ -2310,7 +2413,7 @@
         return { ok: false, confirmed: false, sent: true, requestId,
           error: "broker confirmation did not match the requested asset/direction/amount" };
       }
-      confirmed.expiryTime = confirmed.expiryTime || (confirmed.openTime || Date.now()) + orderArgs.expirySec * 1000;
+      confirmed.expiryTime = confirmed.expiryTime || (confirmed.openTime || getBrokerNow()) + orderArgs.expirySec * 1000;
       confirmed.expiry = orderArgs.expirySec;
       confirmed.requestId = requestId;
     }
@@ -2426,7 +2529,7 @@
     const confirmed = await domConfirmation;
     if (confirmed && confirmed.ok) {
       confirmed.expiry = expirySec;
-      confirmed.expiryTime = confirmed.expiryTime || (confirmed.openTime || Date.now()) + expirySec * 1000;
+      confirmed.expiryTime = confirmed.expiryTime || (confirmed.openTime || getBrokerNow()) + expirySec * 1000;
     }
     return confirmed;
   }

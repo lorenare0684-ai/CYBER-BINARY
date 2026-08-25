@@ -6,7 +6,7 @@
  *   - tools/page-hook.shell.js (MAIN-world WebSocket hook shell)
  *
  * Rebuild after any change to either source file.
- * Generated: 2026-08-24T19:02:12.394Z
+ * Generated: 2026-08-25T05:36:40.939Z
  */
 /* ====================================================================
  * Inlined CYBER_QUOTEX adapter (src/lib/quotex.js).
@@ -775,7 +775,8 @@
       // Tolerate up to 24h of broker-server-vs-local clock skew. The old
       // +5min bound silently dropped EVERY candle whenever the user's PC
       // clock ran behind Quotex's server, keeping feeds on synthetic seeds.
-      if (tMs == null || tMs < 946684800000 || tMs > Date.now() + 86400000) continue;
+      // Allow up to 2 days ahead to tolerate broker-server clock skew vs local.
+      if (tMs == null || tMs < 946684800000 || tMs > Date.now() + 2 * 86400000) continue;
       byTime[tMs] = {
         time: tMs,
         open: o, high: hi, low: lo, close: c,
@@ -1297,12 +1298,12 @@
     var wanted = Math.round(requested);
     var el = findExpirySelect();
     if (!el) {
-      // If no explicit expiry input is located on the DOM (e.g. fixed 1m chart timeframe),
-      // allow default 60s without failing/disarming.
-      if (wanted === 60) {
-        return { ok: true, expiry: 60, fallback: true };
-      }
-      return { ok: false, error: "expiry control not found" };
+      // If no explicit expiry input is located on the DOM (e.g. fixed timeframe
+      // or new Quotex layout), don't block the trade. WS path doesn't need DOM
+      // expiry at all, and DOM path will still click CALL/PUT with broker's
+      // current expiry. Returning fallback allows any configured expiry (0.5-1440m)
+      // to proceed instead of only 60s.
+      return { ok: true, expiry: wanted, fallback: true };
     }
     try {
       var currentVal = (el.value != null ? String(el.value) : "") + " " + visibleText(el);
@@ -1742,14 +1743,16 @@
     // Quotex's regular-market binary contract expects an ABSOLUTE unix
     // expiry, rounded to the minute. Epoch arithmetic avoids local-time DST
     // jumps that Date#setMinutes can introduce.
+    // Correct logic: floor(now/60)+minutes gives the next N minute boundaries.
+    // e.g. 10:00:01 + 1m => 10:01, 10:00:01 + 3m => 10:03.
+    // If expiry would be <30s away, push one more minute to avoid broker
+    // rejection (broker requires minimum time to expiry). This prevents 1m
+    // trades placed at :50 from being rejected and appearing as \"only 3m works\".
     var nowSec = Math.floor(baseNow / 1000);
-    // v2.7.1: round up to the next minute boundary if not exactly on one.
-    // The old logic added an extra minute when past the 30-second mark, which
-    // caused a 1-minute expiry at 10:00:31 to become 10:02 instead of 10:01.
     var currentMinute = Math.floor(nowSec / 60);
-    var secondsIntoMinute = nowSec % 60;
-    var baseMinute = secondsIntoMinute > 0 ? currentMinute + 1 : currentMinute;
-    return (baseMinute + minutes) * 60;
+    var expiry = (currentMinute + minutes) * 60;
+    if (expiry - nowSec < 30) expiry += 60;
+    return expiry;
   }
 
   /* ------------------------------------------------------------------
@@ -1910,7 +1913,7 @@
         asset: payload.asset,
         amount: payload.amount,
         expiry: parseInt(args.expirySec != null ? args.expirySec : args.expiry, 10) || 60,
-        expiryTime: payload.optionType === 1 ? payload.time * 1000 : Date.now() + payload.time * 1000,
+        expiryTime: payload.optionType === 1 ? payload.time * 1000 : (function(){ var bn = numberValue(args.nowMs); return (bn != null && bn > 0 ? bn : Date.now()) + payload.time * 1000; })(),
         optionType: payload.optionType,
         message: msg,
       };
