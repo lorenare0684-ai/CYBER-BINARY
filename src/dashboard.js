@@ -76,6 +76,9 @@
   let qxInstruments = [];
   let qxBalance = null;
   let qxOrders = [];
+  let openOrders = [];
+  let ongoingTimer = null;
+  let lastPriceMap = Object.create(null);
   let lastOrderError = null;   // last broker-side order rejection {error, at}
   let pendingLiveState = null;
   let liveRenderQueued = false;
@@ -802,6 +805,85 @@
     }
   }
 
+  function fmtTimeLeft(expiryMs) {
+    const now = Date.now();
+    const diff = Number(expiryMs) - now;
+    if (!Number.isFinite(diff)) return "—";
+    if (diff <= 0) return "expired";
+    const s = Math.floor(diff / 1000);
+    const m = Math.floor(s / 60);
+    const sec = s % 60;
+    if (m > 0) return `${m}m ${sec}s`;
+    return `${sec}s`;
+  }
+
+  function renderOngoingTrades(virtualPending) {
+    const tables = [
+      { tbody: $("ongoing-table") ? $("ongoing-table").querySelector("tbody") : null, empty: $("ongoing-empty"), count: $("ongoing-count"), full: true },
+      { tbody: $("auto-ongoing-table") ? $("auto-ongoing-table").querySelector("tbody") : null, empty: $("auto-ongoing-empty"), count: $("auto-ongoing-count"), full: false },
+    ];
+    // Combine broker open orders + virtual pending for full view
+    const virtualList = [];
+    if (virtualPending && typeof virtualPending === 'object') {
+      virtualList.push({
+        asset: virtualPending.asset || "—",
+        dir: virtualPending.dir || "—",
+        direction: virtualPending.dir || "—",
+        amount: null,
+        openPrice: virtualPending.entry || virtualPending.entryPrice,
+        expiryTime: virtualPending.expireAt || virtualPending.expiryTime,
+        closeTime: virtualPending.expireAt || virtualPending.expiryTime,
+        isVirtual: true,
+      });
+    }
+    const all = openOrders.concat(virtualList);
+    const count = all.length;
+    for (const cfg of tables) {
+      if (!cfg.tbody) continue;
+      cfg.tbody.innerHTML = "";
+      if (cfg.count) cfg.count.textContent = `${count} active`;
+      if (cfg.empty) cfg.empty.style.display = count ? "none" : "block";
+      for (const o of all.slice(0, 20)) {
+        const tr = document.createElement("tr");
+        const dirCls = o.direction === "CALL" || o.dir === "CALL" ? "win" : o.direction === "PUT" || o.dir === "PUT" ? "loss" : "";
+        const asset = esc(o.asset || "—");
+        const dir = esc(o.direction || o.dir || "—");
+        const stake = o.isVirtual ? "VIRTUAL" : (finite(o.amount, null) != null ? esc(finite(o.amount, 0).toFixed(2)) + "$" : "—");
+        const entry = o.openPrice ? esc(fmtPx(o.openPrice)) : "—";
+        const currPrice = lastPriceMap[o.asset] || null;
+        const curr = currPrice ? esc(fmtPx(currPrice)) : "—";
+        let pnl = "—";
+        let pnlCls = "";
+        if (currPrice && o.openPrice && !o.isVirtual) {
+          const isCall = (o.direction || o.dir) === "CALL";
+          const winning = isCall ? currPrice > o.openPrice : currPrice < o.openPrice;
+          const payout = 0.85;
+          const est = winning ? `+${(o.amount * payout).toFixed(2)}$` : `-${Number(o.amount).toFixed(2)}$`;
+          pnl = est;
+          pnlCls = winning ? "win" : "loss";
+        }
+        const expiry = esc(fmtTime(o.expiryTime || o.closeTime));
+        const timeLeft = esc(fmtTimeLeft(o.expiryTime || o.closeTime));
+        const status = o.isVirtual ? "VIRTUAL PENDING" : "OPEN";
+        const statusCls = o.isVirtual ? "" : "win";
+        if (cfg.full) {
+          tr.innerHTML = `<td><strong>${asset}</strong></td><td class="${dirCls}">${dir}</td><td>${stake}</td><td>${entry}</td><td>${curr}</td><td class="${pnlCls}">${pnl}</td><td>${expiry}</td><td>${timeLeft}</td><td class="${statusCls}">${status}</td>`;
+        } else {
+          tr.innerHTML = `<td><strong>${asset}</strong></td><td class="${dirCls}">${dir}</td><td>${stake}</td><td>${entry}</td><td>${expiry}</td><td>${timeLeft}</td><td class="${statusCls}">${status}</td>`;
+        }
+        cfg.tbody.appendChild(tr);
+      }
+    }
+  }
+
+  let lastVirtualPending = null;
+  function ensureOngoingTimer() {
+    if (ongoingTimer) return;
+    ongoingTimer = setInterval(() => {
+      if (openOrders.length || lastVirtualPending) renderOngoingTrades(lastVirtualPending);
+    }, 1000);
+  }
+
   function renderLive(state) {
     if (!state || typeof state !== "object" || Array.isArray(state)) return;
     if (state && state.quotex && typeof state.quotex === "object" && !Array.isArray(state.quotex)) {
@@ -814,6 +896,19 @@
       if (state.quotex.balance) qxBalance = QUOTEX ? QUOTEX.parseBalance(state.quotex.balance) : null;
       if (Array.isArray(state.quotex.lastOrders)) {
         qxOrders = mergeOrders(state.quotex.lastOrders.concat(qxOrders));
+      }
+      if (Array.isArray(state.quotex.openOrders)) {
+        openOrders = state.quotex.openOrders.slice(0, 50);
+      }
+      lastVirtualPending = state.pending && typeof state.pending === 'object' ? state.pending : null;
+      ensureOngoingTimer();
+      renderOngoingTrades(lastVirtualPending);
+      // Track last price per asset for P&L estimation
+      if (state.assetId && state.price != null) {
+        lastPriceMap[state.assetId] = Number(state.price);
+      }
+      if (state.quotex && state.quotex.activeSymbol && state.price != null) {
+        lastPriceMap[state.quotex.activeSymbol] = Number(state.price);
       }
     }
     paintQuotexPill();

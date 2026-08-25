@@ -70,6 +70,33 @@
           <div class="regime-row" id="regime-row">regime: —</div>
         </section>
 
+        <!-- Ongoing Trades Card -->
+        <section class="card ongoing-card" id="ongoing-card">
+          <div class="card-header">
+            <h3>Ongoing Trades (Live Broker)</h3>
+            <span id="ongoing-count" class="badge">0 active</span>
+          </div>
+          <div class="table-wrap">
+            <table class="table tight" id="ongoing-table">
+              <thead>
+                <tr>
+                  <th>Asset</th>
+                  <th>Dir</th>
+                  <th>Stake</th>
+                  <th>Entry</th>
+                  <th>Current</th>
+                  <th>P&L</th>
+                  <th>Expiry</th>
+                  <th>Time Left</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+            <div id="ongoing-empty" class="dim-text" style="padding:8px">No ongoing trades — broker open orders will appear here with live countdown.</div>
+          </div>
+        </section>
+
         <!-- Auto-Adaptive System Card -->
         <section class="card adaptive-card" id="adaptive-card">
           <div class="card-header">
@@ -159,6 +186,30 @@
           <article><span>Trades this hour</span><strong id="trades-hour">0</strong></article>
           <article><span>Daily P&amp;L</span><strong id="daily-pnl">0</strong></article>
           <article><span>Last trade</span><strong id="last-trade">—</strong></article>
+        </section>
+
+        <section class="card ongoing-card" id="auto-ongoing-card">
+          <div class="card-header">
+            <h3>Ongoing Trades</h3>
+            <span id="auto-ongoing-count" class="badge">0 active</span>
+          </div>
+          <div class="table-wrap">
+            <table class="table tight" id="auto-ongoing-table">
+              <thead>
+                <tr>
+                  <th>Asset</th>
+                  <th>Dir</th>
+                  <th>Stake</th>
+                  <th>Entry</th>
+                  <th>Expiry</th>
+                  <th>Time Left</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+            <div id="auto-ongoing-empty" class="dim-text" style="padding:8px">No active trades.</div>
+          </div>
         </section>
 
         <section class="controls tight">

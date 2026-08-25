@@ -242,6 +242,8 @@
   let lastInstruments = [];
   let lastBalance = null;
   let lastOrders = [];
+  const openOrders = Object.create(null);      // ongoing broker trades: id/requestId -> order data
+  const openOrdersQueue = [];                  // order of ids for bounded size
   const pendingWs = Object.create(null);       // page-hook send ack requestId -> resolver
   const pendingHistory = Object.create(null);  // page-hook history-subscription requestId -> resolver
   const pendingHistoryMeta = Object.create(null); // requestId -> {asset, period} for retry bookkeeping
@@ -1390,6 +1392,81 @@
     for (let i = lastOrders.length - 1; i >= 0; i--) processClosedOrder(lastOrders[i], true);
   }
 
+  function addOpenOrder(data) {
+    if (!data) return;
+    const id = String(data.id || data.requestId || "").trim().slice(0, 128);
+    if (!id) return;
+    // Don't add if already closed
+    if (settledOrderIds[id]) return;
+    const key = id;
+    const now = getBrokerNow();
+    const openTime = Number(data.openTime) || now;
+    let expiryTime = Number(data.expiryTime || data.closeTime);
+    if (!Number.isSafeInteger(expiryTime) || expiryTime <= openTime) {
+      const dur = Number(data.duration);
+      if (Number.isFinite(dur) && dur > 0) expiryTime = openTime + dur * 1000;
+      else expiryTime = openTime + 180000; // fallback 3m
+    }
+    openOrders[key] = {
+      id,
+      requestId: data.requestId ? String(data.requestId).slice(0,128) : null,
+      asset: data.asset || "",
+      dir: data.direction || data.dir || "",
+      direction: data.direction || data.dir || "",
+      amount: Number(data.amount) || 0,
+      openPrice: Number(data.openPrice) || 0,
+      openTime,
+      expiryTime,
+      closeTime: expiryTime,
+      duration: Math.max(0, Math.round((expiryTime - openTime)/1000)),
+      status: "OPEN",
+      raw: data,
+    };
+    if (openOrdersQueue.indexOf(key) === -1) openOrdersQueue.push(key);
+    while (openOrdersQueue.length > 50) {
+      const oldKey = openOrdersQueue.shift();
+      if (oldKey && openOrders[oldKey]) delete openOrders[oldKey];
+    }
+  }
+
+  function removeOpenOrder(data) {
+    if (!data) return;
+    const id = String(data.id || data.requestId || "").trim().slice(0, 128);
+    if (id && openOrders[id]) {
+      delete openOrders[id];
+      const idx = openOrdersQueue.indexOf(id);
+      if (idx >= 0) openOrdersQueue.splice(idx, 1);
+      return;
+    }
+    // Try to match by asset+times if id missing
+    const asset = data.asset ? String(data.asset) : "";
+    const openT = Number(data.openTime);
+    for (const k of Object.keys(openOrders)) {
+      const o = openOrders[k];
+      if (!o) continue;
+      if (asset && o.asset && o.asset !== asset) continue;
+      if (Number.isSafeInteger(openT) && Math.abs(o.openTime - openT) > 5000) continue;
+      delete openOrders[k];
+      const idx = openOrdersQueue.indexOf(k);
+      if (idx >= 0) openOrdersQueue.splice(idx, 1);
+      break;
+    }
+  }
+
+  function cleanupExpiredOpenOrders() {
+    const now = getBrokerNow();
+    for (const k of Object.keys(openOrders)) {
+      const o = openOrders[k];
+      if (!o) continue;
+      // If expiry passed + 2min grace, remove (broker should have sent close)
+      if (o.expiryTime && now > o.expiryTime + 120000) {
+        delete openOrders[k];
+        const idx = openOrdersQueue.indexOf(k);
+        if (idx >= 0) openOrdersQueue.splice(idx, 1);
+      }
+    }
+  }
+
   function applyHookSnapshot(snap) {
     if (!snap || typeof snap !== "object" || Array.isArray(snap)) return;
     const status = normalizeStatus(snap.status);
@@ -1409,6 +1486,25 @@
     }
     if (Array.isArray(snap.orders)) {
       lastOrders = snap.orders.map(normalizeOrderEvent).filter(Boolean).slice(0, 50);
+      // Rebuild open orders from snapshot: opened without matching closed
+      try {
+        // Clear and rebuild
+        for (const k of Object.keys(openOrders)) delete openOrders[k];
+        openOrdersQueue.length = 0;
+        const closedIds = new Set();
+        for (const o of lastOrders) {
+          if (o.kind === "closed" && o.data) {
+            const cid = String(o.data.id || o.data.requestId || "").trim();
+            if (cid) closedIds.add(cid);
+          }
+        }
+        for (const o of lastOrders) {
+          if (o.kind === "opened" && o.data) {
+            const oid = String(o.data.id || o.data.requestId || "").trim();
+            if (oid && !closedIds.has(oid)) addOpenOrder(o.data);
+          }
+        }
+      } catch (_) {}
       if (lastOrders[0]) {
         try { chrome.runtime.sendMessage({ type: "CYBER_QUOTEX_TRADE_RESULT", payload: lastOrders[0] }).catch(() => {}); } catch (_) {}
       }
@@ -1674,6 +1770,8 @@
     const chart = chartForActiveAsset();
     const pending = pendingByAsset[activeAsset];
     const latestOrder = lastOrders[0] && lastOrders[0].data || {};
+    const openCount = Object.keys(openOrders).length;
+    const openFingerprint = openOrdersQueue.slice(-5).join(",");
     return [
       activeAsset, activeFeed.lastPrice(), cachedAnalysisKey,
       sig && sig.direction, sig && sig.confidence,
@@ -1683,6 +1781,7 @@
       lastQuotexStatus && lastQuotexStatus.state,
       lastBalance && lastBalance.balance, lastInstruments.length,
       lastOrders.length, latestOrder.id || latestOrder.requestId || "",
+      openCount, openFingerprint,
     ].join("|");
   }
 
@@ -1712,6 +1811,7 @@
 
   function pushState(sig) {
     if (!sig) return;
+    try { cleanupExpiredOpenOrders(); } catch (_) {}
     const total = stats.wins + stats.losses;
     const chart = chartForActiveAsset();
     const feedSeries = activeFeed.series().slice(-220);
@@ -1761,7 +1861,8 @@
         instrumentsCount: lastInstruments.length,
         activeSymbol: lastWsSymbol || activeAsset,
         activePeriod: lastWsPeriod,
-        lastOrders: lastOrders.slice(0, 5),
+        lastOrders: lastOrders.slice(0, 10),
+        openOrders: Object.values(openOrders).slice(0, 20),
       },
     };
     try { chrome.runtime.sendMessage({ type: "CYBER_STATE", payload }).catch(() => {}); } catch (_) {}
@@ -2143,7 +2244,13 @@
             String(d.openTime || d.closeTime || "") === orderIdentity;
         })) lastOrders.unshift(order);
         if (lastOrders.length > 50) lastOrders.length = 50;
-        if (order.kind === "closed") processClosedOrder(order, false);
+        if (order.kind === "opened") {
+          try { addOpenOrder(order.data); } catch (_) {}
+        }
+        if (order.kind === "closed") {
+          try { removeOpenOrder(order.data); } catch (_) {}
+          processClosedOrder(order, false);
+        }
         if (order.kind === "opened") {
           const req = data.requestId != null ? String(data.requestId) : "";
           const lifecycle = confirmationLifecycle(data);
