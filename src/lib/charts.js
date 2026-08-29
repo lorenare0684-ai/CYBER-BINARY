@@ -317,6 +317,14 @@
     const parent = canvas.parentElement;
     const parentWidth = finite(parent && parent.clientWidth, 0);
     const viewportWidth = finite(window.innerWidth, 480);
+    // Detect the fullscreen chart (CSS class on the .pro-chart wrapper) so the
+    // canvas buffer fills the whole viewport instead of keeping an aspect-ratio
+    // height. The old path sized the canvas from width alone, so fullscreen made
+    // it several times taller than the screen and overflow:hidden clipped it,
+    // leaving the chart looking like a single sliced "chunk".
+    const fullscreenEl = parent && parent.closest ? parent.closest(".pro-chart.fullscreen") : null;
+    const isFullscreen = !!(fullscreenEl || opts.fullscreen);
+    const availH = isFullscreen ? finite(parent && parent.clientHeight, 0) : 0;
     const w = Math.max(320, Math.min(4096, parentWidth || viewportWidth || 800));
     const dpr = Math.max(1, Math.min(2, finite(window.devicePixelRatio, 1)));
 
@@ -327,8 +335,15 @@
     const macdH = showMacd ? Math.max(56, Math.round(w * 0.13)) : 0;
     const rsiH = showRsi ? Math.max(48, Math.round(w * 0.11)) : 0;
     const timeAxisH = 22;
-    const priceH = Math.max(180, Math.round(w * 0.36));
-    const totalH = priceH + volH + macdH + rsiH + timeAxisH + (showVol||showMacd||showRsi ? 12 : 0);
+    const paneGap = (showVol || showMacd || showRsi ? 12 : 0);
+    let priceH = Math.max(180, Math.round(w * 0.36));
+    let totalH = priceH + volH + macdH + rsiH + timeAxisH + paneGap;
+    if (isFullscreen && availH >= 260) {
+      // In fullscreen the price pane absorbs all remaining vertical space so
+      // the candles fill the screen and nothing is cut off.
+      totalH = Math.max(260, Math.floor(availH));
+      priceH = Math.max(180, totalH - (volH + macdH + rsiH + timeAxisH + paneGap));
+    }
 
     const pixelW = Math.floor(w * dpr), pixelH = Math.floor(totalH * dpr);
     if (canvas.width !== pixelW) canvas.width = pixelW;

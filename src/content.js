@@ -1201,13 +1201,36 @@
     // Never overlay resampled synthetic warm-up bars on genuine broker
     // history. Until a real 1m batch arrives, those two series can have
     // different price levels and create a fake final spike.
-    if (historySeeded[activeAsset] && period >= 60 && period % 60 === 0 &&
-        self.CYBER_TA && typeof self.CYBER_TA.resample === "function") {
+    //
+    // v2.7.7: the live-bar overlay was gated on historySeeded AND
+    // period%60===0, so it never ran for a freshly attached session (or a
+    // timeframe whose 1m batch had not arrived yet). The dashboard chart then
+    // froze on the last broker history chunk while the platform kept drawing
+    // the forming candle — the reported "live candles nahi dikhti, sirf ek
+    // last loaded chunk dikhta hai" bug. Overlay the forming bar whenever the
+    // chart timeframe is a whole number of minutes AND real quotes have been
+    // accepted, but only if the live bar's price scale is consistent with the
+    // broker chart's last close. The scale guard is what stops a synthetic
+    // warm-up (or wrong-asset) bar from being smeared onto real history.
+    const scaleGuard = (bars, liveBar) => {
+      const lastBars = bars && bars.length ? Array.from(bars) : [];
+      const lastClose = Number(lastBars[lastBars.length - 1] && lastBars[lastBars.length - 1].close);
+      const liveClose = Number(liveBar && liveBar.close);
+      if (!Number.isFinite(lastClose) || lastClose <= 0 || !Number.isFinite(liveClose) || liveClose <= 0) return false;
+      return Math.abs(liveClose - lastClose) / lastClose <= 0.1; // 10% scale tolerance
+    };
+    const hasRealQuotes = !!lastAcceptedQuoteAt[activeAsset];
+    if (period >= 60 && period % 60 === 0 &&
+        self.CYBER_TA && typeof self.CYBER_TA.resample === "function" &&
+        (historySeeded[activeAsset] || hasRealQuotes)) {
       const minutes = Math.max(1, Math.round(period / 60));
       const live = self.CYBER_TA.resample(activeFeed.series(), minutes);
-      const merged = overlayLiveBar(selected.candles, live.length ? live[live.length - 1] : null);
-      if (merged !== selected.candles) {
-        return { period, candles: merged, ts: Date.now() };
+      const liveBar = live.length ? live[live.length - 1] : null;
+      if (scaleGuard(selected.candles, liveBar)) {
+        const merged = overlayLiveBar(selected.candles, liveBar);
+        if (merged !== selected.candles) {
+          return { period, candles: merged, ts: Date.now() };
+        }
       }
     }
     return selected;
@@ -1990,11 +2013,15 @@
     const total = stats.wins + stats.losses;
     const chart = chartForActiveAsset();
     const feedSeries = activeFeed.series().slice(-220);
-    // Display only candles matching the broker's currently selected period.
-    // Do not substitute the 1m engine feed while a new timeframe is loading.
-    const chartSeries = (chart && Array.isArray(chart.candles) && chart.candles.length)
+    // Display candles matching the broker's currently selected period. If that
+    // timeframe's history has not arrived yet (right after a timeframe switch,
+    // or before the broker's first history batch), SUBSTITUTE the live 1m
+    // engine feed so the dashboard chart never sits blank or frozen on a stale
+    // partial batch. The dashboard keeps a `chartPeriod` of 60 in that case and
+    // the live 1m candle moves on every accepted tick.
+    const brokerSeries = (chart && Array.isArray(chart.candles) && chart.candles.length)
       ? chart.candles.slice(-220)
-      : [];
+      : feedSeries;
     const payload = {
       attached: true,
       primary: isPrimaryContext,
@@ -2005,7 +2032,7 @@
       candles: feedSeries,
       // Keep messages compact while allowing the active 1m candle to move on
       // every accepted Quotex tick instead of waiting for a history refresh.
-      chartCandles: chartSeries,
+      chartCandles: brokerSeries,
       chartPeriod: chart ? chart.period : 60,
       chartTimeBasis: "broker-utc",
       engineTimeframeSec: ENGINE_TIMEFRAME_SEC,

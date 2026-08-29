@@ -816,7 +816,9 @@
           const label = item.label || stratId;
           const fit = item.fitness || 0;
           const stratDir = item.direction === "PUT" ? "put" : item.direction === "CALL" ? "call" : "";
-          const dirTxt = item.direction && item.direction !== "WAIT" ? " [" + item.direction + "]" : "";
+          const dirTxt = item.direction && item.direction !== "WAIT"
+            ? " [" + item.direction + (item.confidence ? " " + item.confidence + "%" : "") + "]"
+            : "";
           fitnessHtml += '<div class="meter small' + (isSelected ? ' selected' : '') + '"><span>' + esc(label) + dirTxt + '</span><div class="bar ' + stratDir + '"><i style="width:' + fit + '%"></i></div><span>' + fit + '/100</span></div>';
         }
         fitnessContainer.innerHTML = fitnessHtml;
@@ -942,8 +944,17 @@
       });
     }
 
-    const chartCandles = (Array.isArray(state.chartCandles) && state.chartCandles.length
-      ? state.chartCandles : []).slice(-500);
+    // Prefer the broker chart's own timeframe the platform is showing, but
+    // NEVER let the chart go blank (or freeze on the last history batch) when
+    // that series has not arrived yet. `state.candles` is the engine's 1m feed
+    // and it updates on every accepted broker tick, so it is the live fallback.
+    // This is what stops the "only a last loaded chunk shows / no live candles"
+    // symptom on a freshly opened dashboard or right after a timeframe switch.
+    const brokerChart = (Array.isArray(state.chartCandles) && state.chartCandles.length)
+      ? state.chartCandles : null;
+    const liveFeed = (Array.isArray(state.candles) && state.candles.length)
+      ? state.candles : null;
+    const chartCandles = (brokerChart || liveFeed || []).slice(-500);
     const markers = Array.isArray(state.markers) ? state.markers.slice(-600) : [];
     const nextChartKey = chartStateKey(chartCandles, state.chartPeriod, markers);
     // Always update lastChartCandles/meta for integration even if key same? Keep key check for performance but enrich meta
@@ -2643,15 +2654,18 @@
           // try native fullscreen
           if (wrap.requestFullscreen) wrap.requestFullscreen().catch(()=>{});
         }
+        // Redraw with the same enriched options (signals, markers, orders,
+        // decimals) so entering/leaving fullscreen never drops overlays, and
+        // at the new container size so the candles fill the screen.
         setTimeout(() => {
-          if (state._lastNormalized) CH.drawMainChart(canvas, state._lastNormalized, {});
-        }, 100);
+          if (state._lastNormalized) CH.drawMainChart(canvas, state._lastNormalized, state._lastOpts || {});
+        }, 120);
       });
       document.addEventListener("fullscreenchange", () => {
         if (!document.fullscreenElement) {
           wrap.classList.remove("fullscreen");
           if (fsBtn) fsBtn.textContent = "⛶";
-          setTimeout(() => { if (state._lastNormalized) CH.drawMainChart(canvas, state._lastNormalized, {}); }, 100);
+          setTimeout(() => { if (state._lastNormalized) CH.drawMainChart(canvas, state._lastNormalized, state._lastOpts || {}); }, 120);
         }
       });
     }
@@ -2665,10 +2679,25 @@
     const eqFs = $("bt-equity-fullscreen");
     const eqWrap = $("bt-equity-wrap");
     if (eqFs && eqWrap) {
+      const eqRedraw = () => {
+        // Re-draw the equity chart at the new container size after a moment so
+        // the canvas fills the fullscreen area instead of staying at its old
+        // small dimensions and being clipped by the wrapper.
+        setTimeout(() => {
+          const c = $("bt-equity");
+          if (c && CH.drawEquityChart && lastBtEquity) {
+            CH.drawEquityChart(c, lastBtEquity, {});
+          }
+        }, 120);
+      };
       eqFs.addEventListener("click", () => {
         const isFs = eqWrap.classList.contains("fullscreen");
         if (isFs) { eqWrap.classList.remove("fullscreen"); eqFs.textContent="⛶"; if (document.exitFullscreen) document.exitFullscreen().catch(()=>{}); }
         else { eqWrap.classList.add("fullscreen"); eqFs.textContent="✕"; if (eqWrap.requestFullscreen) eqWrap.requestFullscreen().catch(()=>{}); }
+        eqRedraw();
+      });
+      document.addEventListener("fullscreenchange", () => {
+        if (!document.fullscreenElement) eqRedraw();
       });
     }
 

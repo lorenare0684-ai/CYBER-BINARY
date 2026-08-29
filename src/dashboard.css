@@ -727,13 +727,15 @@ body::before {
   height: 100vh;
 }
 .pro-chart.fullscreen .chart-canvas-wrap {
-  flex: 1;
+  flex: 1 1 auto;
+  min-height: 0;
   display: flex;
   flex-direction: column;
 }
 .pro-chart.fullscreen canvas {
-  flex: 1;
-  height: auto !important;
+  flex: 1 1 auto;
+  width: 100% !important;
+  height: 100% !important;
 }
 
 /* Equity & Monte Carlo specific */

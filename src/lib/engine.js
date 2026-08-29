@@ -293,6 +293,27 @@
     } catch (_) { return null; }
   }
 
+  /**
+   * v2.7+: normalise a raw adaptive fitness score to a 0-100 display value.
+   *
+   * The old display clamped with `Math.min(100, rawScore*8 + confidence*0.3 +
+   * regimeBonus + signalBonus + winrateBonus)`. Because the weighted vote sum
+   * routinely reaches 15-25, the raw score alone (`*8`) already produced
+   * 120-200, so EVERY strategy that fired on a bar rendered as "100/100" and
+   * the Auto-Adaptive card could not tell a marginal confluence call from an
+   * overwhelming one ("sab 100, nahi to sab equal"). The real fitness used to
+   * SELECT a strategy must stay unbounded (see rawFitness below), but the
+   * number we show should be a monotonic, saturating 0-100 that keeps the
+   * strongest candidate first while still separating it from the next best.
+   * A saturating exponential keeps ordering monotonic, so a strategy that is
+   * fitter is always shown higher, and the historical-accuracy bonus still
+   * moves the reading (it is passed through unchanged below the curve).
+   */
+  function fitnessDisplay(raw) {
+    const v = Number.isFinite(raw) ? Math.max(0, raw) : 0;
+    return Math.min(100, Math.max(0, Math.round(100 * (1 - Math.exp(-v / 80)))));
+  }
+
   function extract(candles) {
     const o = [], h = [], l = [], c = [], t = [];
     for (let i = 0; i < candles.length; i++) {
@@ -464,7 +485,7 @@
       const rawFitness = Math.round(
         rawScore * 8 + confScore * 0.3 + regimeBonus + signalBonus + winrateBonus
       );
-      const displayFitness = Math.min(100, Math.max(0, rawFitness));
+      const displayFitness = fitnessDisplay(rawFitness);
 
       scores[stratId] = {
         label: (STRAT && STRAT[stratId] && STRAT[stratId].label) || stratId,
@@ -581,7 +602,7 @@
       const rawFitness = Math.round(
         rawScore * 8 + confScore * 0.3 + regimeBonus + signalBonus + winrateBonus
       );
-      const displayFitness = Math.min(100, Math.max(0, rawFitness));
+      const displayFitness = fitnessDisplay(rawFitness);
 
       scores[stratId] = {
         label: (STRAT && STRAT[stratId] && STRAT[stratId].label) || stratId,
