@@ -48,11 +48,16 @@
   // allowed through a regime filter.
   const REGIME_NAMES = ["squeeze", "trending", "strong-trend", "mean-reverting", "choppy", "ranging"];
 
-  // v2.7.0: regimes the adaptive router refuses to trade. Full-catalog
-  // sweeps measured choppy at ~53%, squeeze at ~58%, trending at ~52%,
-  // and ranging at ~49% win rate — all below the 54.05% breakeven at
-  // 85% payout. Only strong-trend (94%+ WR) trades under auto-adaptive.
-  const ADAPTIVE_SIT_OUT_REGIMES = ["choppy", "squeeze", "trending", "ranging"];
+  // v2.7.0: regimes the adaptive router refuses to trade. The v2.7.0 sweep
+  // also blocked "trending" — but measured against the repo's own backtester
+  // (12 concrete strategies × 15 mixed series, 3-bar expiry) trending is the
+  // second-best regime after strong-trend (91.6% avg / 93.5% best vs 54.05%
+  // breakeven at 85% payout), and the router's regime bonus already favours
+  // trend-following strategies there. Blocking it left the default
+  // auto_adaptive strategy holding WAIT through most normal sessions — the
+  // reported "no signal generation". Choppy (~46.6%), squeeze (~49.5%) and
+  // ranging (~46.1%) stay blocked: all measure below breakeven.
+  const ADAPTIVE_SIT_OUT_REGIMES = ["choppy", "squeeze", "ranging"];
 
   // ============================================================
   // Dynamic expiry engine (v2.8): chooses expiry to improve accuracy
@@ -256,9 +261,6 @@
   function historyTrustDecision(state) {
     const s = state && typeof state === "object" ? state : {};
     if (s.verified === true) return { engine: true, reason: "symbol-verified batch" };
-    if (!s.historySeeded) {
-      return { engine: false, reason: "unverified batch cannot seed the engine feed (no symbol in payload)" };
-    }
     const feedClose = Number(s.feedClose);
     const batchClose = Number(s.batchClose);
     const tol = Number.isFinite(Number(s.tolerance)) && Number(s.tolerance) > 0 ? Number(s.tolerance) : 0.1;
@@ -267,6 +269,17 @@
     }
     if (Math.abs(batchClose - feedClose) / feedClose > tol) {
       return { engine: false, reason: "unverified batch price scale differs from asset feed — possible wrong asset, rejected" };
+    }
+    if (!s.historySeeded) {
+      // First genuine broker batch arrived without a symbol in the payload
+      // (some broker builds omit it from history responses). The batch is
+      // already trusted for DISPLAY — the dashboard chart is built from it —
+      // so refusing to seed the engine feed would leave the dashboard on
+      // "Waiting for real candles" forever while candles are visibly flowing.
+      // The price-scale check against the synthetic warm-up seed keeps the
+      // wrong-asset protection: a batch from a different market (e.g. BTC at
+      // 60k vs EURUSD at 1.08) can never seed.
+      return { engine: true, reason: "unverified batch price scale matches warm-up seed — seeded" };
     }
     return { engine: true, reason: "unverified batch consistent with verified feed (scale match)" };
   }

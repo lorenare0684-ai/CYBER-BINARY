@@ -1325,9 +1325,23 @@
     }
     if (!real.length) return;
     real.sort((a, b) => a.time - b.time);
-    // Update broker clock from newest candle (open + period = approx now)
+    // Update broker clock from the newest candle. The newest row of a broker
+    // batch is the OPEN of the still-forming candle, so "now" lies somewhere
+    // in [newestTime, newestTime + periodMs]. Using the upper bound (the old
+    // open + period estimate) extrapolates up to `period` seconds into the
+    // future: a fresh 5m/15m/1h batch made the clock run minutes ahead, the
+    // 1s poll force-closed the still-forming 1m bar immediately, and every
+    // remaining tick of the real minute was then rejected as stale — the
+    // dashboard's forming candle froze and signals ran on half-built bars.
+    // Estimate the midpoint of the forming bucket instead, and never let a
+    // batch run more than a minute past the last tick-anchored clock: live
+    // quote ticks carry true broker timestamps and re-anchor on every
+    // message, so a behind-by-seconds estimate is safe (it only delays the
+    // backup force-close, never advances it).
     const newestTime = real[real.length - 1].time;
-    updateBrokerClock(newestTime + periodMs);
+    const nowLocal = Date.now();
+    const anchorRef = brokerNow != null && brokerNow > nowLocal ? brokerNow : nowLocal;
+    updateBrokerClock(Math.min(newestTime + Math.round(periodMs / 2), anchorRef + 60000));
 
     // The engine runs on 1m bars; accept 60s history directly and build 1m
     // from ticks for everything else (the chart shows the broker timeframe).
@@ -2311,7 +2325,10 @@
     }
 
     const rawLimit = Number(requestedLimit);
-    const wanted = Number.isFinite(rawLimit) ? Math.max(60, Math.min(10000, Math.floor(rawLimit))) : 5000;
+    // Broker history rows are capped at 5000 per request — the adapter clamps
+    // to the same bound. Requesting more makes the platform error out and the
+    // dashboard stays on "Waiting for candles…" despite a live feed.
+    const wanted = Number.isFinite(rawLimit) ? Math.max(60, Math.min(5000, Math.floor(rawLimit))) : 5000;
     const limit = safePeriod === 60 ? wanted : Math.max(60, Math.min(wanted, 2000));
     const requestId = "history_" + now + "_" + (++historyRequestSequence % 1000000);
     if (!isPagination) historyRequestedAt[key] = now;
