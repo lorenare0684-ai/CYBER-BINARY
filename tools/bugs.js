@@ -273,13 +273,16 @@ function feedTest() {
   check("mergeCandles sorts arbitrary-order history", t2[0] < t2[1] && t2[1] < t2[2], t2.join(","));
 
   // setSeries with tiny cap keeps the newest bar as live (times are
-  // seconds → normalized to ms by setSeries)
+  // seconds → normalized to ms by setSeries). Times are minute-aligned
+  // (multiples of 60s): real broker 1m candles open on minute boundaries, and
+  // the feed deliberately floors incoming times to the period bucket, so a
+  // non-aligned input (e.g. 100000 + i*60) would be shifted one bucket left.
   const f3 = FEED.createFeed({ tfMs: 60000, max: 3 });
   const arr = [];
-  for (let i = 0; i < 10; i++) arr.push({ time: 100000 + i * 60, open: 1, high: 1.01, low: 0.99, close: 1 });
+  for (let i = 0; i < 10; i++) arr.push({ time: 100020 + i * 60, open: 1, high: 1.01, low: 0.99, close: 1 });
   const s3 = f3.setSeries(arr);
   check("setSeries caps to max including live without evicting newest",
-    s3.length === 3 && s3[2].time === (100000 + 9 * 60) * 1000,
+    s3.length === 3 && s3[2].time === (100020 + 9 * 60) * 1000,
     "len=" + s3.length + " last=" + s3[s3.length - 1].time);
   const cappedMerge = FEED.createFeed({ tfMs: 60000, max: 3 });
   cappedMerge.mergeCandles(arr);

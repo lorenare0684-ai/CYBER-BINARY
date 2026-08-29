@@ -31,7 +31,7 @@ Comprehensive accuracy hardening with **accuracy-first, minimum risk** philosoph
 3. **Trend-agreement confidence bonus**: +4/+8 when 3/4 indicators confirm direction
 4. **Regime-aware BB votes**: no reversal signals in strong trends
 5. **Momentum confirmation vote**: MACD histogram agreement
-6. **Adaptive sit-out**: only trades in strong-trend regime
+6. **Adaptive sit-out**: blocks only sub-breakeven regimes (choppy, squeeze, ranging); trending trades — the v2.7.0 sweep's "trending ~52%" figure contradicted the repo's own backtester (trending averages 91.6% WR across 12 strategies; best 93.5%), and blocking it left auto-adaptive holding WAIT through normal trending sessions
 7. **Default minConfidence raised to 90**: biggest single lever
 8. **Hard trend-agreement gate**: requires 1+ indicator confirming direction
 9. **ATR volatility ceiling** (0.6%): suppresses whipsaw conditions

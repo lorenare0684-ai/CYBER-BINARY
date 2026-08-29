@@ -6,7 +6,7 @@
  *   - tools/page-hook.shell.js (MAIN-world WebSocket hook shell)
  *
  * Rebuild after any change to either source file.
- * Generated: 2026-08-25T07:22:14.713Z
+ * Generated: 2026-08-29T07:25:35.576Z
  */
 /* ====================================================================
  * Inlined CYBER_QUOTEX adapter (src/lib/quotex.js).
@@ -2680,8 +2680,12 @@
       if (!sym) return { ok: false, error: "asset required" };
       period = numberValue(period);
       period = period != null && period > 0 ? Math.min(86400, Math.floor(period)) : 60;
+      // Broker history is capped at 5000 rows per request. Asking for more
+      // (some callers passed 9000–10000) makes the platform answer with an
+      // error or an empty batch, which left the dashboard on
+      // "Waiting for candles…" even though the feed was live.
       limit = numberValue(limit);
-      limit = limit != null ? Math.max(60, Math.min(10000, Math.floor(limit))) : 5000;
+      limit = limit != null ? Math.max(60, Math.min(5000, Math.floor(limit))) : 5000;
       offset = numberValue(offset);
       offset = offset != null ? Math.max(0, Math.min(1000000, Math.floor(offset))) : 0;
       try {
@@ -2722,7 +2726,9 @@
       batches = numberValue(batches);
       batches = batches != null ? Math.max(1, Math.min(20, Math.floor(batches))) : 3;
       batchSize = numberValue(batchSize);
-      batchSize = batchSize != null ? Math.max(60, Math.min(10000, Math.floor(batchSize))) : 5000;
+      // Same 5000-row broker cap as subscribeHistory — a batch size above it
+      // would be re-clamped per request anyway, but report the real bound.
+      batchSize = batchSize != null ? Math.max(60, Math.min(5000, Math.floor(batchSize))) : 5000;
       var results = [];
       for (var b = 0; b < batches; b++) {
         var offset = b * batchSize;

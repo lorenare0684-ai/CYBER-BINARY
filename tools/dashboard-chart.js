@@ -139,7 +139,7 @@ sandbox.window.getComputedStyle = () => ({ backgroundColor: "rgb(10,10,10)", col
 sandbox.window.matchMedia = () => ({ matches: false, addListener: () => {}, addEventListener: () => {} });
 
 vm.createContext(sandbox);
-for (const f of ["indicators.js", "assets.js", "strategy.js", "feed.js", "engine.js", "storage.js", "auto.js", "backtest.js", "workers.js", "asset-selector.js", "quotex.js"]) {
+for (const f of ["indicators.js", "assets.js", "strategy.js", "feed.js", "engine.js", "storage.js", "auto.js", "backtest.js", "workers.js", "asset-selector.js", "quotex.js", "charts.js"]) {
   vm.runInContext(fs.readFileSync(path.join(root, "src/lib", f), "utf8"), sandbox);
 }
 vm.runInContext(fs.readFileSync(path.join(root, "src/dashboard.js"), "utf8"), sandbox);
@@ -182,7 +182,10 @@ for (let pass = 0; pass < 4; pass++) {
   for (const fn of due) { try { fn(); } catch (_) {} }
 }
 const texts = drawn.map((d) => d.text);
-const header = texts.find((t) => t.indexOf("CYBER BINARY ·") === 0);
+// The header is drawn by charts.js from the dashboard's enriched meta label,
+// e.g. "EUR/USD OTC · 1m · 7/7 bars · last 09:47 UTC · CONF 0%". Find it by
+// its content (bar count + UTC basis) rather than a fixed label prefix.
+const header = texts.find((t) => t.indexOf("·") !== -1 && /bars/.test(t) && /last \d\d:\d\d UTC/.test(t));
 
 check("chart rendered candle labels", texts.length > 0, "drawn=" + texts.length);
 check("axis shows the broker's UTC minute (09:4x), not machine-local time",
