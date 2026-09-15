@@ -572,6 +572,61 @@ if (!sandbox.self.CYBER_ENGINE.walkForward(candles, {}).error) {
   console.error("undersized walk-forward folds must be rejected"); failed++;
 }
 
+// Strategy audit (engine honesty).
+//
+// No technical stack has edge on a pure random walk — so if the backtester
+// reports a win rate well above ~50% on one, the engine is leaking future
+// information (lookahead) and every backtest number it produces is fiction.
+// Conversely, on a series WITH persistent drift a trend stack must lock on.
+// These two deterministic series pin the engine between those poles; if a
+// future change breaks causality or kills trend detection, CI fails here.
+function auditSeries(n, drift, vol, seed) {
+  let a = seed >>> 0;
+  const rnd = () => {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  const t0 = Date.UTC(2026, 0, 5, 8, 0, 0);
+  let price = 1.1;
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const open = price;
+    const z = rnd() + rnd() + rnd() + rnd() - 2;
+    const close = open * (1 + drift + vol * z);
+    const wick = vol * (0.4 + rnd() * 0.8);
+    out.push({
+      time: t0 + i * 60000, open, close,
+      high: Math.max(open, close) * (1 + wick),
+      low: Math.min(open, close) * (1 - wick),
+      volume: 100,
+    });
+    price = close;
+  }
+  return out;
+}
+const auditNoise = sandbox.self.CYBER_ENGINE.backtest(
+  auditSeries(1600, 0, 0.0006, 42), { strategy: "confluence", horizon: 3, warmup: 120 });
+if (auditNoise.total < 300 || auditNoise.winrate < 35 || auditNoise.winrate > 62) {
+  console.error("engine shows spurious edge on a random walk (possible lookahead): trades=" +
+    auditNoise.total + " WR=" + auditNoise.winrate.toFixed(2) + "%");
+  failed++;
+}
+const auditNoiseAdaptive = sandbox.self.CYBER_ENGINE.backtest(
+  auditSeries(1600, 0, 0.0006, 42), { strategy: "auto_adaptive", horizon: 3, warmup: 120 });
+if (auditNoiseAdaptive.total > 500) {
+  console.error("auto-adaptive router must sit out most of a noise regime: trades=" + auditNoiseAdaptive.total);
+  failed++;
+}
+const auditTrend = sandbox.self.CYBER_ENGINE.backtest(
+  auditSeries(1600, 0.00025, 0.0005, 99), { strategy: "confluence", horizon: 3, warmup: 120 });
+if (auditTrend.total < 500 || auditTrend.winrate < 70) {
+  console.error("trend stack failed to lock onto persistent drift: trades=" +
+    auditTrend.total + " WR=" + auditTrend.winrate.toFixed(2) + "%");
+  failed++;
+}
+
 // Historic matrix smoke (fast path, lean + smaller days)
 const HIST = sandbox.self.CYBER_HIST;
 const matrix = HIST.runMatrix({ days: 2, strategies: ["confluence"], assets: sandbox.self.CYBER_ASSETS.byKind("fx").slice(0, 3), minBars: 200 });

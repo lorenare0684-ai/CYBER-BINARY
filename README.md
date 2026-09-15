@@ -104,6 +104,38 @@ of one large loss. Controls:
 - optional **series cap** stops a series once it has cost a configured
   percentage of the balance.
 
+## Strategies, honestly
+
+The engine is a weighted-confluence stack (EMA, RSI, MACD, Stochastic,
+Bollinger, ADX, Supertrend, PSAR, VWAP, Donchian, Hurst, CCI, Williams %R)
+over 1m candles, with multi-timeframe alignment, a regime classifier, and
+hard gates that only ever *suppress* a signal, never flip one. The indicator
+math is textbook-correct (Wilder RMA seeding, true-range ATR, scale-stable
+stdev) and the backtester has **no lookahead**: a deterministic audit in
+`tools/validate.js` proves it.
+
+What the audit shows (and what it cannot show):
+
+- On a **pure random walk** every preset lands at ~50% win rate — no edge,
+  because none exists in the code. A technical stack cannot manufacture
+  predictability.
+- On a series with **real drift** the trend stacks lock on at ~93%.
+- The engine is honest: the backtester reports what is in the data, nothing
+  more.
+
+What it cannot show is whether **live broker candles** carry exploitable
+short-expiry structure. At an ~85% payout the breakeven win rate is ~54%, so
+the margin is thin, and Quotex **OTC** symbols are broker-generated synthetic
+prices where technical edges are weakest. Treat any backtest number as an
+in-sample upper bound. Validate on real data, on demo, before risking money:
+
+1. Open the broker on the asset you intend to trade and let the extension
+   cache real candles.
+2. Run the rebuilt backtester over that cached series (it refuses synthetic
+   data, so the result reflects the real feed).
+3. Enable slippage; short-expiry entries are sensitive to the entry price.
+4. Prefer trending regimes / liquid hours; the adaptive router sits out chop.
+
 ## Repository layout
 
 ```
