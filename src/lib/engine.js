@@ -1388,7 +1388,6 @@
       avgHolding: 0, winLossRatio: 0, kelly: 0,
       byRegime: {}, byConfidence: {}, byHour: {}, byStrategy: {}, byExpiry: {},
       calibration: [], equity: [], trades: [],
-      monteCarlo: null, walkForward: null,
     };
     if (!Array.isArray(candles) || candles.length < 40) return empty;
     for (let i = 0; i < candles.length; i++) {
@@ -1472,6 +1471,19 @@
     let bestTrade = -Infinity, worstTrade = Infinity;
     const returns = [];
 
+    // v3.0: money management. "flat" (default) keeps the legacy unit-stake
+    // behaviour bit-for-bit; "martingale" sizes each settled trade by the
+    // progression in CYBER_MONEY (win resets, loss steps up, depth-capped).
+    const moneyInput = opts && opts.money && typeof opts.money === "object" ? opts.money : null;
+    const MONEY = root.CYBER_MONEY || null;
+    const moneyEnabled = !!(moneyInput && moneyInput.plan === "martingale" && MONEY);
+    const moneyCfg = moneyEnabled
+      ? MONEY.normalizeConfig(Object.assign({ enabled: true }, moneyInput)) : null;
+    let moneyState = moneyEnabled ? MONEY.defaultState() : null;
+    const moneyBase = moneyEnabled
+      ? Math.max(MONEY.MIN_STAKE, Math.min(100000, numberValue(moneyInput.baseStake) != null ? numberValue(moneyInput.baseStake) : 1))
+      : 1;
+
     // Helper to get expiry price with fractional support
     function getExpiryPrice(entryIdx, effectiveHorizon) {
       const eff = Number(effectiveHorizon);
@@ -1522,9 +1534,21 @@
         (sig.direction === "PUT" && exit < entry));
       if (draw) draws++; else if (won) wins++; else losses++;
 
+      // Stake for this trade. Flat plan = 1 (legacy unit economics). The
+      // martingale plan plans the step BEFORE settlement and advances the
+      // series after it; draws leave the progression untouched (stake back).
+      let stake = 1;
+      if (moneyEnabled && !draw) {
+        const planned = MONEY.planNext(moneyCfg, moneyState, moneyBase, null);
+        stake = planned.ok && planned.stake != null ? planned.stake : moneyBase;
+      }
+
       // PnL calculations
       const tradePnlUnits = draw ? 0 : (won ? 1 : -1);
-      const tradePnlPayout = draw ? 0 : (won ? payout : -1);
+      const tradePnlPayout = draw ? 0 : (won ? payout * stake : -stake);
+      if (moneyEnabled && !draw) {
+        moneyState = MONEY.settle(moneyCfg, moneyState, won, tradePnlPayout);
+      }
       pnl += tradePnlUnits;
       pnlWithPayout += tradePnlPayout;
       if (tradePnlPayout > 0) grossProfit += tradePnlPayout;
@@ -1551,6 +1575,7 @@
         entryTime: entryTime,
         expiryTime: exitTimeMs,
         exitTime: exitTimeMs,
+        stake: stake,
         pnl: tradePnlUnits,
         pnlPayout: tradePnlPayout,
         payout: payout,
@@ -1756,55 +1781,5 @@
     };
   }
 
-  function monteCarlo(trades, opts) {
-    // Monte Carlo simulation: shuffle trade order N times to estimate risk
-    opts = opts || {};
-    const sims = Math.max(100, Math.min(10000, Math.floor(Number(opts.sims) || 1000)));
-    if (!Array.isArray(trades) || trades.length < 10) return { error: "need at least 10 trades" };
-    const returns = trades.map(t => t.pnlPayout != null ? t.pnlPayout : t.pnl).filter(r => Number.isFinite(r));
-    if (returns.length < 10) return { error: "insufficient returns" };
-
-    const results = [];
-    for (let s = 0; s < sims; s++) {
-      // Fisher-Yates shuffle copy
-      const shuffled = returns.slice();
-      for (let i = shuffled.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        const tmp = shuffled[i]; shuffled[i] = shuffled[j]; shuffled[j] = tmp;
-      }
-      let eq = 0, peak = -Infinity, maxDD = 0, maxLossStreak = 0, curLoss = 0;
-      for (const r of shuffled) {
-        eq += r;
-        if (eq > peak) peak = eq;
-        const dd = peak - eq;
-        if (dd > maxDD) maxDD = dd;
-        if (r < 0) { curLoss++; if (curLoss > maxLossStreak) maxLossStreak = curLoss; }
-        else curLoss = 0;
-      }
-      results.push({ finalPnL: eq, maxDD, maxLossStreak });
-    }
-    results.sort((a,b)=>a.finalPnL - b.finalPnL);
-    const percentile = (p) => {
-      const idx = Math.floor(results.length * p / 100);
-      return results[Math.max(0, Math.min(results.length-1, idx))];
-    };
-    const avgPnL = results.reduce((a,r)=>a+r.finalPnL,0)/results.length;
-    const avgDD = results.reduce((a,r)=>a+r.maxDD,0)/results.length;
-    const positive = results.filter(r=>r.finalPnL>0).length / results.length * 100;
-    return {
-      simulations: sims,
-      avgPnL, avgDD,
-      median: percentile(50),
-      p5: percentile(5),
-      p10: percentile(10),
-      p90: percentile(90),
-      p95: percentile(95),
-      positiveRate: positive,
-      best: results[results.length-1],
-      worst: results[0],
-      results: results.slice(0, 100), // sample for charting
-    };
-  }
-
-  root.CYBER_ENGINE = { DEFAULTS, DEFAULT_WEIGHTS, CONCRETE_STRATEGIES, STRATEGY_EXPIRY_PROFILES, REGIME_EXPIRY, suggestExpiry, analyze, backtest, walkForward, monteCarlo, resolveStrategy, liveSignalGate, historyTrustDecision };
+  root.CYBER_ENGINE = { DEFAULTS, DEFAULT_WEIGHTS, CONCRETE_STRATEGIES, STRATEGY_EXPIRY_PROFILES, REGIME_EXPIRY, suggestExpiry, analyze, backtest, walkForward, resolveStrategy, liveSignalGate, historyTrustDecision };
 })(typeof self !== "undefined" ? self : globalThis);

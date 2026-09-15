@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "CYBER BINARY \u2014 Quotex Trading Automation",
-  "version": "2.7.7",
-  "description": "v2.7.6: Fixed auto-trading not executing trades — 5 critical bugs fixed: history gate, account mode, cooldown, high-accuracy gate, chart authority check.",
+  "version": "3.0.0",
+  "description": "v3.0: Preloaded candle capture (HTTP + ack-correlated WS), Martingale money management, rebuilt backtester, hardened trade execution. Martingale is high-risk; trade responsibly.",
   "permissions": [
     "storage",
     "windows",
@@ -63,6 +63,7 @@
         "src/lib/engine.js",
         "src/lib/asset-selector.js",
         "src/lib/storage.js",
+        "src/lib/money.js",
         "src/lib/auto.js",
         "src/lib/backtest.js",
         "src/lib/workers.js",

@@ -36,6 +36,13 @@
       perAssetStrategy: {},       // { ASSET: strategyId }
       notifySound: true,
       notifyDesktop: false,
+      // v3.0: Martingale money management (see src/lib/money.js).
+      martingale: {
+        enabled: false,           // OFF by default — doubling progressions are high-risk
+        multiplier: 2,            // stake multiplier per consecutive loss (1.1–10)
+        maxSteps: 4,              // max progression depth before reset (1–10)
+        seriesCapPct: 0,          // 0 = off; else max % of balance one losing series may cost
+      },
     },
     stats: {
       wins: 0, losses: 0, history: [],
@@ -52,6 +59,8 @@
       tradesToday: 0, tradesHour: 0, dailyPnl: 0,
       lastTrade: null, lastAttemptAt: 0,
       lastSignalKey: "", recentSignalKeys: [], recentClosedOrderIds: [], frozenAssets: {},
+      // v3.0: live Martingale progression (see src/lib/money.js)
+      martingaleStep: 0, martingaleSeriesPnl: 0,
     },
     calibration: {
       buckets: {},                // { confidenceBucket: {pred, hit, n} }
@@ -205,6 +214,8 @@
       .filter((id) => typeof id === "string" && id.trim())
       .map((id) => id.trim().slice(0, 256)))).slice(-500);
     a.frozenAssets = sanitizeFrozenAssets(a.frozenAssets);
+    a.martingaleStep = Math.floor(finiteIn(a.martingaleStep, 0, 0, 10));
+    a.martingaleSeriesPnl = finiteIn(a.martingaleSeriesPnl, 0, -1000000000, 1000000000);
     if (!a.lastTrade || typeof a.lastTrade !== "object" || Array.isArray(a.lastTrade)) {
       a.lastTrade = null;
     } else {

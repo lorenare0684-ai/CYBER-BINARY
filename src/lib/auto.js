@@ -109,6 +109,8 @@
       dailyPnl: 0,
       frozenAssets: Object.create(null), // assetId → unfreezeAt
       account: { isDemo: null, balance: null, currency: null, at: 0 }, // v2.6.9 live/demo detection
+      // v3.0: live Martingale progression state (stake sizing lives in money.js)
+      martingale: { step: 0, seriesPnl: 0 },
       log: [],
     };
     const rawMax = numberValue(opts && opts.maxLog);
@@ -183,6 +185,15 @@
           const until = toMs(frozen[rawId], 0);
           if (id && until > now && until <= now + 7 * 86400000) ctx.frozenAssets[id] = until;
         }
+        // v3.0: restore the live Martingale progression so a reload does not
+        // reset a half-finished doubling series.
+        try {
+          if (root.CYBER_MONEY && typeof root.CYBER_MONEY.normalizeState === "function") {
+            ctx.martingale = root.CYBER_MONEY.normalizeState({
+              step: saved.martingaleStep, seriesPnl: saved.martingaleSeriesPnl,
+            });
+          }
+        } catch (_) {}
       } catch (_) {}
     })();
 
@@ -199,6 +210,8 @@
           recentSignalKeys: ctx.processedOrder.slice(-100),
           recentClosedOrderIds: ctx.settledOrderQueue.slice(-500),
           frozenAssets: Object.assign({}, ctx.frozenAssets),
+          martingaleStep: ctx.martingale.step,
+          martingaleSeriesPnl: ctx.martingale.seriesPnl,
         })).then(() => true, () => false);
       } catch (_) { return Promise.resolve(false); }
     }
@@ -247,6 +260,7 @@
         lastSignalKey: ctx.lastSignalKey,
         inFlight: ctx.inFlight,
         frozenAssets: Object.assign({}, ctx.frozenAssets),
+        martingale: Object.assign({}, ctx.martingale),
       };
     }
 
@@ -413,7 +427,19 @@
       if (fixedStake != null && fixedStake < 1) {
         return { ok: false, reason: `Stake below broker minimum ($1.00): ${fixedStake.toFixed(2)}` };
       }
-      if (ctx.account.balance != null && ctx.account.balance > 0 &&
+
+      // v3.0: Martingale money management. Applied AFTER fixed/percent base
+      // staking so the progression rides on whatever base the user chose.
+      // A plan the balance cannot fund refuses the trade outright — it never
+      // silently shrinks the step, which is how martingale accounts blow up.
+      const MONEY = root.CYBER_MONEY;
+      if (MONEY && s.martingale && s.martingale.enabled && fixedStake != null) {
+        const plan = MONEY.planNext(s.martingale, ctx.martingale, fixedStake, ctx.account.balance);
+        if (!plan.ok) {
+          return { ok: false, reason: `Martingale: ${plan.reason}` };
+        }
+        s = Object.assign({}, s, { stake: plan.stake });
+      } else if (ctx.account.balance != null && ctx.account.balance > 0 &&
           fixedStake != null && fixedStake > ctx.account.balance) {
         return {
           ok: false,
@@ -563,6 +589,9 @@
           result = { ok: false, confirmed: false, error: String(e && e.message || e) };
         }
         log.action = result;
+        // v3.0: record the ACTUAL submitted stake — under Martingale this is
+        // the progression-scaled value from canTrade, not the base setting.
+        log.stake = numberValue(decision.settings.stake);
         log.expiryMinutes = expiryMin;
         log.expiryReason = signal && signal.expiryReason ? String(signal.expiryReason).slice(0, 256) : null;
         log.suggestedExpiry = signal && signal.suggestedExpiry != null ? Number(signal.suggestedExpiry) : null;
@@ -727,6 +756,29 @@
           const asset = safeMapKey(assetId, 96);
           if (asset) ctx.frozenAssets[asset] = Date.now() + 15 * 60000;
         }
+        // v3.0: advance the Martingale progression on the settled outcome.
+        // Win → reset to base; loss → step up (or reset once the configured
+        // depth is exhausted). Config comes from live settings so toggling
+        // the system off stops further doubling immediately.
+        try {
+          const MONEY = root.CYBER_MONEY;
+          if (MONEY) {
+            const s = await loadSettings();
+            if (s && s.martingale && s.martingale.enabled) {
+              const before = ctx.martingale.step;
+              const seriesTotal = (ctx.martingale.seriesPnl || 0) + n;
+              const next = MONEY.settle(s.martingale, ctx.martingale, n > 0, n);
+              ctx.martingale = { step: next.step, seriesPnl: next.seriesPnl };
+              if (n > 0) {
+                if (before > 0) pushLog("trade", `Martingale WIN at step ${before} → reset to base stake`);
+              } else if (next.maxStepsReached) {
+                pushLog("warn", `Martingale: max depth exhausted — series reset to base stake (series P&L ${seriesTotal >= 0 ? "+" : ""}${seriesTotal.toFixed(2)})`);
+              } else {
+                pushLog("info", `Martingale LOSS → step ${next.step}/${s.martingale.maxSteps}`);
+              }
+            }
+          }
+        } catch (_) {}
         const persisted = await persistSafety();
         emitState();
         return persisted;

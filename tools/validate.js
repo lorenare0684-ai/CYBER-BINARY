@@ -21,6 +21,7 @@ const required = [
   "src/lib/engine.js",
   "src/lib/feed.js",
   "src/lib/storage.js",
+  "src/lib/money.js",
   "src/lib/auto.js",
   "src/lib/backtest.js",
   "src/lib/workers.js",
@@ -59,7 +60,7 @@ sandbox.window.WebSocket = undefined;
 sandbox.window.HTMLInputElement = { prototype: {} };
 sandbox.window.HTMLTextAreaElement = { prototype: {} };
 vm.createContext(sandbox);
-for (const f of ["indicators.js", "assets.js", "strategy.js", "feed.js", "engine.js", "storage.js", "auto.js", "backtest.js", "workers.js", "quotex.js"]) {
+for (const f of ["indicators.js", "assets.js", "strategy.js", "feed.js", "engine.js", "storage.js", "money.js", "auto.js", "backtest.js", "workers.js", "quotex.js"]) {
   vm.runInContext(fs.readFileSync(path.join(root, "src/lib", f), "utf8"), sandbox);
 }
 
@@ -163,6 +164,25 @@ if (!sandbox.self.CYBER_TA) { console.error("indicators missing"); failed++; }
 if (!sandbox.self.CYBER_ENGINE) { console.error("engine missing"); failed++; }
 if (!sandbox.self.CYBER_STORE) { console.error("store missing"); failed++; }
 if (!sandbox.self.CYBER_AUTO) { console.error("auto missing"); failed++; }
+const MG = sandbox.self.CYBER_MONEY;
+if (!MG) { console.error("money (martingale) module missing"); failed++; }
+else {
+  const cfg = MG.normalizeConfig({ enabled: true, multiplier: 2, maxSteps: 3 });
+  let st = MG.defaultState();
+  const step0 = MG.planNext(cfg, st, 1, 1000);
+  st = MG.settle(cfg, st, false, -1);
+  const step1 = MG.planNext(cfg, st, 1, 1000);
+  st = MG.settle(cfg, st, false, -2);
+  st = MG.settle(cfg, st, false, -4);
+  st = MG.settle(cfg, st, false, -8);   // 4th loss exceeds maxSteps=3
+  const afterReset = MG.planNext(cfg, st, 1, 1000);
+  const broke = MG.planNext(cfg, MG.defaultState(), 500, 100);
+  if (!step0.ok || step0.stake !== 1 || !step1.ok || step1.stake !== 2 ||
+      !st.maxStepsReached || st.step !== 0 || !afterReset.ok || afterReset.stake !== 1 ||
+      broke.ok) {
+    console.error("martingale progression/steps/reset/balance guards failed"); failed++;
+  }
+}
 if (!sandbox.self.CYBER_HIST) { console.error("backtest missing"); failed++; }
 const W = sandbox.self.CYBER_WORKERS;
 if (!W) {
@@ -177,7 +197,7 @@ if (!W) {
     );
     workerInputsSafe = Object.getPrototypeOf(canonical.seriesByAsset) === null &&
       canonical.jobs.length === 1 && canonical.jobs[0].asset.name !== "FORGED" &&
-      canonical.jobs[0].strategy.label !== "FORGED" && canonical.seriesByAsset.EURUSD.length === 1440;
+      canonical.jobs[0].strategy.label !== "FORGED" && canonical.seriesByAsset.EURUSD.length === 0;
     const otcJob = W.buildJob(["EURUSD", "EURUSD_otc", "BTCUSD_otc", "AAPL_otc"], ["trend"], {
       days: 1, kinds: ["otc"],
     });
@@ -564,10 +584,18 @@ const cachedSeries = HIST.getSeries(sandbox.self.CYBER_ASSETS.get("EURUSD"), {
     { time: cacheStart + 60000, open: 2.05, high: 2.2, low: 2, close: 2.1 },
   ],
 });
-if (cachedSeries.length !== 1440 || cachedSeries[cachedSeries.length - 1].close !== 2.1 ||
-    cachedSeries[cachedSeries.length - 3].time !== cacheStart - 60000 ||
-    Math.abs(cachedSeries[cachedSeries.length - 3].close - 2) > 1e-9) {
-  console.error("cached historic series was not preferred/aligned to its synthetic prefix"); failed++;
+// v3.0: getSeries is live-only — it returns exactly the real cached bars and
+// NEVER pads with synthetic data. An asset with 2 real candles gets 2 bars.
+if (cachedSeries.length !== 2 ||
+    cachedSeries[cachedSeries.length - 1].close !== 2.1 ||
+    cachedSeries[cachedSeries.length - 1].time !== cacheStart + 60000 ||
+    !cachedSeries._meta || cachedSeries._meta.source !== "live" ||
+    cachedSeries._meta.liveBars !== 2) {
+  console.error("historic series must be real cached candles only, never synthetically padded"); failed++;
+}
+const emptySeries = HIST.getSeries(sandbox.self.CYBER_ASSETS.get("EURUSD"), { days: 1 });
+if (emptySeries.length !== 0 || !emptySeries._meta || emptySeries._meta.source !== "none") {
+  console.error("an asset without cached candles must yield an empty series, not fabricated data"); failed++;
 }
 const dedupedMatrix = HIST.runMatrix({ days: 1, strategies: ["confluence", "confluence"], assets: ["EURUSD", "EURUSD"] });
 if (dedupedMatrix.count !== 1) { console.error("historic matrix did not deduplicate jobs"); failed++; }
@@ -653,7 +681,7 @@ async function poolTest() {
   }
   poolSandbox.self.Worker = FakeWorker;
   vm.createContext(poolSandbox);
-  for (const f of ["indicators.js", "assets.js", "strategy.js", "feed.js", "engine.js", "backtest.js", "workers.js"]) {
+  for (const f of ["indicators.js", "assets.js", "strategy.js", "feed.js", "engine.js", "money.js", "backtest.js", "workers.js"]) {
     vm.runInContext(fs.readFileSync(path.join(root, "src/lib", f), "utf8"), poolSandbox);
   }
   const WORKERS = poolSandbox.self.CYBER_WORKERS;
@@ -732,4 +760,7 @@ async function poolTest() {
   }
 }
 console.log("OK — structure + engine + backtest checks passed");
+  // The vm sandboxes keep background timers alive; exit explicitly so CI
+  // gets a deterministic status code instead of a hang.
+  process.exit(process.exitCode ? 1 : 0);
 })();

@@ -738,9 +738,28 @@ body::before {
   height: 100% !important;
 }
 
-/* Equity & Monte Carlo specific */
-#bt-equity-wrap, #bt-monte-wrap {
+/* Equity chart */
+#bt-equity-wrap {
   border-radius: 14px;
+}
+
+/* v3.0: Martingale card */
+.martingale-card .controls {
+  margin: 4px 0 10px;
+}
+.martingale-card .table {
+  font-size: 12px;
+}
+.martingale-card #mg-projection tbody td {
+  padding: 3px 8px;
+}
+
+/* v3.0: Data feed card */
+.feed-card .grid.stats {
+  margin-top: 6px;
+}
+.feed-card .grid.stats article strong {
+  font-size: 15px;
 }
 
 /* Responsive toolbar */

@@ -1926,6 +1926,49 @@
   var pendingAckOrder = [];
   var nextAckSeq = 1;
 
+  /**
+   * Recent outgoing history requests (newest last). When the broker answers
+   * a history request WITHOUT echoing the asset in the payload (several
+   * builds do), this log is what upgrades a fallback-attributed batch to a
+   * verified one: if exactly one request for that period is outstanding, the
+   * response can only belong to it.
+   */
+  var recentHistoryReqs = [];
+
+  function rememberHistoryRequest(asset, period) {
+    var sym = normalizeSymbolName(asset);
+    var per = numberValue(period);
+    if (!sym || per == null || per <= 0) return;
+    var now = Date.now();
+    recentHistoryReqs.push({ asset: sym, period: Math.floor(per), at: now });
+    while (recentHistoryReqs.length > 32) recentHistoryReqs.shift();
+    // Trim entries older than 30s — a broker answer never takes that long,
+    // and stale entries would mis-attribute later headerless pushes.
+    var cutoff = now - 30000;
+    while (recentHistoryReqs.length && recentHistoryReqs[0].at < cutoff) recentHistoryReqs.shift();
+  }
+
+  function attributeFromRecentRequests(period) {
+    if (!recentHistoryReqs.length) return null;
+    var now = Date.now();
+    var cutoff = now - 15000;
+    var per = numberValue(period);
+    var matches = [];
+    for (var i = 0; i < recentHistoryReqs.length; i++) {
+      var r = recentHistoryReqs[i];
+      if (r.at < cutoff) continue;
+      if (per != null && per > 0 && r.period !== Math.floor(per)) continue;
+      matches.push(r);
+    }
+    if (!matches.length) return null;
+    // Only an unambiguous single candidate may be promoted to verified.
+    var asset = matches[0].asset;
+    for (var j = 1; j < matches.length; j++) {
+      if (matches[j].asset !== asset) return null;
+    }
+    return { asset: asset, period: matches[matches.length - 1].period };
+  }
+
   function registerOrderAck(requestId, meta) {
     // Socket.IO ack ids are per-socket counter integers; keep ours numeric
     // and far from the page client's own low counters.
@@ -1933,7 +1976,9 @@
     meta = meta && typeof meta === "object" ? meta : {};
     PENDING_ACKS[ackId] = {
       requestId: String(requestId == null ? "" : requestId),
+      kind: meta.kind === "history" ? "history" : "order",
       asset: typeof meta.asset === "string" ? meta.asset : "",
+      period: numberValue(meta.period) != null ? numberValue(meta.period) : 0,
       dir: meta.dir === "PUT" ? "PUT" : (meta.dir === "CALL" ? "CALL" : ""),
       amount: numberValue(meta.amount) != null ? numberValue(meta.amount) : 0,
       expirySec: numberValue(meta.expirySec) != null ? numberValue(meta.expirySec) : 0,
@@ -2122,12 +2167,37 @@
       try { listeners.frame(label, payload, frame); } catch (_) {}
     }
 
-    function emitCandles(payload) {
-      var c = parseCandles(payload, lastAsset, lastPeriod);
+    /** Does the payload name its own period (vs. inheriting the router's)? */
+    function payloadHasPeriod(payload) {
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) return false;
+      if (payload.period != null || payload.timeframe != null) return true;
+      var body = null;
+      if (payload.data && typeof payload.data === "object" && !Array.isArray(payload.data)) body = payload.data;
+      else if (payload.result && typeof payload.result === "object" && !Array.isArray(payload.result)) body = payload.result;
+      return !!(body && (body.period != null || body.timeframe != null));
+    }
+
+    function emitCandles(payload, forcedAsset, forcedPeriod, forcedVerified) {
+      var fallbackAsset = forcedAsset || lastAsset;
+      var fallbackPeriod = forcedPeriod != null ? forcedPeriod : lastPeriod;
+      var c = parseCandles(payload, fallbackAsset, fallbackPeriod);
       if (c && Array.isArray(c.raw) && c.raw.length) {
+        var verified = !!(c.verified) || !!forcedVerified;
+        // Headerless broker pushes (the initial preloaded batch arrives this
+        // way on several builds) carry no asset of their own. When the batch
+        // answers an unambiguous recent request of ours, attribute it with
+        // certainty instead of degrading it to a display-only guess. If the
+        // payload names no period of its own, match on any period — the
+        // router's 60s default must not mask the real request.
+        if (!c.asset && !verified) {
+          var attributed = attributeFromRecentRequests(payloadHasPeriod(payload) ? c.period : null);
+          if (attributed) {
+            c.asset = attributed.asset;
+            verified = true;
+          }
+        }
         var asset = c.asset || lastAsset || "";
         var period = c.period || lastPeriod || 60;
-        var verified = !!(c.verified);
         var normalized = normalizeCandles(c);
         if (normalized.length) {
           try { listeners.candle({ asset: asset, period: period, candles: normalized, verified: verified }); } catch (_) {}
@@ -2332,7 +2402,16 @@
         // They have no event name, so they must be routed before the
         // event-name mapping below would drop them as "unknown".
         if (frame.ackBody) {
-          emitOrderAck(frame);
+          // ACK bodies answer one of our own emits. History requests and
+          // orders/open both use this channel; the pending-ack registry
+          // knows which kind each ack id belongs to.
+          var ackPeek = frame && frame.id != null ? PENDING_ACKS[String(frame.id)] : null;
+          if (ackPeek && ackPeek.kind === "history") {
+            var histMeta = takeOrderAck(frame.id);
+            emitCandles(frame.payload, histMeta && histMeta.asset, histMeta && histMeta.period, true);
+          } else {
+            emitOrderAck(frame);
+          }
           return;
         }
         var ev3 = mapEventName(frame.event);
@@ -2590,6 +2669,113 @@
   }
 
   /* ============================================================
+   * 7b. HTTP history capture.
+   *
+   * The platform fetches the chart's INITIAL candle block over plain HTTP
+   * (fetch/XHR) when a market page opens, and only switches the socket to
+   * live ticks afterwards. A WebSocket-only hook therefore never sees the
+   * preloaded history — it only starts receiving candles when the user pans
+   * the chart left and the platform back-fills over the socket.
+   *
+   * The page-hook wraps fetch() and XMLHttpRequest and hands every JSON
+   * response body to `parseHttpHistory`; `historyParamsFromUrl` recovers the
+   * asset/period the page asked for so the batch can be attributed with
+   * certainty.
+   * ============================================================ */
+  function periodFromToken(token) {
+    if (token == null) return null;
+    if (typeof token === "number") {
+      var n0 = token;
+      while (n0 >= 1e11) n0 /= 1000;
+      return n0 > 0 && n0 <= 86400 ? Math.floor(n0) : null;
+    }
+    var s = String(token).trim().toLowerCase();
+    if (!s) return null;
+    var m = s.match(/^(\d+(?:\.\d+)?)\s*(s|sec|second|seconds|m|min|minute|minutes|h|hr|hour|hours|d|day|days)?$/);
+    if (!m) {
+      // TradingView-style resolutions: "1", "5", "60", "1m", "m1", "M5", "1H"
+      m = s.match(/^(?:m|min)?(\d+)(?:s|m|h|d)?$/);
+      if (!m) return null;
+      var bare = parseFloat(m[1]);
+      if (!Number.isFinite(bare) || bare <= 0) return null;
+      if (/^m/.test(s)) return Math.min(86400, Math.floor(bare * 60));
+      if (/h$/.test(s)) return Math.min(86400, Math.floor(bare * 3600));
+      // Bare number: values >= 1000 look like ms epochs elsewhere, but as a
+      // timeframe token the platform uses seconds (60, 300, 3600…).
+      return bare <= 86400 ? Math.floor(bare) : null;
+    }
+    var qty = parseFloat(m[1]);
+    if (!Number.isFinite(qty) || qty <= 0) return null;
+    var unit = m[2] || "s";
+    var mult = unit.charAt(0) === "s" ? 1 : (unit.charAt(0) === "m" ? 60 : (unit.charAt(0) === "h" ? 3600 : 86400));
+    var secs = Math.floor(qty * mult);
+    return secs > 0 && secs <= 86400 ? secs : null;
+  }
+
+  /**
+   * Parse an HTTP response body that may carry candle history. Returns the
+   * parsed JSON only when it actually contains candle-shaped rows, otherwise
+   * null. Deliberately lenient about the envelope: broker builds wrap rows
+   * in {candles}, {history}, {data:{...}}, or return the bare row array.
+   */
+  function parseHttpHistory(text) {
+    if (typeof text !== "string") return null;
+    var t = text.length > 2 && text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+    t = t.trim();
+    if (!t || t.length > 25 * 1024 * 1024) return null;
+    var first = t.charAt(0);
+    if (first !== "{" && first !== "[") return null;
+    var json = safeJSON(t);
+    if (json == null) return null;
+    try {
+      if (inferEventFromPayload(json) !== "candles") return null;
+    } catch (_) { return null; }
+    return json;
+  }
+
+  /** Recover {asset, period} the page asked for from a request URL. */
+  function historyParamsFromUrl(url) {
+    var out = { asset: null, period: null };
+    var raw = String(url == null ? "" : url);
+    if (!raw) return out;
+    try {
+      var qIndex = raw.indexOf("?");
+      var query = qIndex >= 0 ? raw.slice(qIndex + 1) : "";
+      var pairs = query ? query.split("&") : [];
+      var assetNames = ["asset", "symbol", "instrument", "pair", "code", "market", "ticker", "id", "instrumentId", "assetId"];
+      var periodNames = ["period", "timeframe", "tf", "interval", "granularity", "resolution", "duration", "periodSeconds"];
+      for (var i = 0; i < pairs.length && i < 64; i++) {
+        var eq = pairs[i].indexOf("=");
+        if (eq <= 0) continue;
+        var key = "";
+        var val = "";
+        try { key = decodeURIComponent(pairs[i].slice(0, eq)).trim().toLowerCase(); } catch (_) { key = pairs[i].slice(0, eq).trim().toLowerCase(); }
+        try { val = decodeURIComponent(pairs[i].slice(eq + 1)).trim(); } catch (_) { val = pairs[i].slice(eq + 1).trim(); }
+        if (!key || !val) continue;
+        if (out.asset == null && assetNames.indexOf(key) !== -1) {
+          if (/^\d+$/.test(val) && ID_TO_SYMBOL[Number(val)]) out.asset = ID_TO_SYMBOL[Number(val)];
+          else out.asset = normalizeSymbolName(val);
+        }
+        if (out.period == null && periodNames.indexOf(key) !== -1) {
+          out.period = periodFromToken(val);
+        }
+      }
+      if (out.asset == null || out.period == null) {
+        // Path-shaped variants: /history/EURUSD_otc/60, /candles/EURUSD~60
+        var pm = raw.match(/\/(?:history|candles|chart|api)[^?]*?\/([A-Za-z0-9_\-\.]{3,32})(?:[\/~|%])(\d{1,6})(?:[?\/]|$)/);
+        if (pm) {
+          if (out.asset == null) out.asset = normalizeSymbolName(pm[1]);
+          if (out.period == null) out.period = periodFromToken(pm[2]);
+        }
+      }
+    } catch (_) {}
+    if (out.asset && !ID_TO_SYMBOL[ASSET_IDS[out.asset] || 0] && !ASSET_IDS[out.asset]) {
+      // Unknown symbol — keep it; ensureRegistered downstream handles it.
+    }
+    return out;
+  }
+
+  /* ============================================================
    * 8. Public API.
    * ============================================================ */
   var KNOWN_EVENTS = [
@@ -2654,10 +2840,21 @@
     buildOrderPayload: buildOrderPayload,
     qxExpirationEpoch: qxExpirationEpoch,
     /**
-     * Ask the broker for real-time ticks + history on the *page's own*
-     * socket. Mirrors the exact sequence the Quotex web client sends when a
-     * chart opens, so nothing extra is needed to receive `quotes/stream` and
-     * `history/list/v2` frames from the server. Safe to call repeatedly.
+     * Ask the broker for candle history on the *page's own* socket.
+     *
+     * v3.0: each history request is sent WITH a Socket.IO callback id. Two
+     * things come out of that:
+     *   1. Builds whose handler invokes the callback answer on `43<ackId>`;
+     *      the router ties that answer to this asset/period with certainty
+     *      (verified batch — the engine may seed from it).
+     *   2. Builds that ignore the callback still push the data as regular
+     *      `history/list*` frames; the recent-request log upgrades those to
+     *      verified attribution whenever the answer is unambiguous.
+     * The old implementation sprayed ten different event names without
+     * correlation ids — several of them (`instruments/update`, the duplicate
+     * `count` variant) had side effects on the visible chart and none could
+     * ever be attributed back to the request, so preloaded batches arrived
+     * "unverified" and the engine refused to seed from them.
      */
     subscribeHistory: function (ws, asset, period, limit, offset) {
       if (!ws || typeof ws.send !== "function") return { ok: false, error: "no websocket handle" };
@@ -2667,9 +2864,7 @@
       period = numberValue(period);
       period = period != null && period > 0 ? Math.min(86400, Math.floor(period)) : 60;
       // Broker history is capped at 5000 rows per request. Asking for more
-      // (some callers passed 9000–10000) makes the platform answer with an
-      // error or an empty batch, which left the dashboard on
-      // "Waiting for candles…" even though the feed was live.
+      // makes the platform answer with an error or an empty batch.
       limit = numberValue(limit);
       limit = limit != null ? Math.max(60, Math.min(5000, Math.floor(limit))) : 5000;
       offset = numberValue(offset);
@@ -2677,15 +2872,15 @@
       try {
         ws.send('42["tick"]');
         ws.send('42["instruments/follow","' + sym + '"]');
-        ws.send('42["instruments/update",{"asset":"' + sym + '","period":' + period + '}]');
-        ws.send('42["history/list/v2",{"asset":"' + sym + '","period":' + period + ',"offset":' + offset + ',"limit":' + limit + '}]');
-        ws.send('42["history/list",{"asset":"' + sym + '","period":' + period + ',"offset":' + offset + ',"limit":' + limit + '}]');
-        ws.send('42["history/list/v3",{"asset":"' + sym + '","period":' + period + ',"offset":' + offset + ',"limit":' + limit + '}]');
-        ws.send('42["chart_notification/get",{"asset":"' + sym + '","version":"1.0.0"}]');
-        ws.send('42["loadHistoryPeriod",{"asset":"' + sym + '","period":' + period + ',"offset":' + offset + ',"limit":' + limit + '}]');
-        ws.send('42["loadHistory",{"asset":"' + sym + '","period":' + period + ',"offset":' + offset + ',"limit":' + limit + '}]');
-        ws.send('42["candles/history",{"asset":"' + sym + '","period":' + period + ',"offset":' + offset + ',"limit":' + limit + '}]');
-        ws.send('42["history/list/v2",{"asset":"' + sym + '","period":' + period + ',"offset":' + offset + ',"count":' + limit + '}]');
+        var variants = ["history/list/v2", "history/list", "candles/history", "loadHistoryPeriod"];
+        var body = JSON.stringify({ asset: sym, period: period, offset: offset, limit: limit });
+        for (var vi = 0; vi < variants.length; vi++) {
+          var ackId = registerOrderAck("hist_" + Date.now() + "_" + vi, {
+            kind: "history", asset: sym, period: period,
+          });
+          rememberHistoryRequest(sym, period);
+          ws.send('42' + ackId + '["' + variants[vi] + '",' + body + ']');
+        }
         return { ok: true, asset: sym, period: period, limit: limit, offset: offset };
       } catch (e) {
         return { ok: false, error: String(e && e.message || e) };
@@ -2787,6 +2982,10 @@
     },
     rememberIds: rememberIds,
     sniffOutgoing: sniffOutgoing,
+    parseHttpHistory: parseHttpHistory,
+    historyParamsFromUrl: historyParamsFromUrl,
+    periodFromToken: periodFromToken,
+    rememberHistoryRequest: rememberHistoryRequest,
     KNOWN_EVENTS: KNOWN_EVENTS,
     WSS_GUESSES: WSS_GUESSES,
     ASSET_IDS: ASSET_IDS,

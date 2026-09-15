@@ -7,7 +7,7 @@
 
   const STRATEGIES = {
     "auto_adaptive": {
-      label: "Auto-Adaptive (Elite Strategy Router)",
+      label: "Auto-Adaptive Router",
       blurb: "Dynamically evaluates market regime, volatility, and high-accuracy strategy matrix to auto-select the highest winrate setup for the current bar.",
       params: {
         rsiPeriod: 14, rsiBuy: 42, rsiSell: 58,
@@ -25,7 +25,7 @@
       },
     },
     "high_accuracy": {
-      label: "High-Accuracy 80+ (Trending Regime Only)",
+      label: "Precision Trend",
       blurb: "Ultra-selective engine: fires only in trending regimes with 90+ confluence. Tuned for 5-8 minute expiries (set expiry accordingly). Far fewer signals, far higher hit rate.",
       params: {
         rsiPeriod: 7, rsiBuy: 40, rsiSell: 60,
@@ -49,7 +49,7 @@
       },
     },
     "sniper": {
-      label: "Sniper 90+ Confluence",
+      label: "Strict Confluence",
       blurb: "Ultra-high conviction multi-timeframe alignment with strict Supertrend, ADX filter, and Parabolic SAR confirmation.",
       params: {
         rsiPeriod: 14, rsiBuy: 45, rsiSell: 55,
@@ -67,7 +67,7 @@
       },
     },
     "turbo_trend": {
-      label: "Turbo Trend Flow",
+      label: "Trend Flow",
       blurb: "Fast EMA ribbon acceleration coupled with Supertrend and higher-timeframe momentum continuation.",
       params: {
         rsiPeriod: 12, rsiBuy: 46, rsiSell: 54,
@@ -85,7 +85,7 @@
       },
     },
     "institutional_flow": {
-      label: "Institutional VWAP Flow",
+      label: "VWAP Flow",
       blurb: "Volume-weighted institutional anchor levels aligned with Hurst fractal trend persistence.",
       params: {
         rsiPeriod: 14, rsiBuy: 45, rsiSell: 55,
@@ -121,7 +121,7 @@
       },
     },
     "trend": {
-      label: "Trend Master",
+      label: "Trend",
       blurb: "EMA + ADX + Supertrend heavy. Best in directional trending markets.",
       params: {
         rsiPeriod: 14, rsiBuy: 45, rsiSell: 55,
@@ -139,7 +139,7 @@
       },
     },
     "breakout": {
-      label: "Breakout Velocity",
+      label: "Breakout",
       blurb: "Donchian channel breakout with ADX surge and volatility expansion.",
       params: {
         rsiPeriod: 14, rsiBuy: 50, rsiSell: 50,
@@ -157,7 +157,7 @@
       },
     },
     "scalp": {
-      label: "1m Ultra Scalp",
+      label: "1m Scalp",
       blurb: "Fast EMA + MACD pulse for rapid high-frequency entries.",
       params: {
         rsiPeriod: 7, rsiBuy: 40, rsiSell: 60,
@@ -175,7 +175,7 @@
       },
     },
     "otc": {
-      label: "OTC Pro Matrix",
+      label: "OTC Matrix",
       blurb: "Tailored for Quotex OTC synthetic pairs with adaptive volatility filtering.",
       params: {
         rsiPeriod: 14, rsiBuy: 40, rsiSell: 60,
@@ -193,7 +193,7 @@
       },
     },
     "squeeze": {
-      label: "Volatility Squeeze Expansion",
+      label: "Volatility Squeeze",
       blurb: "Bollinger compression inside Keltner Channels followed by explosive directional expansion.",
       params: {
         rsiPeriod: 14, rsiBuy: 48, rsiSell: 52,
@@ -211,7 +211,7 @@
       },
     },
     "ribbon": {
-      label: "EMA Ribbon Matrix",
+      label: "EMA Ribbon",
       blurb: "Multiple EMA stack alignment (Fast / Medium / Slow) + ADX trend confirmation.",
       params: {
         rsiPeriod: 14, rsiBuy: 45, rsiSell: 55,

@@ -1306,7 +1306,7 @@
     }, wait);
   }
 
-  function ingestLiveCandles(asset, period, candles, verified) {
+  function ingestLiveCandles(asset, period, candles, verified, source) {
     if (!asset || !Array.isArray(candles) || !candles.length) return;
     const det = typeof asset === "string" && asset.length <= 80 ? ASSETS.ensureRegistered(asset) : null;
     if (!det) return;
@@ -1385,6 +1385,20 @@
       if (!ingestTrustLog[id] || Date.now() - ingestTrustLog[id] > 60000) {
         ingestTrustLog[id] = Date.now();
         try { console.warn("candle batch for " + id + " kept for display only: " + trust.reason); } catch (_) {}
+      }
+      // v3.0: a rejected batch on the ACTIVE asset usually means the answer
+      // arrived un-attributed. Ask again with force — the ack-correlated
+      // request gives the retry a verified answer the engine can seed from.
+      if (id === activeAsset) {
+        const nudgeKey = "reseed:" + id;
+        if (!ingestTrustLog[nudgeKey] || Date.now() - ingestTrustLog[nudgeKey] > 10000) {
+          ingestTrustLog[nudgeKey] = Date.now();
+          setTimeout(() => {
+            try {
+              if (!historySeeded[id]) ensureHistorySubscription(ASSETS.get(id) || ASSETS.ensureRegistered(id), true);
+            } catch (_) {}
+          }, 1500);
+        }
       }
     }
     const useForEngine = safePeriod === 60 && trust.engine;
@@ -2041,6 +2055,15 @@
       // genuine 1m series directly while the storage write is still settling.
       // Synthetic warm-up bars must never be presented as broker history.
       realHistoryReady: !!realHistoryReady[activeAsset],
+      // v3.0: honest feed status — the dashboard shows whether the engine
+      // actually holds preloaded broker candles or is still waiting.
+      feed: {
+        seeded: !!historySeeded[activeAsset],
+        realBars: realBarCount[activeAsset] || 0,
+        engineBars: feedSeries.length,
+        ready: !!realHistoryReady[activeAsset],
+        lastTickAt: lastAcceptedQuoteAt[activeAsset] || 0,
+      },
       signal: sig,
       wins: stats.wins,
       losses: stats.losses,
@@ -2609,6 +2632,7 @@
     });
   }
 
+  let lastSeedWatchAt = 0;
   function tick() {
     const det = syncActiveAsset();
     const currentTime = Date.now();
@@ -2616,6 +2640,14 @@
     // Periodic instruments/balance refresh
     if (currentTime % 15000 < 1200) {
       try { requestInstrumentsAndBalance(false); } catch (_) {}
+    }
+    // v3.0 seed watchdog: until the active asset's engine feed holds real
+    // broker candles, keep re-asking for its history (every 8s). The first
+    // request can race the socket open; preloaded history must not depend
+    // on the user panning the chart.
+    if (activeAsset && !historySeeded[activeAsset] && currentTime - lastSeedWatchAt > 8000) {
+      lastSeedWatchAt = currentTime;
+      try { ensureHistorySubscription(det || ASSETS.get(activeAsset) || ASSETS.ensureRegistered(activeAsset), true); } catch (_) {}
     }
     // Periodic gap check for active asset (every 2 min)
     if (currentTime % 120000 < 1200) {
@@ -2721,7 +2753,7 @@
       }
       case "candle": {
         if (p && p.asset && Array.isArray(p.candles)) {
-          ingestLiveCandles(p.asset, p.period, p.candles, p.verified === true);
+          ingestLiveCandles(p.asset, p.period, p.candles, p.verified === true, p.source);
         }
         break;
       }

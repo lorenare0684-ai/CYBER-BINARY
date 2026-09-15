@@ -9,6 +9,7 @@ importScripts(
   "lib/strategy.js",
   "lib/feed.js",
   "lib/engine.js",
+  "lib/money.js",
   "lib/backtest.js",
   "lib/workers.js"
 );
@@ -40,6 +41,7 @@ self.onmessage = function (event) {
     sortBy: input.sortBy,
     cachedByAsset: input.cachedByAsset && typeof input.cachedByAsset === "object" ? input.cachedByAsset : null,
     liveOnly: input.liveOnly === true || input.requireLive === true,
+    money: input.money && typeof input.money === "object" ? input.money : null,
     onProgress: function (progress) {
       self.postMessage({ type: "progress", i: progress.i, total: progress.total });
     },

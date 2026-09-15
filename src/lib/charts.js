@@ -995,58 +995,6 @@
     state._lastEquity=eq; state._lastTrades=trades; state._lastPlot={ xFor, yEq, w, priceH, totalH };
   }
 
-  function drawMonteCarloChart(canvas, mcResults, opts) {
-    if (!canvas) return;
-    opts=opts||{};
-    const parent=canvas.parentElement;
-    const w=Math.max(320, Math.min(4096, (parent && parent.clientWidth)||800));
-    const h=Math.max(170, Math.round(w*0.30));
-    const dpr=Math.max(1, Math.min(2, Number(window.devicePixelRatio)||1));
-    canvas.width=Math.floor(w*dpr); canvas.height=Math.floor(h*dpr);
-    canvas.style.width=w+"px"; canvas.style.height=h+"px";
-    const ctx=canvas.getContext("2d"); if(!ctx) return;
-    ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,w,h);
-    ctx.fillStyle="#0c1422"; ctx.fillRect(0,0,w,h);
-
-    if (!mcResults || !Array.isArray(mcResults) || mcResults.length<5){
-      ctx.fillStyle="rgba(255,255,255,0.45)"; ctx.font="11px system-ui, sans-serif"; ctx.textAlign="center";
-      ctx.fillText("Run Monte Carlo to see distribution", w/2, h/2); return;
-    }
-    const vals=mcResults.map(r=>r.finalPnL).sort((a,b)=>a-b);
-    const lo=vals[0], hi=vals[vals.length-1]; const range=hi-lo||1;
-    const bins=50; const counts=new Array(bins).fill(0);
-    for(const v of vals){ const idx=Math.min(bins-1, Math.max(0, Math.floor((v-lo)/range*bins))); counts[idx]++; }
-    const maxC=Math.max(...counts)||1;
-    const padL=54, padR=18, padT=28, padB=32;
-    const plotW=w-padL-padR, plotH=h-padT-padB;
-
-    ctx.strokeStyle="rgba(255,255,255,0.06)"; ctx.beginPath();
-    for(let i=0;i<=4;i++){ const y=padT + (i/4)*plotH; ctx.moveTo(padL, y); ctx.lineTo(padL+plotW, y); }
-    ctx.stroke();
-
-    for(let i=0;i<bins;i++){
-      const x=padL + (i/bins)*plotW; const bw=plotW/bins*0.78; const bh=(counts[i]/maxC)*plotH; const y=padT+plotH-bh;
-      const grad=ctx.createLinearGradient(0,y,0,y+bh); grad.addColorStop(0,"rgba(74,163,255,0.95)"); grad.addColorStop(1,"rgba(74,163,255,0.2)");
-      ctx.fillStyle=grad; ctx.beginPath(); const r=2.5;
-      ctx.moveTo(x, y+bh); ctx.lineTo(x, y+r); ctx.quadraticCurveTo(x,y,x+r,y); ctx.lineTo(x+bw-r,y); ctx.quadraticCurveTo(x+bw,y,x+bw,y+r); ctx.lineTo(x+bw,y+bh); ctx.closePath(); ctx.fill();
-    }
-
-    function percentile(p){ const idx=Math.floor((p/100)*vals.length); return vals[Math.min(vals.length-1, Math.max(0, idx))]; }
-    const p5=percentile(5), p25=percentile(25), p50=percentile(50), p75=percentile(75), p95=percentile(95);
-    const markers=[{v:p5,label:"5%",color:"#ff5d7a"}, {v:p25,label:"25%",color:"rgba(255,93,122,0.6)"}, {v:p50,label:"MED",color:"#7ff5ff"}, {v:p75,label:"75%",color:"rgba(61,255,154,0.6)"}, {v:p95,label:"95%",color:"#3dff9a"}];
-    for(const m of markers){
-      const x=padL + ((m.v-lo)/range)*plotW;
-      ctx.strokeStyle=m.color; ctx.setLineDash(m.label==="MED"?[0,0]:[4,3]); ctx.lineWidth=m.label==="MED"?1.5:1;
-      ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, padT+plotH); ctx.stroke(); ctx.setLineDash([]); ctx.lineWidth=1;
-      ctx.fillStyle=m.color; ctx.font=m.label==="MED"?"bold 10px ui-monospace, monospace":"9px ui-monospace, monospace"; ctx.textAlign="center";
-      ctx.fillText(m.label, x, padT-6); ctx.font="9px ui-monospace, monospace"; ctx.fillText(m.v.toFixed(1), x, padT+plotH+14);
-    }
-
-    ctx.fillStyle="rgba(255,255,255,0.55)"; ctx.font="10px ui-monospace, monospace"; ctx.textAlign="left";
-    ctx.fillText(lo.toFixed(1), padL, h-4); ctx.textAlign="right"; ctx.fillText(hi.toFixed(1), padL+plotW, h-4);
-    ctx.textAlign="left"; ctx.fillText(`Monte Carlo · ${vals.length} sims · [${lo.toFixed(1)} → ${hi.toFixed(1)}] · Med ${p50.toFixed(1)} · 5% ${p5.toFixed(1)} · 95% ${p95.toFixed(1)}`, 12, 16);
-  }
-
   // Performance timeline chart (winrate over time)
   function drawPerformanceChart(canvas, history, opts) {
     if (!canvas) return;
@@ -1118,7 +1066,6 @@
     drawMainChart,
     bindMainChartInteractions,
     drawEquityChart,
-    drawMonteCarloChart,
     drawPerformanceChart,
     exportCanvasPNG,
     getState,

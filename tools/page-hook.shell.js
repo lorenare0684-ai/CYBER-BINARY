@@ -72,7 +72,8 @@
       reconnections: 0,
       gapsDetected: 0,
       instrumentsUpdates: 0,
-      balanceUpdates: 0
+      balanceUpdates: 0,
+      httpBatches: 0
     },
     socketMeta: Object.create(null), // wsId -> {url, createdAt, lastMsgAt, msgCount, isOpen}
     lastInstrumentsAt: 0,
@@ -117,6 +118,9 @@
     // v2.7.5: chart asset changed — try to apply any markers that were
     // deferred during the previous chart mismatch.
     try { MARKERS.reapplyPendingMarkers(); } catch (_) {}
+    // v3.0: chart identified — pull its history once so the extension holds
+    // preloaded candles without the user having to pan the chart.
+    try { setTimeout(function () { prefetchActiveHistory("chart"); }, 700); } catch (_) {}
     return true;
   }
 
@@ -131,6 +135,7 @@
       var period = msg.period || live.lastWsPeriod || 60;
       var key = asset + "@" + period;
       var incoming = Array.isArray(msg.candles) ? msg.candles.slice(-10000) : [];
+      var batchSource = msg.source === "http" ? "http" : (msg.source === "chart" ? "chart" : "ws");
       // v2.8: merge instead of replace when we already have data for this key
       // This prevents newer small batches from wiping larger history, and handles
       // pagination correctly. Use Q.mergeCandleArrays if available.
@@ -164,6 +169,7 @@
       try {
         live.dataStats.candlesReceived++;
         live.dataStats.lastCandleAt = Date.now();
+        if (batchSource === "http") live.dataStats.httpBatches = (live.dataStats.httpBatches || 0) + 1;
         // Gap detection for quality tracking
         if (Q.detectGaps && live.candles[key].length >= 2) {
           var gaps = Q.detectGaps(live.candles[key], period);
@@ -178,7 +184,7 @@
         delete live.candles[droppedKey];
         delete live.candlesVerified[droppedKey];
       }
-      emit("candle", { asset: asset, period: period, candles: live.candles[key], verified: live.candlesVerified[key] === true });
+      emit("candle", { asset: asset, period: period, candles: live.candles[key], verified: live.candlesVerified[key] === true, source: batchSource });
     },
     onTick: function (q) {
       if (!q || !q.symbol) return;
@@ -281,6 +287,139 @@
   handle.router = router;
 
   /* ====================================================================
+   * v3.0 — preloaded-history capture.
+   *
+   * The platform loads the chart's INITIAL candle block over plain HTTP
+   * (fetch/XHR) when the market page opens, then streams live ticks over
+   * the socket. A WebSocket-only hook therefore never sees the preloaded
+   * history — candles only start arriving when the user pans the chart left
+   * and the platform back-fills over the socket. Two fixes work together:
+   *
+   *   1. HTTP capture: fetch() and XMLHttpRequest responses are inspected;
+   *      anything shaped like candle history is routed into the same
+   *      pipeline as socket batches (asset/period recovered from the URL).
+   *   2. Proactive prefetch: as soon as the chart asset is known and a
+   *      broker socket is open, the extension asks for the visible period
+   *      (+ 1m for the engine) once, so preloaded bars never depend on the
+   *      user moving the chart.
+   * ==================================================================== */
+  function historyUrlCandidate(url) {
+    var s = String(url || "").toLowerCase();
+    if (!s) return false;
+    if (/\.(png|jpe?g|gif|svg|webp|woff2?|ttf|css|js|mp4|webm|ico|json\.map)([?#]|$)/.test(s)) return false;
+    return /(histor|candle|chart|quote|market|instrument|asset|tick|api)/.test(s);
+  }
+
+  function handleHttpHistory(text, url) {
+    try {
+      if (!text || typeof Q.parseHttpHistory !== "function") return;
+      var json = Q.parseHttpHistory(text);
+      if (json == null) return;
+      var params = Q.historyParamsFromUrl ? Q.historyParamsFromUrl(url) : { asset: null, period: null };
+      var fallbackAsset = (live.activeChart && live.activeChart.symbol) || live.lastWsSymbol || null;
+      var fallbackPeriod = (live.activeChart && live.activeChart.period) || live.lastWsPeriod || 60;
+      var parsed = Q.parseCandles(json, params.asset || fallbackAsset, params.period || fallbackPeriod);
+      if (!parsed || !Array.isArray(parsed.raw) || !parsed.raw.length) return;
+      var candles = Q.normalizeCandles(parsed);
+      if (!candles.length) return;
+      var asset = parsed.asset || fallbackAsset;
+      if (!asset) return; // not attributable — never guess silently
+      var period = parsed.period || fallbackPeriod || 60;
+      // URL-named asset = verified; chart fallback = display-first like any
+      // unverified WS batch (the engine keeps its scale safety net).
+      routerHandlers.onCandle({
+        asset: asset, period: period, candles: candles,
+        verified: !!params.asset, source: "http",
+      });
+    } catch (_) {}
+  }
+
+  var nativeFetch = window.fetch;
+  if (typeof nativeFetch === "function") {
+    var wrappedFetch = function (input, init) {
+      var promise = nativeFetch.apply(this, arguments);
+      try {
+        var reqUrl = "";
+        try { reqUrl = typeof input === "string" ? input : ((input && input.url) || ""); } catch (_) {}
+        if (reqUrl && historyUrlCandidate(reqUrl)) {
+          promise = promise.then(function (resp) {
+            try {
+              var clone = resp.clone();
+              clone.text().then(function (t) { handleHttpHistory(t, reqUrl); }).catch(function () {});
+            } catch (_) {}
+            return resp;
+          });
+        }
+      } catch (_) {}
+      return promise;
+    };
+    try {
+      wrappedFetch.toString = function () { return "function fetch() { [native code] }"; };
+      Object.defineProperty(window, "fetch", { value: wrappedFetch, writable: true, configurable: true });
+    } catch (_) { try { window.fetch = wrappedFetch; } catch (_) {} }
+  }
+
+  try {
+    var XHRProto = window.XMLHttpRequest && window.XMLHttpRequest.prototype;
+    if (XHRProto && typeof XHRProto.open === "function" && typeof XHRProto.send === "function") {
+      var nativeXhrOpen = XHRProto.open;
+      var nativeXhrSend = XHRProto.send;
+      XHRProto.open = function (method, url) {
+        try { this.__cyberUrl = String(url || ""); } catch (_) {}
+        return nativeXhrOpen.apply(this, arguments);
+      };
+      XHRProto.send = function () {
+        try {
+          var xhr = this;
+          var xhrUrl = xhr.__cyberUrl || "";
+          if (historyUrlCandidate(xhrUrl)) {
+            xhr.addEventListener("load", function () {
+              try {
+                var type = "";
+                try { type = String(xhr.responseType || ""); } catch (_) {}
+                if (type && type !== "text") return;
+                var text = typeof xhr.responseText === "string" ? xhr.responseText : "";
+                if (text) handleHttpHistory(text, xhrUrl);
+              } catch (_) {}
+            });
+          }
+        } catch (_) {}
+        return nativeXhrSend.apply(this, arguments);
+      };
+    }
+  } catch (_) {}
+
+  var prefetchedKeys = Object.create(null);
+  function prefetchActiveHistory(reason) {
+    try {
+      var chart = live.activeChart;
+      var sym = (chart && chart.symbol) || live.lastWsSymbol;
+      if (!sym) return;
+      var ws = handle.lastWs;
+      if (!ws || ws.readyState !== 1) return;
+      var visP = chart && chart.period ? Math.floor(chart.period) : Math.floor(live.lastWsPeriod || 60);
+      var periods = [];
+      if (visP >= 1 && visP <= 86400) periods.push(visP);
+      if (periods.indexOf(60) === -1) periods.push(60);
+      var now = Date.now();
+      for (var i = 0; i < periods.length; i++) {
+        var p = periods[i];
+        var key = sym + "@" + p;
+        if (prefetchedKeys[key] && now - prefetchedKeys[key] < 120000) continue;
+        prefetchedKeys[key] = now;
+        internalSubscriptionSend = true;
+        try { Q.subscribeHistory(ws, sym, p, 5000, 0); }
+        catch (_) {}
+        finally { internalSubscriptionSend = false; }
+      }
+      var memoKeys = Object.keys(prefetchedKeys);
+      if (memoKeys.length > 400) {
+        for (var mk = 0; mk < memoKeys.length - 300; mk++) delete prefetchedKeys[memoKeys[mk]];
+      }
+    } catch (_) {}
+  }
+
+  /* ====================================================================
    * v2.3.3 — non-repainting signal markers on the platform chart.
    *
    * Quotex's chart is TradingView "lightweight-charts". Arrows are anchored
@@ -363,7 +502,7 @@
               var norm = Q.normalizeCandles(parsed || { raw: data });
               if (norm.length) {
                 var p = (parsed && parsed.period) || live.lastWsPeriod || 60;
-                routerHandlers.onCandle({ asset: sym, period: p, candles: norm, verified: true });
+                routerHandlers.onCandle({ asset: sym, period: p, candles: norm, verified: true, source: "chart" });
               }
             }
           } catch (_) {}
@@ -395,7 +534,7 @@
                 }
                 // Keep bounded
                 if (merged.length > 5000) merged = merged.slice(-5000);
-                routerHandlers.onCandle({ asset: sym2, period: p2, candles: merged, verified: true });
+                routerHandlers.onCandle({ asset: sym2, period: p2, candles: merged, verified: true, source: "chart" });
               }
             }
           } catch (_) {}
@@ -1213,6 +1352,12 @@
               }
             } catch (_) {}
           }
+          if (hit && hit.symbol && hit.period &&
+              /history\/list|chart_notification\/get|loadHistoryPeriod|loadHistory|candles\/history/.test(hit.event || "")) {
+            // The page's own history request: remember it so an answer that
+            // omits the asset can still be attributed with certainty.
+            try { if (Q.rememberHistoryRequest) Q.rememberHistoryRequest(hit.symbol, hit.period); } catch (_) {}
+          }
           if (hit && hit.symbol && !internalSubscriptionSend) {
             if (hit.main) selectActiveChart(hit, "ws_out");
             else if (hit.candidate && !live.activeChart) selectActiveChart(hit, "ws_candidate");
@@ -1261,6 +1406,15 @@
             handle.router = socketRouter;
           }
           try { emit("quotex_status", { state: "open", url: url || "" }); } catch (_) {}
+          // v3.0: once the socket is open the chart asset is usually known
+          // (or becomes known within seconds via instruments/update). Retry
+          // the prefetch a few times — it is a no-op until both the asset
+          // and this socket are ready, and throttled per asset@period.
+          try {
+            setTimeout(function () { if (handle.lastWs === ws) prefetchActiveHistory("open"); }, 1500);
+            setTimeout(function () { if (handle.lastWs === ws) prefetchActiveHistory("open"); }, 6000);
+            setTimeout(function () { if (handle.lastWs === ws) prefetchActiveHistory("open"); }, 15000);
+          } catch (_) {}
         }
       });
       ws.addEventListener("close", function () {
@@ -1384,6 +1538,9 @@
         if ((!live.instruments || !live.instruments.length) && Q.requestInstruments) Q.requestInstruments(handle.lastWs);
         if (!live.balance && Q.requestBalance) Q.requestBalance(handle.lastWs);
       } catch (_) {}
+      // v3.0: content script (re)attached — make sure the active chart's
+      // preloaded history is in our store; the snapshot above may predate it.
+      try { setTimeout(function () { prefetchActiveHistory("sync"); }, 600); } catch (_) {}
     } else if (ev.data.kind === "subscribe") {
       var sub = ev.data.payload || {};
       internalSubscriptionSend = true;

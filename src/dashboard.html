@@ -3,14 +3,14 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>CYBER BINARY — Trading Automation &amp; Adaptive Engine</title>
+    <title>CYBER BINARY — Quotex Trading Dashboard</title>
     <link rel="stylesheet" href="dashboard.css" />
   </head>
   <body>
     <div class="shell">
       <header class="top">
         <div>
-          <p class="kicker" id="app-kicker">Auto-Adaptive Engine &amp; High-Accuracy Assets</p>
+          <p class="kicker" id="app-kicker">Quotex signal &amp; automation dashboard</p>
           <h1>CYBER BINARY</h1>
         </div>
         <div class="top-right">
@@ -40,18 +40,18 @@
           <label class="ctl">
             <span>Strategy</span>
             <select id="strategy-select">
-              <option value="auto_adaptive">Auto-Adaptive (Elite Strategy Router)</option>
-              <option value="high_accuracy">High-Accuracy 80+ (Trending Regime Only)</option>
-              <option value="sniper">Sniper 90+ Confluence</option>
-              <option value="turbo_trend">Turbo Trend Flow</option>
-              <option value="institutional_flow">Institutional VWAP Flow</option>
+              <option value="auto_adaptive">Auto-Adaptive (strategy router)</option>
+              <option value="high_accuracy">Precision Trend</option>
+              <option value="sniper">Strict Confluence</option>
+              <option value="turbo_trend">Trend Flow</option>
+              <option value="institutional_flow">VWAP Flow</option>
               <option value="confluence">Balanced Confluence</option>
-              <option value="trend">Trend Master</option>
-              <option value="breakout">Breakout Velocity</option>
-              <option value="scalp">1m Ultra Scalp</option>
-              <option value="otc">OTC Pro Matrix</option>
-              <option value="squeeze">Volatility Squeeze Expansion</option>
-              <option value="ribbon">EMA Ribbon Matrix</option>
+              <option value="trend">Trend</option>
+              <option value="breakout">Breakout</option>
+              <option value="scalp">1m Scalp</option>
+              <option value="otc">OTC Matrix</option>
+              <option value="squeeze">Volatility Squeeze</option>
+              <option value="ribbon">EMA Ribbon</option>
               <option value="momentum_pulse">Momentum Pulse</option>
             </select>
           </label>
@@ -68,6 +68,21 @@
             <span id="price">—</span>
           </div>
           <div class="regime-row" id="regime-row">regime: —</div>
+        </section>
+
+        <!-- v3.0: honest feed status — shows whether real preloaded candles
+             reached the engine or it is still waiting for broker history -->
+        <section class="card feed-card" id="feed-card">
+          <div class="card-header">
+            <h3>Data Feed</h3>
+            <span id="feed-pill" class="pill dim">waiting</span>
+          </div>
+          <section class="grid stats">
+            <article><span>Source</span><strong id="feed-source">—</strong></article>
+            <article><span>Real 1m bars</span><strong id="feed-bars">0</strong></article>
+            <article><span>History</span><strong id="feed-history">waiting</strong></article>
+            <article><span>Last tick</span><strong id="feed-tick">—</strong></article>
+          </section>
         </section>
 
         <!-- Ongoing Trades Card -->
@@ -241,6 +256,7 @@
           <article><span>Trades this hour</span><strong id="trades-hour">0</strong></article>
           <article><span>Daily P&amp;L</span><strong id="daily-pnl">0</strong></article>
           <article><span>Last trade</span><strong id="last-trade">—</strong></article>
+          <article><span>Martingale step</span><strong id="mg-step">0</strong></article>
         </section>
 
         <section class="card ongoing-card" id="auto-ongoing-card">
@@ -346,6 +362,44 @@
             <span>Min balance ($)</span>
             <input type="number" id="min-balance" min="0" step="1" value="0" />
           </label>
+        </section>
+
+        <section class="card martingale-card">
+          <div class="card-header">
+            <h3>Martingale Money Management</h3>
+            <span id="mg-status" class="badge">off</span>
+          </div>
+          <section class="controls tight">
+            <label class="check" style="grid-column:1/-1">
+              <input type="checkbox" id="mg-enabled" />
+              Enable Martingale — double down on losses (HIGH RISK)
+            </label>
+            <label class="ctl">
+              <span>Multiplier</span>
+              <input type="number" id="mg-multiplier" min="1.1" max="10" step="0.1" value="2" />
+            </label>
+            <label class="ctl">
+              <span>Max steps</span>
+              <input type="number" id="mg-maxsteps" min="1" max="10" step="1" value="4" />
+            </label>
+            <label class="ctl">
+              <span>Series cap (% balance, 0=off)</span>
+              <input type="number" id="mg-cap" min="0" max="100" step="1" value="0" />
+            </label>
+          </section>
+          <div class="table-wrap">
+            <table class="table tight" id="mg-projection">
+              <thead><tr><th>Step</th><th>Stake</th><th>Total risked if reached</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <p class="warn" style="margin-top:8px">
+            A losing streak multiplies the stake at every step. The table above shows the
+            exact cost BEFORE you enable it. The system refuses a step the balance cannot
+            fund and resets to the base stake once max steps is exhausted — it never
+            doubles past the configured depth. Martingale does not create edge; it only
+            reshapes risk. Use a demo account first.
+          </p>
         </section>
 
         <section class="row">
@@ -467,9 +521,23 @@
             </select>
           </label>
           <label class="check"><input type="checkbox" id="bt-adaptive" /> Adaptive expiry</label>
+          <label class="ctl">
+            <span>Money plan</span>
+            <select id="bt-money">
+              <option value="flat">Flat stake</option>
+              <option value="martingale">Martingale</option>
+            </select>
+          </label>
+          <label class="ctl">
+            <span>MG multiplier</span>
+            <input type="number" id="bt-mg-mult" min="1.1" max="10" step="0.1" value="2" />
+          </label>
+          <label class="ctl">
+            <span>MG max steps</span>
+            <input type="number" id="bt-mg-steps" min="1" max="10" step="1" value="4" />
+          </label>
           <button id="bt-run" class="arm-btn">Run backtest</button>
           <button id="bt-walk" class="ghost-btn" title="Run walk-forward analysis">Walk-Forward</button>
-          <button id="bt-monte" class="ghost-btn" title="Run Monte Carlo simulation">Monte Carlo</button>
           <button id="bt-export" class="ghost-btn" title="Exports cached real Quotex 1m candles as JSON">Export candles</button>
           <button id="bt-export-trades" class="ghost-btn" title="Export detailed trade log as CSV">Export trades</button>
         </section>
@@ -491,7 +559,6 @@
           <button data-bt-tab="overview" class="ghost-btn active" style="padding:4px 10px">Overview</button>
           <button data-bt-tab="trades" class="ghost-btn" style="padding:4px 10px">Trade Log</button>
           <button data-bt-tab="walk" class="ghost-btn" style="padding:4px 10px">Walk-Forward</button>
-          <button data-bt-tab="monte" class="ghost-btn" style="padding:4px 10px">Monte Carlo</button>
           <button data-bt-tab="heatmap" class="ghost-btn" style="padding:4px 10px">Heatmap</button>
         </section>
 
@@ -605,34 +672,6 @@
           <p class="disclaimer">Walk-forward tests if the strategy holds across time — high consistency (>60%) suggests robustness, not curve-fitting.</p>
         </section>
 
-        <section class="bt-pane" data-bt-pane="monte" style="display:none">
-          <h2>Monte Carlo Simulation (1000 shuffles)</h2>
-          <div class="grid stats">
-            <article><span>Avg P&L</span><strong id="bt-monte-avg">—</strong></article>
-            <article><span>Median P&L</span><strong id="bt-monte-median">—</strong></article>
-            <article><span>5% Worst</span><strong id="bt-monte-p5">—</strong></article>
-            <article><span>95% Best</span><strong id="bt-monte-p95">—</strong></article>
-            <article><span>Positive Rate</span><strong id="bt-monte-pos">—</strong></article>
-            <article><span>Avg Max DD</span><strong id="bt-monte-dd">—</strong></article>
-          </div>
-          <div style="display:flex;justify-content:space-between;align-items:center;margin:10px 0 8px">
-            <h2 style="margin:0">Distribution</h2>
-            <div style="display:flex;gap:6px">
-              <button id="bt-monte-export" class="ghost-btn tiny">PNG</button>
-            </div>
-          </div>
-          <div class="chart-wrap pro-chart" id="bt-monte-wrap">
-            <div class="chart-canvas-wrap">
-              <canvas id="bt-monte-chart" width="800" height="200"></canvas>
-            </div>
-            <div class="chart-statusbar">
-              <span>Histogram of shuffled P&L outcomes · Red 5% worst · Cyan median · Green 95% best</span>
-              <span></span>
-            </div>
-          </div>
-          <p class="disclaimer">Monte Carlo shuffles trade order to estimate risk — shows distribution of possible outcomes if same trades occurred in different order.</p>
-        </section>
-
         <section class="bt-pane" data-bt-pane="heatmap" style="display:none">
           <h2>Strategy × Asset Heatmap (Win Rate)</h2>
           <div id="bt-heatmap" style="overflow:auto;max-height:400px"></div>
@@ -640,9 +679,10 @@
 
         <p class="disclaimer" id="bt-sources"></p>
         <p class="disclaimer">
-          Backtests use cached Quotex live 1m candles when available, otherwise deterministic simulator.
-          Metrics include payout-aware P&L (EV = WR×payout − LR), Profit Factor, Sharpe, Kelly.
-          Walk-forward and Monte Carlo assess robustness. Not a guarantee of future results.
+          Backtests run ONLY on real Quotex candles cached by the extension — no synthetic data is invented.
+          Keep the Quotex tab open to collect history before running long backtests.
+          Metrics: payout-aware P&L (EV = WR×payout − LR), Profit Factor, Sharpe, Kelly, drawdown.
+          Walk-forward assesses robustness. Past results never guarantee future performance.
         </p>
       </section>
 
@@ -758,6 +798,7 @@
     <script src="lib/engine.js"></script>
     <script src="lib/asset-selector.js"></script>
     <script src="lib/storage.js"></script>
+    <script src="lib/money.js"></script>
     <script src="lib/auto.js"></script>
     <script src="lib/backtest.js"></script>
     <script src="lib/workers.js"></script>

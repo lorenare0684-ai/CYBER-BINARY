@@ -91,9 +91,11 @@
     for (const a of assets) {
       let s = null;
       if (cachedByAsset && Array.isArray(cachedByAsset[a.id]) && root.CYBER_HIST && root.CYBER_HIST.getSeries) {
-        s = root.CYBER_HIST.getSeries(a, { days, seed, cachedByAsset, liveOnly: opts.liveOnly === true || opts.requireLive === true });
+        s = root.CYBER_HIST.getSeries(a, { days, seed, cachedByAsset, liveOnly: true });
       }
-      if (!s) s = (opts.liveOnly === true || opts.requireLive === true) ? [] : FEED.syntheticSeries(a, days * 24 * 60, { seed });
+      // v3.0: never fabricate history. An asset without cached real candles
+      // gets an empty series and is reported as "insufficient data".
+      if (!s) s = [];
       seriesByAsset[a.id] = s;
     }
     const jobs = [];
@@ -139,6 +141,7 @@
         useAdaptiveExpiry,
         adaptiveExpiryMin: opts.adaptiveExpiryMin,
         adaptiveExpiryMax: opts.adaptiveExpiryMax,
+        money: opts.money || null,
         lean: false,
       });
       out.push({
@@ -203,7 +206,7 @@
         sb.globalThis = sb.self;
         vm.createContext(sb);
         const lib = workerData.libDir;
-        for (const f of ['indicators.js','assets.js','strategy.js','feed.js','engine.js','backtest.js']) {
+        for (const f of ['indicators.js','assets.js','strategy.js','feed.js','engine.js','money.js','backtest.js']) {
           vm.runInContext(fs.readFileSync(path.join(lib, f), 'utf8'), sb);
         }
         const FEED = sb.self.CYBER_FEED;
@@ -218,8 +221,17 @@
             if (currentAid !== j.aid) {
               const a = ASSETS.get(j.aid);
               currentAid = j.aid;
-              currentSeries = a
-                ? FEED.syntheticSeries(a, (opts.days || 2) * 24 * 60, { seed: opts.seed }) : null;
+              // v3.0: real cached candles only — never fabricate history.
+              currentSeries = null;
+              if (a) {
+                const cached = opts.cachedByAsset && Array.isArray(opts.cachedByAsset[a.id])
+                  ? opts.cachedByAsset[a.id] : null;
+                if (cached && sb.self.CYBER_HIST && sb.self.CYBER_HIST.getSeries) {
+                  currentSeries = sb.self.CYBER_HIST.getSeries(a, { days: opts.days || 2, cachedBars: cached });
+                } else {
+                  currentSeries = [];
+                }
+              }
               currentMeta = a ? { name: a.name, kind: a.kind } : null;
             }
             const strategy = sb.self.CYBER_STRATEGIES.get(j.sid);
@@ -231,6 +243,7 @@
               minBars: opts.minBars != null ? opts.minBars : 200,
               payout: opts.payout || 0.85,
               useAdaptiveExpiry: !!opts.useAdaptiveExpiry,
+              money: opts.money || null,
               lean: false,
             });
             out.push({
@@ -361,8 +374,9 @@
               liveOnly: opts.liveOnly === true || opts.requireLive === true,
             });
           }
-          if (!series) series = (opts.liveOnly === true || opts.requireLive === true)
-            ? [] : FEED.syntheticSeries(job.asset, Math.round(days * 24 * 60), { seed: opts.seed });
+          // v3.0: no synthetic fallback — an uncached asset yields an empty
+          // series and is reported as "no data" instead of fabricated bars.
+          if (!series) series = [];
         }
         for (const result of runChunk({ [job.asset.id]: series }, [job], opts)) out.push(result);
         i++;
@@ -405,6 +419,7 @@
       sortBy: opts.sortBy,
       cachedByAsset: opts.cachedByAsset && typeof opts.cachedByAsset === "object" ? opts.cachedByAsset : null,
       liveOnly: opts.liveOnly === true || opts.requireLive === true,
+      money: opts.money && typeof opts.money === "object" ? opts.money : null,
     };
     // Pool of dedicated workers so full-catalog runs (every asset × every
     // strategy) finish in a fraction of the single-worker time. Assets are

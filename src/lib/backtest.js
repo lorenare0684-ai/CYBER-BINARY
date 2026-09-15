@@ -1,11 +1,15 @@
 /**
- * Historic backtest across the full asset catalog and strategy presets.
- * Produces per-asset, per-strategy accuracy tables, regime breakdowns,
- * walk-forward splits, and a calibration curve.
+ * Historic backtest across the asset catalog and strategy presets.
  *
- * Data sources (in order of preference):
- *   1. Cached Quotex live/tick-built candles from chrome.storage.local (s.candles[asset])
- *   2. Synthetic 1m series only when liveOnly/requireLive is not requested
+ * v3.0 REBUILD — honesty first:
+ *   - The backtester runs ONLY on real Quotex candles cached by the
+ *     extension (chrome.storage.local `candles[asset]` or the live 1m
+ *     feed). The old build silently padded missing history with synthetic
+ *     simulator bars and reported those results as if they were market
+ *     evidence — that was removed. An asset without enough real data is
+ *     reported as "insufficient data", never backtested on fiction.
+ *   - Money management (flat / martingale) is applied trade-by-trade by the
+ *     engine so equity, drawdown and P&L reflect the actual staking plan.
  *
  * This runs both in the extension content-script and Node (for `node tools/`).
  */
@@ -24,18 +28,23 @@
   }
 
   /**
-   * Build a 1m series for an asset. Cached if available; else synthetic.
-   * If `cachedBars` is provided, it is preferred (and synthetic is appended
-   * before the cached slice to extend history).
+   * Build a 1m series for an asset from REAL cached Quotex candles only.
+   *
+   * v3.0: the old build padded missing history with a synthetic simulator and
+   * reported the result as if it were market evidence. That is gone. This
+   * returns the cleaned, de-duplicated live candles it actually has; the
+   * `_meta.liveBars` / `_meta.quality` fields let the dashboard say honestly
+   * how much real data a run used. Assets without enough real bars simply
+   * produce fewer (or zero) trades — they are never backtested on fiction.
    */
   function getSeries(asset, opts) {
     const o = opts && typeof opts === "object" ? opts : {};
-    if (!asset || typeof asset.id !== "string" || !asset.id) return [];
+    const empty = [];
+    empty._meta = { source: "none", gaps: 0, liveBars: 0, quality: "none" };
+    if (!asset || typeof asset.id !== "string" || !asset.id) return empty;
     const requestedDays = Number(o.days);
     const days = Number.isFinite(requestedDays) ? Math.max(1, Math.min(60, requestedDays)) : 7;
     const minutes = Math.round(days * 24 * 60);
-    const requestedSeed = Number(o.seed);
-    const seed = Number.isFinite(requestedSeed) ? requestedSeed : 7;
     const cachedByAsset = o.cachedByAsset && typeof o.cachedByAsset === "object" ? o.cachedByAsset : null;
     const cached = cachedByAsset && Object.prototype.hasOwnProperty.call(cachedByAsset, asset.id)
       ? cachedByAsset[asset.id] : o.cachedBars;
@@ -52,8 +61,7 @@
         if (![time, open, high, low, close].every(Number.isFinite) || !Number.isSafeInteger(time) || time < 0 ||
             open <= 0 || high <= 0 || low <= 0 || close <= 0 ||
             high < Math.max(open, low, close) || low > Math.min(open, high, close)) continue;
-        // Gap detection: >10 min gap
-        if (lastTime != null && time - lastTime > 10*60000) gaps++;
+        if (lastTime != null && time - lastTime > 10 * 60000) gaps++;
         lastTime = time;
         const rawVolume = Number(b.volume);
         byTime.set(time, {
@@ -62,34 +70,17 @@
         });
       }
     }
-    let cleanCached = Array.from(byTime.values()).sort((a, b) => a.time - b.time);
-    // Filter out weekend gaps for non-OTC? Keep for now but track quality
-    if (cleanCached.length > minutes) cleanCached = cleanCached.slice(-minutes);
-    if (o.liveOnly === true || o.requireLive === true) return cleanCached;
-    const missing = Math.max(0, minutes - cleanCached.length);
-    if (!missing || (cleanCached.length && cleanCached[0].time < missing * 60000)) {
-      // Attach quality meta for UI
-      cleanCached._meta = { source: "live", gaps, quality: cleanCached.length >= minutes * 0.9 ? "high" : cleanCached.length >= minutes * 0.5 ? "medium" : "low" };
-      return cleanCached;
-    }
-    const startTime = cleanCached.length ? cleanCached[0].time - missing * 60000 : undefined;
-    const synth = FEED.syntheticSeries(asset.id, missing, { seed, startTime });
-    if (cleanCached.length && synth.length) {
-      const tail = synth[synth.length - 1].close;
-      const scale = Number.isFinite(tail) && tail > 0 ? cleanCached[0].open / tail : 1;
-      for (const bar of synth) {
-        bar.open *= scale; bar.high *= scale; bar.low *= scale; bar.close *= scale;
-      }
-    }
-    const combined = synth.concat(cleanCached);
-    combined._meta = {
-      source: cleanCached.length ? "live+sim" : "sim",
+    let clean = Array.from(byTime.values()).sort((a, b) => a.time - b.time);
+    if (clean.length > minutes) clean = clean.slice(-minutes);
+    clean._meta = {
+      source: clean.length ? "live" : "none",
       gaps,
-      liveBars: cleanCached.length,
-      simBars: synth.length,
-      quality: cleanCached.length >= minutes * 0.9 ? "high" : cleanCached.length >= minutes * 0.5 ? "medium" : "low"
+      liveBars: clean.length,
+      quality: clean.length >= minutes * 0.9 ? "high"
+        : clean.length >= minutes * 0.5 ? "medium"
+        : clean.length ? "low" : "none",
     };
-    return combined;
+    return clean;
   }
 
   function normalizedOptions(opts) {
@@ -106,6 +97,11 @@
     o.useAdaptiveExpiry = !!source.useAdaptiveExpiry;
     o.adaptiveExpiryMin = Number.isFinite(Number(source.adaptiveExpiryMin)) ? Number(source.adaptiveExpiryMin) : 1;
     o.adaptiveExpiryMax = Number.isFinite(Number(source.adaptiveExpiryMax)) ? Number(source.adaptiveExpiryMax) : 5;
+    // v3.0: money management plan (flat | martingale) — passed straight to
+    // the engine's trade-by-trade staking.
+    if (source.money && typeof source.money === "object" && !Array.isArray(source.money)) {
+      o.money = Object.assign({}, source.money);
+    }
     return o;
   }
 
@@ -124,6 +120,7 @@
       useAdaptiveExpiry: o.useAdaptiveExpiry,
       adaptiveExpiryMin: o.adaptiveExpiryMin,
       adaptiveExpiryMax: o.adaptiveExpiryMax,
+      money: o.money || null,
       lean: false,
     });
     return {
@@ -181,6 +178,7 @@
 
     for (const a of assets) {
       const series = getSeries(a, o);
+      const seriesMeta = series && series._meta ? series._meta : null;
       // Determine payout for this asset if available
       let assetPayout = o.payout;
       if (o.payoutByAsset && typeof o.payoutByAsset === "object" && o.payoutByAsset[a.id] != null) {
@@ -197,6 +195,7 @@
           useAdaptiveExpiry: o.useAdaptiveExpiry,
           adaptiveExpiryMin: o.adaptiveExpiryMin,
           adaptiveExpiryMax: o.adaptiveExpiryMax,
+          money: o.money || null,
           lean: false,
         });
         results.push({
@@ -218,6 +217,8 @@
           byStrategy: res.byStrategy, byExpiry: res.byExpiry,
           calibration: res.calibration, equity: res.equity ? res.equity.slice(-200) : [],
           trades: res.trades ? res.trades.slice(-50) : [],
+          dataSource: seriesMeta && seriesMeta.source ? seriesMeta.source : "none",
+          liveBars: seriesMeta && Number.isFinite(seriesMeta.liveBars) ? seriesMeta.liveBars : 0,
         });
         i++;
         try { if (typeof o.onProgress === "function") o.onProgress({ i, total, asset: a.id, strategy: s.id, result: res }); } catch (_) {}

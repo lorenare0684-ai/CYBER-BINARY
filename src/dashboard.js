@@ -67,7 +67,7 @@
   let autoState = null;
   let settings = null;
   let btResults = null;
-  let btDataByAsset = null; // asset id -> "live" | "live+sim" | "sim" for the last run
+  let btDataByAsset = null; // asset id -> "live" | "partial" | "none" for the last run (v3.0: real data only)
   let lastChartCandles = null;
   let lastChartMeta = {};
   let currentAssetId = null; // asset on screen, for per-asset price precision
@@ -719,6 +719,33 @@
       : "Demo feed";
     $("link-state").className = "pill " + (state.attached ? "ok" : "dim");
 
+    // v3.0: honest data-feed status. The engine must hold real preloaded
+    // broker candles before its signals mean anything — surface that here.
+    const feed = state.feed && typeof state.feed === "object" ? state.feed : null;
+    const feedPill = $("feed-pill");
+    if (feedPill) {
+      let label = "waiting", cls = "dim";
+      if (feed) {
+        if (feed.ready) { label = "live · ready"; cls = "ok"; }
+        else if (feed.seeded) { label = "live · warming"; cls = "warn"; }
+        else if (state.attached) { label = "awaiting history"; cls = "warn"; }
+        else { label = "no connection"; cls = "dim"; }
+      }
+      feedPill.textContent = label;
+      feedPill.className = "pill " + cls;
+    }
+    if ($("feed-source")) $("feed-source").textContent = state.attached ? (state.source || "chart") : "—";
+    if ($("feed-bars")) $("feed-bars").textContent = feed ? String(feed.realBars || 0) : "0";
+    if ($("feed-history")) {
+      const el = $("feed-history");
+      el.textContent = feed ? (feed.seeded ? "loaded" : "waiting") : "—";
+      el.className = feed && feed.seeded ? "win" : "";
+    }
+    if ($("feed-tick")) {
+      const at = feed ? Number(feed.lastTickAt) : 0;
+      $("feed-tick").textContent = Number.isFinite(at) && at > 0 ? fmtTime(at) + " UTC" : "—";
+    }
+
     // Track the on-screen asset before formatting any price, so fmtPx can use
     // that asset's real decimal precision (JPY pairs quote 3, not 2).
     if (typeof state.assetId === "string" && state.assetId) currentAssetId = state.assetId.slice(0, 96);
@@ -1169,6 +1196,17 @@
       $("last-trade").textContent = "—";
     }
 
+    // v3.0: live Martingale progression state from the controller.
+    const mgStepEl = $("mg-step");
+    if (mgStepEl) {
+      const mg = source.martingale && typeof source.martingale === "object" ? source.martingale : null;
+      const step = mg ? Math.max(0, Math.floor(finite(mg.step, 0))) : 0;
+      mgStepEl.textContent = String(step);
+      mgStepEl.className = step > 0 ? "loss" : "";
+      mgStepEl.title = mg && Number.isFinite(Number(mg.seriesPnl))
+        ? "Series P&L " + Number(mg.seriesPnl).toFixed(2) : "";
+    }
+
     const armBtn = $("arm-btn");
     if (armBtn) {
       armBtn.classList.toggle("armed", !!autoState.armed);
@@ -1418,6 +1456,36 @@
     bindBooleanSetting("notify-desktop", "notifyDesktop");
     bindBooleanSetting("auto-high-accuracy", "autoHighAccuracy");
 
+    /* ---- v3.0: Martingale controls ---- */
+    const saveMartingale = () => {
+      const patch = {
+        martingale: {
+          enabled: !!($("mg-enabled") && $("mg-enabled").checked),
+          multiplier: $("mg-multiplier") ? Number($("mg-multiplier").value) : 2,
+          maxSteps: $("mg-maxsteps") ? Number($("mg-maxsteps").value) : 4,
+          seriesCapPct: $("mg-cap") ? Number($("mg-cap").value) : 0,
+        },
+      };
+      setSettings(patch).then((saved) => {
+        const mg = saved && saved.martingale ? saved.martingale : {};
+        if ($("mg-multiplier")) $("mg-multiplier").value = mg.multiplier != null ? mg.multiplier : 2;
+        if ($("mg-maxsteps")) $("mg-maxsteps").value = mg.maxSteps != null ? mg.maxSteps : 4;
+        if ($("mg-cap")) $("mg-cap").value = mg.seriesCapPct != null ? mg.seriesCapPct : 0;
+        renderMartingaleProjection();
+      }).catch(() => {});
+    };
+    ["mg-enabled"].forEach((id) => {
+      const el = $(id);
+      if (el) el.addEventListener("change", saveMartingale);
+    });
+    ["mg-multiplier", "mg-maxsteps", "mg-cap"].forEach((id) => {
+      const el = $(id);
+      if (el) el.addEventListener("change", saveMartingale);
+    });
+    // The projection depends on the base stake too.
+    const stakeEl = $("stake");
+    if (stakeEl) stakeEl.addEventListener("change", renderMartingaleProjection);
+
     let armPending = false;
     $("arm-btn").addEventListener("click", () => {
       if (armPending) return;
@@ -1468,15 +1536,52 @@
       $("notify-desktop").checked = !!s.notifyDesktop;
       if ($("auto-high-accuracy")) $("auto-high-accuracy").checked = s.autoHighAccuracy !== false;
       if ($("set-auto-high-accuracy")) $("set-auto-high-accuracy").checked = s.autoHighAccuracy !== false;
+      // v3.0: Martingale money management
+      const mg = s.martingale || {};
+      if ($("mg-enabled")) $("mg-enabled").checked = !!mg.enabled;
+      if ($("mg-multiplier")) $("mg-multiplier").value = mg.multiplier != null ? mg.multiplier : 2;
+      if ($("mg-maxsteps")) $("mg-maxsteps").value = mg.maxSteps != null ? mg.maxSteps : 4;
+      if ($("mg-cap")) $("mg-cap").value = mg.seriesCapPct != null ? mg.seriesCapPct : 0;
+      renderMartingaleProjection();
       activeStrategy = STRAT.get(s.strategy) ? s.strategy : "auto_adaptive";
       const sel = $("strategy-select");
       if (sel) sel.value = activeStrategy;
     });
   }
 
+  /** v3.0: Martingale projection table — shows the exact cost of every step
+   *  of the progression at the CURRENT base stake, before the user arms it. */
+  function renderMartingaleProjection() {
+    const MONEY = self.CYBER_MONEY;
+    const body = $("mg-projection") && $("mg-projection").querySelector("tbody");
+    if (!body) return;
+    body.innerHTML = "";
+    if (!MONEY) return;
+    const cfg = MONEY.normalizeConfig({
+      enabled: true,
+      multiplier: $("mg-multiplier") ? Number($("mg-multiplier").value) : 2,
+      maxSteps: $("mg-maxsteps") ? Number($("mg-maxsteps").value) : 4,
+    });
+    const baseStake = Number($("stake") ? $("stake").value : 1);
+    const base = Number.isFinite(baseStake) && baseStake > 0 ? baseStake : 1;
+    const rows = MONEY.projection(cfg, base);
+    for (const r of rows) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = "<td>" + r.step + "</td>" +
+        "<td>$" + r.stake.toFixed(2) + "</td>" +
+        "<td>$" + r.cumulativeRisk.toFixed(2) + "</td>";
+      body.appendChild(tr);
+    }
+    const status = $("mg-status");
+    if (status) {
+      const on = $("mg-enabled") && $("mg-enabled").checked;
+      status.textContent = on ? "ON — high risk" : "off";
+      status.style.color = on ? "#ff5d7a" : "";
+    }
+  }
+
   /* ---------- backtest tab (v2.9 improved) ---------- */
   let btWalkResults = null;
-  let btMonteResults = null;
   let btAllTrades = [];
 
   function drawEquityWithDrawdown(canvas, equity) {
@@ -1597,11 +1702,23 @@
       }
     }
 
+    // v3.0: money management plan for the run.
+    const moneyKind = $("bt-money") ? $("bt-money").value : "flat";
+    const rawMgMult = Number($("bt-mg-mult") ? $("bt-mg-mult").value : 2);
+    const rawMgSteps = Number($("bt-mg-steps") ? $("bt-mg-steps").value : 4);
+    const money = moneyKind === "martingale" ? {
+      plan: "martingale",
+      baseStake: 1,
+      multiplier: Number.isFinite(rawMgMult) ? Math.min(10, Math.max(1.1, rawMgMult)) : 2,
+      maxSteps: Number.isFinite(rawMgSteps) ? Math.min(10, Math.max(1, Math.floor(rawMgSteps))) : 4,
+    } : { plan: "flat" };
+
     const o = {
       days, horizon, minConf, kinds, minBars: 50,
       payout, payoutByAsset, useAdaptiveExpiry: useAdaptive,
       adaptiveExpiryMin: settings && settings.adaptiveExpiryMin ? settings.adaptiveExpiryMin : 1,
       adaptiveExpiryMax: settings && settings.adaptiveExpiryMax ? settings.adaptiveExpiryMax : 5,
+      money,
     };
 
     const btn = isWalkForward ? $("bt-walk") : $("bt-run");
@@ -1667,8 +1784,8 @@
       btDataByAsset = Object.create(null);
       for (const a of assetPool) {
         const bars = cachedByAsset[a.id];
-        btDataByAsset[a.id] = !Array.isArray(bars) || !bars.length ? "sim"
-          : bars.length >= minutes ? "live" : "live+sim";
+        btDataByAsset[a.id] = !Array.isArray(bars) || !bars.length ? "none"
+          : bars.length >= minutes * 0.5 ? "live" : "partial";
       }
       o.assets = assetPool;
       o.cachedByAsset = cachedByAsset;
@@ -1707,7 +1824,7 @@
     // Walk-forward on the active asset's live candles for detailed view
     const active = ASSETS.get(activeAsset) || ASSETS.list()[0];
     if (!active) return;
-    const cached = btDataByAsset && btDataByAsset[active.id] !== "sim" && liveCandlesByAsset[active.id] ? liveCandlesByAsset[active.id] : null;
+    const cached = btDataByAsset && btDataByAsset[active.id] !== "none" && liveCandlesByAsset[active.id] ? liveCandlesByAsset[active.id] : null;
     let series = null;
     if (HIST && HIST.getSeries) {
       series = HIST.getSeries(active, { days: opts.days, cachedByAsset: opts.cachedByAsset });
@@ -1741,48 +1858,6 @@
     }
   }
 
-  function runMonteCarloAnalysis() {
-    if (!btResults || !btResults.results || !btResults.results.length) {
-      alert("Run backtest first to generate trades for Monte Carlo");
-      return;
-    }
-    // Collect all trades from results
-    const allTrades = [];
-    for (const r of btResults.results) {
-      if (r.trades && Array.isArray(r.trades)) {
-        for (const t of r.trades) allTrades.push(t);
-      } else if (r.equity && r.equity.length) {
-        // synthesize from equity diff
-      }
-    }
-    // If no detailed trades, use aggregated pnl series
-    let tradesForMC = allTrades;
-    if (tradesForMC.length < 10) {
-      // Build from equity curve
-      const seq = [];
-      let prev = 0;
-      for (const r of btResults.results.slice(0, 50)) {
-        const pnl = Number(r.pnlWithPayout != null ? r.pnlWithPayout : r.pnl) || 0;
-        const t = Number(r.total) || 1;
-        const avg = t ? pnl / t : 0;
-        for (let i = 0; i < Math.min(t, 20); i++) seq.push({ pnlPayout: avg });
-      }
-      tradesForMC = seq;
-    }
-    if (tradesForMC.length < 10) {
-      alert("Not enough trades for Monte Carlo — need at least 10");
-      return;
-    }
-    try {
-      const mc = ENG.monteCarlo(tradesForMC, { sims: 1000 });
-      btMonteResults = mc;
-      paintMonteCarlo(mc);
-      activateBtTab("monte");
-    } catch (e) {
-      console.error("monteCarlo failed", e);
-    }
-  }
-
   function paintWalkForward(wf) {
     if (!wf || wf.error) {
       const body = $("bt-walk-table") && $("bt-walk-table").querySelector("tbody");
@@ -1810,65 +1885,6 @@
     if ($("bt-walk-pnl")) $("bt-walk-pnl").textContent = (wf.combined.pnl||0).toFixed(2);
     if ($("bt-walk-avg")) $("bt-walk-avg").textContent = fmtPct(wf.combined.avgWinrate);
     if ($("bt-walk-cons")) $("bt-walk-cons").textContent = fmtPct(wf.combined.consistency);
-  }
-
-  function paintMonteCarlo(mc) {
-    if (!mc || mc.error) return;
-    if ($("bt-monte-avg")) $("bt-monte-avg").textContent = (mc.avgPnL||0).toFixed(2);
-    if ($("bt-monte-median")) $("bt-monte-median").textContent = (mc.median && mc.median.finalPnL || 0).toFixed(2);
-    if ($("bt-monte-p5")) $("bt-monte-p5").textContent = (mc.p5 && mc.p5.finalPnL || 0).toFixed(2);
-    if ($("bt-monte-p95")) $("bt-monte-p95").textContent = (mc.p95 && mc.p95.finalPnL || 0).toFixed(2);
-    if ($("bt-monte-pos")) $("bt-monte-pos").textContent = fmtPct(mc.positiveRate);
-    if ($("bt-monte-dd")) $("bt-monte-dd").textContent = (mc.avgDD||0).toFixed(2);
-
-    // Draw distribution via enhanced library
-    const canvas = $("bt-monte-chart");
-    if (!canvas) return;
-    const CH = self.CYBER_CHARTS || null;
-    if (CH && CH.drawMonteCarloChart) {
-      CH.drawMonteCarloChart(canvas, mc.results, {});
-    } else {
-      // fallback simple
-      const w = Math.max(180, Math.min(4096, (canvas.parentElement && canvas.parentElement.clientWidth) || 800));
-      const h = Math.max(120, Math.round(w * 0.22));
-      const dpr = Math.max(1, Math.min(2, Number(window.devicePixelRatio)||1));
-      canvas.width = Math.floor(w * dpr);
-      canvas.height = Math.floor(h * dpr);
-      canvas.style.width = w + "px";
-      canvas.style.height = h + "px";
-      const ctx = canvas.getContext("2d");
-      if (!ctx) return;
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      ctx.clearRect(0,0,w,h);
-      ctx.fillStyle = "#0c1422";
-      ctx.fillRect(0,0,w,h);
-      const vals = mc.results.map(r=>r.finalPnL).sort((a,b)=>a-b);
-      const lo = vals[0], hi = vals[vals.length-1];
-      const range = hi - lo || 1;
-      const bins = 40;
-      const counts = new Array(bins).fill(0);
-      for (const v of vals) {
-        const idx = Math.min(bins-1, Math.max(0, Math.floor((v - lo)/range * bins)));
-        counts[idx]++;
-      }
-      const maxC = Math.max(...counts) || 1;
-      const padL = 40, padR = 10, padT = 10, padB = 20;
-      const plotW = w - padL - padR, plotH = h - padT - padB;
-      ctx.fillStyle = "rgba(74,163,255,0.6)";
-      for (let i = 0; i < bins; i++) {
-        const x = padL + (i / bins) * plotW;
-        const bw = plotW / bins * 0.8;
-        const bh = (counts[i] / maxC) * plotH;
-        ctx.fillRect(x, padT + plotH - bh, bw, bh);
-      }
-      ctx.fillStyle = "rgba(255,255,255,0.5)";
-      ctx.font = "9px system-ui, sans-serif";
-      ctx.textAlign = "center";
-      ctx.fillText(lo.toFixed(1), padL, h - 2);
-      ctx.fillText(hi.toFixed(1), padL + plotW, h - 2);
-      ctx.textAlign = "left";
-      ctx.fillText("P&L distribution (" + mc.simulations + " sims)", 8, 12);
-    }
   }
 
   function activateBtTab(name) {
@@ -1992,7 +2008,7 @@
         if (r.profitFactor) perAsset[r.asset].pf = r.profitFactor;
         if (r.expectedValue) perAsset[r.asset].ev = r.expectedValue;
       }
-      const sourceLabel = { live: "Live", "live+sim": "Live+Sim", sim: "Sim" };
+      const sourceLabel = { live: "Live", partial: "Partial", none: "No data" };
       const sortedAssets = Object.keys(perAsset).sort((a,b) => perAsset[b].pnlPayout - perAsset[a].pnlPayout);
       for (const k of sortedAssets.slice(0, 100)) {
         const v = perAsset[k];
@@ -2000,7 +2016,7 @@
         const wr = t ? (v.wins / t) * 100 : 0;
         const ev = t ? (wr/100 * (opts.payout||0.85) - (1-wr/100))*100 : 0;
         const pf = v.losses ? (v.wins * (opts.payout||0.85)) / v.losses : (v.wins ? 99 : 0);
-        const source = btDataByAsset && btDataByAsset[k] ? sourceLabel[btDataByAsset[k]] || "Sim" : "—";
+        const source = btDataByAsset && btDataByAsset[k] ? sourceLabel[btDataByAsset[k]] || "No data" : "—";
         const tr = document.createElement("tr");
         tr.className = "clickable";
         tr.title = "Click to view " + (v.name||k) + " on live chart and filter trades";
@@ -2218,12 +2234,12 @@
       } else {
         const perAsset = {};
         for (const r of matrix.results) if (!perAsset[r.asset]) perAsset[r.asset] = true;
-        const counts = { live: 0, "live+sim": 0, sim: 0 };
+        const counts = { live: 0, partial: 0, none: 0 };
         for (const k of Object.keys(perAsset)) {
           if (btDataByAsset && btDataByAsset[k] && counts[btDataByAsset[k]] != null) counts[btDataByAsset[k]]++;
         }
         const covered = Object.keys(perAsset).length;
-        sourcesEl.textContent = "Covered " + covered + " assets — " + counts.live + " live, " + counts["live+sim"] + " live+sim, " + counts.sim + " sim. Payout " + (opts.payout*100).toFixed(0) + "% · Horizon " + opts.horizon + "m · " + (opts.useAdaptiveExpiry ? "Adaptive expiry" : "Fixed expiry") + ". EV = WR×payout − LR. PF = gross profit / gross loss. Sharpe = mean/std. Kelly = optimal stake %.";
+        sourcesEl.textContent = "Covered " + covered + " assets — " + counts.live + " with full history, " + counts.partial + " partial, " + counts.none + " without data (never simulated). Money: " + (opts.money && opts.money.plan === "martingale" ? "Martingale ×" + opts.money.multiplier + " / " + opts.money.maxSteps + " steps" : "flat stake") + ". Payout " + (opts.payout*100).toFixed(0) + "% · Horizon " + opts.horizon + "m · " + (opts.useAdaptiveExpiry ? "Adaptive expiry" : "Fixed expiry") + ". EV = WR×payout − LR. PF = gross profit / gross loss. Sharpe = mean/std. Kelly = optimal stake %.";
       }
     }
   }
@@ -2238,8 +2254,6 @@
     $("bt-run").addEventListener("click", () => runBacktest(false));
     const walkBtn = $("bt-walk");
     if (walkBtn) walkBtn.addEventListener("click", () => runBacktest(true));
-    const monteBtn = $("bt-monte");
-    if (monteBtn) monteBtn.addEventListener("click", runMonteCarloAnalysis);
 
     const exportBtn = $("bt-export");
     if (exportBtn) exportBtn.addEventListener("click", () => {
@@ -2701,11 +2715,6 @@
       });
     }
 
-    const monteExport = $("bt-monte-export");
-    if (monteExport) monteExport.addEventListener("click", () => {
-      const c = $("bt-monte-chart");
-      if (c && CH.exportCanvasPNG) CH.exportCanvasPNG(c, "cyber-binary-monte-" + new Date().toISOString().slice(0,10) + ".png");
-    });
 
     const perfExport = $("perf-export");
     if (perfExport) perfExport.addEventListener("click", () => {
