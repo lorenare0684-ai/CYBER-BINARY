@@ -255,7 +255,7 @@
    * Under "auto_adaptive" the user's selection is a router, not a strategy —
    * the engine names its pick in `selectedStrategy`. Everything that displays
    * or logs "which strategy" must resolve through here so auto mode reports
-   * the real strategy (e.g. "Sniper 90+ Confluence") instead of the router.
+   * the real strategy (e.g. "Strict Confluence") instead of the router.
    * Falls back to the user's selection when the engine did not name one
    * (a preset run) and finally to the default preset.
    */

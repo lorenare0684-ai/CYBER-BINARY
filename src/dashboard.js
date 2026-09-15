@@ -217,8 +217,8 @@
    *
    * Rows record the concrete strategy id; under auto_adaptive that is the
    * strategy the router PICKED, never the literal "auto_adaptive". Resolve it
-   * to the preset's human label so the UI reads "Sniper 90+ Confluence"
-   * rather than "sniper" — and never shows the router as if it were a
+   * to the preset's human label so the UI reads "Strict Confluence"
+   * rather than the raw id "sniper" — and never shows the router as if it were a
    * strategy that generated a signal.
    */
   function strategyLabel(id, fallbackLabel) {

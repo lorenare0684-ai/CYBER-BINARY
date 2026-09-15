@@ -65,7 +65,7 @@
     return id;
   }
 
-  /** " · strategy Sniper 90+ Confluence" — empty when nothing named it. */
+  /** " · strategy Strict Confluence" — empty when nothing named it. */
   function strategySuffix(signal) {
     const label = signalStrategyLabel(signal);
     if (!label) return "";
